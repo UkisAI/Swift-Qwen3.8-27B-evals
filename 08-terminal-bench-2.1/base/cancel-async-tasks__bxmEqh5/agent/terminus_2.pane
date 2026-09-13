@@ -1,0 +1,290 @@
+[?2004hroot@16ad5062758e:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@16ad5062758e:/app# clear
+[?2004l[H[J[3J[?2004hroot@16ad5062758e:/app# python3 --version
+[?2004lPython 3.13.7
+[?2004hroot@16ad5062758e:/app# cat > /app/run.py << 'EOF'
+[?2004l[?2004h> import asyncio
+[?2004l[?2004h> from typing import Callable, Awaitable
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> async def run_tasks(
+[?2004l[?2004h>     tasks: list[Callable[[], Awaitable[None]]],
+[?2004l[?2004h>     max_concurrent: int,
+[?2004l[?2004h> ) -> None:
+[?2004l[?2004h>     """Run async tasks with a limit on the number of concurrently executing tasks.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Each element of *tasks* is a zero-argument callable that returns an
+[?2004l[?2004h>     awaitable (i.e. an async function to be called).
+[?2004l[?2004h> 
+[?2004l[?2004h>     At most *max_concurrent* tasks will be running (i.e. past their semaphore
+[?2004l[?2004h>     acquire) at any given time.
+[?2004l[?2004h> 
+[?2004l[?2004h>     If the enclosing task is cancelled (for example because the user pressed
+[?2004l[?2004h>     Ctrl+C while ``asyncio.run`` is in use), all in-flight and pending tasks
+[?2004l[?2004h>     are cancelled and awaited so that their ``finally`` / ``cleanup`` code
+[?2004l[?2004h>     still gets the chance to run before the exception propagates.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     semaphore = asyncio.Semaphore(max_concurrent)
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def _limited(task: Callable[[], Awaitable[None]]) -> None:
+[?2004l[?2004h>         async with semaphore:
+[?2004l[?2004h>             await task()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # TaskGroup ensures that if the outer task is cancelled (KeyboardInterrupt
+[?2004l[?2004h>     # -> asyncio.run cancels the main task), every child task is cancelled
+[?2004l[?2004h>     # AND awaited to completion so that finally-blocks / cleanup code executes
+[?2004l[?2004h>     # before the exception propagates outward.
+[?2004l[?2004h>     async with asyncio.TaskGroup() as tg:
+[?2004l[?2004h>         for t in tasks:
+[?2004l[?2004h>             tg.create_task(_limited(t))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@16ad5062758e:/app# cat > /app/test_run.py << 'EOF'
+[?2004l[?2004h> import asyncio
+[?2004l[?2004h> import sys
+[?2004l[?2004h> from run import run_tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 1: basic concurrency limit ----------
+[?2004l[?2004h> async def test_concurrency_limit():
+[?2004l[?2004h>     running = 0
+[?2004l[?2004h>     peak = 0
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def job(i: int):
+[?2004l[?2004h>         nonlocal running, peak
+[?2004l[?2004h>         running += 1
+[?2004l[?2004h>         peak = max(peak, running)
+[?2004l[?2004h>         await asyncio.sleep(0.05)
+[?2004l[?2004h>         running -= 1
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda i=i: job(i) for i in range(10)]
+[?2004l[?2004h>     await run_tasks(tasks, max_concurrent=3)
+[?2004l[?2004h>     assert peak <= 3, f"peak was {peak}, expected <= 3"
+[?2004l[?2004h>     assert peak >= 2, f"peak was {peak}, expected at least 2 (some overlap)"
+[?2004l[?2004h>     print(f"PASS: concurrency limit (peak={peak})")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 2: cleanup runs on cancellation ----------
+[?2004l[?2004h> async def test_cleanup_on_cancel():
+[?2004l[?2004h>     cleaned = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def job(i: int):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await asyncio.sleep(10)  # long-running
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             cleaned.append(i)
+[?2004l[?2004h>             await asyncio.sleep(0)   # simulate async cleanup (yield to loop)
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda i=i: job(i) for i in range(6)]
+[?2004l[?2004h> 
+[?2004l[?2004h>     async with asyncio.TaskGroup() as tg:
+[?2004l[?2004h>         outer = tg.create_task(run_tasks(tasks, max_concurrent=2))
+[?2004l[?2004h>         await asyncio.sleep(0.1)  # let a few tasks start
+[?2004l[?2004h>         outer.cancel()            # simulate KeyboardInterrupt via asyncio.run
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await outer
+[?2004l[?2004h>         except asyncio.CancelledError:
+[?2004l[?2004h>             pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     # At least the tasks that had started should have cleaned up
+[?2004l[?2004h>     # With max_concurrent=2 and 6 tasks, at least 2 were running
+[?2004l[?2004h>     assert len(cleaned) >= 2, f"only {len(cleaned)} tasks cleaned up, expected >= 2"
+[?2004l[?2004h>     print(f"PASS: cleanup on cancel ({len(cleaned)} tasks cleaned up)")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 3: all tasks complete normally ----------
+[?2004l[?2004h> async def test_all_complete():
+[?2004l[?2004h>     done = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def job(i: int):
+[?2004l[?2004h>         await asyncio.sleep(0.01)
+[?2004l[?2004h>         done.append(i)
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda i=i: job(i) for i in range(10)]
+[?2004l[?2004h>     await run_tasks(tasks, max_concurrent=4)
+[?2004l[?2004h>     assert sorted(done) == list(range(10)), f"not all tasks completed: {sorted(done)}"
+[?2004l[?2004h>     print(f"PASS: all {len(done)} tasks completed")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 4: empty task list ----------
+[?2004l[?2004h> async def test_empty():
+[?2004l[?2004h>     await run_tasks([], max_concurrent=5)
+[?2004l[?2004h>     print("PASS: empty task list")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 5: task exception propagates ----------
+[?2004l[?2004h> async def test_exception():
+[?2004l[?2004h>     async def good():
+[?2004l[?2004h>         await asyncio.sleep(0.01)
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def bad():
+[?2004l[?2004h>         await asyncio.sleep(0.01)
+[?2004l[?2004h>         raise ValueError("boom")
+[?2004l[?2004h> 
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await run_tasks([good, bad], max_concurrent=2)
+[?2004l[?2004h>         assert False, "should have raised"
+[?2004l[?2004h>     except (ValueError,* ):
+[?2004l[?2004h>         pass
+[?2004l[?2004h>     except BaseException as e:
+[?2004l[?2004h>         if type(e).__name__ == 'ExceptionGroup' or isinstance(e, ValueError):
+[?2004l[?2004h>             print(f"PASS: exception propagated ({type(e).__name__})")
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             raise
+[?2004l[?2004h> 
+[?2004l[?2004h> async def main():
+[?2004l[?2004h>     await test_concurrency_limit()
+[?2004l[?2004h>     await test_cleanup_on_cancel()
+[?2004l[?2004h>     await test_all_complete()
+[?2004l[?2004h>     await test_empty()
+[?2004l[?2004h>     await test_exception()
+[?2004l[?2004h>     print("\nAll tests passed!")
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(main())
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@16ad5062758e:/app# cd /app && python3 test_run.py
+[?2004l  File [35m"/app/test_run.py"[0m, line [35m80[0m
+    except (ValueError,* [1;31m)[0m:
+                         [1;31m^[0m
+[1;35mSyntaxError[0m: [35minvalid syntax[0m
+[?2004hroot@16ad5062758e:/app# cat > /app/test_run.py << 'EOF'
+[?2004l[?2004h> import asyncio
+[?2004l[?2004h> import sys
+[?2004l[?2004h> from run import run_tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 1: basic concurrency limit ----------
+[?2004l[?2004h> async def test_concurrency_limit():
+[?2004l[?2004h>     running = 0
+[?2004l[?2004h>     peak = 0
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def job(i: int):
+[?2004l[?2004h>         nonlocal running, peak
+[?2004l[?2004h>         running += 1
+[?2004l[?2004h>         peak = max(peak, running)
+[?2004l[?2004h>         await asyncio.sleep(0.05)
+[?2004l[?2004h>         running -= 1
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda i=i: job(i) for i in range(10)]
+[?2004l[?2004h>     await run_tasks(tasks, max_concurrent=3)
+[?2004l[?2004h>     assert peak <= 3, f"peak was {peak}, expected <= 3"
+[?2004l[?2004h>     assert peak >= 2, f"peak was {peak}, expected at least 2 (some overlap)"
+[?2004l[?2004h>     print(f"PASS: concurrency limit (peak={peak})")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 2: cleanup runs on cancellation ----------
+[?2004l[?2004h> async def test_cleanup_on_cancel():
+[?2004l[?2004h>     cleaned = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def job(i: int):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await asyncio.sleep(10)  # long-running
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             cleaned.append(i)
+[?2004l[?2004h>             await asyncio.sleep(0)   # simulate async cleanup (yield to loop)
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda i=i: job(i) for i in range(6)]
+[?2004l[?2004h> 
+[?2004l[?2004h>     outer = asyncio.current_task()
+[?2004l[?2004h>     
+[?2004l[?2004h>     async def runner():
+[?2004l[?2004h>         await run_tasks(tasks, max_concurrent=2)
+[?2004l[?2004h> 
+[?2004l[?2004h>     outer_task = asyncio.create_task(runner())
+[?2004l[?2004h>     await asyncio.sleep(0.1)  # let a few tasks start
+[?2004l[?2004h>     outer_task.cancel()       # simulate KeyboardInterrupt via asyncio.run
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await outer_task
+[?2004l[?2004h>     except asyncio.CancelledError:
+[?2004l[?2004h>         pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     # At least the tasks that had started should have cleaned up
+[?2004l[?2004h>     assert len(cleaned) >= 2, f"only {len(cleaned)} tasks cleaned up, expected >= 2"
+[?2004l[?2004h>     print(f"PASS: cleanup on cancel ({len(cleaned)} tasks cleaned up)")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 3: all tasks complete normally ----------
+[?2004l[?2004h> async def test_all_complete():
+[?2004l[?2004h>     done = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def job(i: int):
+[?2004l[?2004h>         await asyncio.sleep(0.01)
+[?2004l[?2004h>         done.append(i)
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda i=i: job(i) for i in range(10)]
+[?2004l[?2004h>     await run_tasks(tasks, max_concurrent=4)
+[?2004l[?2004h>     assert sorted(done) == list(range(10)), f"not all tasks completed: {sorted(done)}"
+[?2004l[?2004h>     print(f"PASS: all {len(done)} tasks completed")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 4: empty task list ----------
+[?2004l[?2004h> async def test_empty():
+[?2004l[?2004h>     await run_tasks([], max_concurrent=5)
+[?2004l[?2004h>     print("PASS: empty task list")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------- Test 5: task exception propagates ----------
+[?2004l[?2004h> async def test_exception():
+[?2004l[?2004h>     async def good():
+[?2004l[?2004h>         await asyncio.sleep(0.01)
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def bad():
+[?2004l[?2004h>         await asyncio.sleep(0.01)
+[?2004l[?2004h>         raise ValueError("boom")
+[?2004l[?2004h> 
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await run_tasks([good, bad], max_concurrent=2)
+[?2004l[?2004h>         assert False, "should have raised"
+[?2004l[?2004h>     except BaseException as e:
+[?2004l[?2004h>         if isinstance(e, ExceptionGroup) or isinstance(e, ValueError):
+[?2004l[?2004h>             print(f"PASS: exception propagated ({type(e).__name__})")
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             raise
+[?2004l[?2004h> 
+[?2004l[?2004h> async def main():
+[?2004l[?2004h>     await test_concurrency_limit()
+[?2004l[?2004h>     await test_cleanup_on_cancel()
+[?2004l[?2004h>     await test_all_complete()
+[?2004l[?2004h>     await test_empty()
+[?2004l[?2004h>     await test_exception()
+[?2004l[?2004h>     print("\nAll tests passed!")
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(main())
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@16ad5062758e:/app# python3 test_run.py
+[?2004lPASS: concurrency limit (peak=3)
+PASS: cleanup on cancel (2 tasks cleaned up)
+PASS: all 10 tasks completed
+PASS: empty task list
+PASS: exception propagated (ExceptionGroup)
+
+All tests passed!
+[?2004hroot@16ad5062758e:/app# cat /app/run.py
+[?2004limport asyncio
+from typing import Callable, Awaitable
+
+
+async def run_tasks(
+    tasks: list[Callable[[], Awaitable[None]]],
+    max_concurrent: int,
+) -> None:
+    """Run async tasks with a limit on the number of concurrently executing tasks.
+
+    Each element of *tasks* is a zero-argument callable that returns an
+    awaitable (i.e. an async function to be called).
+
+    At most *max_concurrent* tasks will be running (i.e. past their semaphore
+    acquire) at any given time.
+
+    If the enclosing task is cancelled (for example because the user pressed
+    Ctrl+C while ``asyncio.run`` is in use), all in-flight and pending tasks
+    are cancelled and awaited so that their ``finally`` / ``cleanup`` code
+    still gets the chance to run before the exception propagates.
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def _limited(task: Callable[[], Awaitable[None]]) -> None:
+        async with semaphore:
+            await task()
+
+    # TaskGroup ensures that if the outer task is cancelled (KeyboardInterrupt
+    # -> asyncio.run cancels the main task), every child task is cancelled
+    # AND awaited to completion so that finally-blocks / cleanup code executes
+    # before the exception propagates outward.
+    async with asyncio.TaskGroup() as tg:
+        for t in tasks:
+            tg.create_task(_limited(t))
+[?2004hroot@16ad5062758e:/app# python3 -c "from run import run_tasks; print('Import OK:', run_tasks)"
+[?2004lImport OK: <function run_tasks at 0x7052788c4040>
+[?2004hroot@16ad5062758e:/app# 

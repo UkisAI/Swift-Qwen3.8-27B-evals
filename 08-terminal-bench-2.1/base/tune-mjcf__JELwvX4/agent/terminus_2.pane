@@ -1,0 +1,1479 @@
+[?2004hroot@2ea9dcc76068:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@2ea9dcc76068:/app# clear
+[?2004l[H[J[3J[?2004hroot@2ea9dcc76068:/app# ls -la /app
+[?2004ltotal 8
+drwxr-xr-x 1 root root   35 Sep 13  2025 .
+drwxr-xr-x 1 root root  102 Sep  6 15:41 ..
+-rw-r--r-- 1 root root 3112 Sep 13  2025 eval.py
+-rw-r--r-- 1 root root 1254 Sep 13  2025 model_ref.xml
+[?2004hroot@2ea9dcc76068:/app# cat /app/eval.py
+[?2004limport time
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+total_sim_time = 2.0
+atol = 1e-5  # absolute tolerance for state comparison
+pctg = 0.6  # target percentage of reference model time
+n_runs = 20  # number of runs to average timing
+model_path = Path("model.xml")
+model_ref_path = Path("model_ref.xml")
+
+
+def test_correctness():
+    """Compare final states of models with potentially different timesteps"""
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    model_ref = mujoco.MjModel.from_xml_path(str(model_ref_path))
+
+    seed = np.random.randint(0, 10000)
+    final_state = simulate_model(model, seed)
+    final_state_ref = simulate_model(model_ref, seed)
+
+    # compare final states
+    state_diff = np.linalg.norm(final_state - final_state_ref)
+    print(f"Final state difference: {state_diff:.4f}")
+
+    assert np.allclose(final_state, final_state_ref, atol=atol), (
+        f"Final states differ by {state_diff}, exceeding tolerance {atol}"
+    )
+
+
+def simulate_model(model, seed):
+    """Simulate model with randomized initial qpos and return only the final state"""
+    data = mujoco.MjData(model)
+    nstep = int(total_sim_time / model.opt.timestep)
+    # jiggle initial qpos for robustness
+    rng = np.random.default_rng(seed)
+    data.qpos += rng.normal(0, 0.01, size=data.qpos.shape)
+    mujoco.mj_forward(model, data)
+
+    for _ in range(nstep):
+        mujoco.mj_step(model, data)
+
+    full_physics = mujoco.mjtState.mjSTATE_FULLPHYSICS
+    state = np.zeros(mujoco.mj_stateSize(model, full_physics))
+    mujoco.mj_getState(model, data, state, full_physics)
+    assert not np.isnan(state).any(), "Final state contains NaN values"
+    assert not np.isinf(state).any(), "Final state contains Inf values"
+    return state
+
+
+def simulation_time(model, n_runs):
+    """Run n_runs times with different seeds, and return time taken."""
+    times = []
+    for _ in range(n_runs):
+        seed = np.random.randint(0, 10000)
+        time_start = time.perf_counter()
+        _ = simulate_model(model, seed)
+        time_end = time.perf_counter()
+        times.append(time_end - time_start)
+    return np.array(times)
+
+
+def test_model_speed():
+    """Test that new model is faster than the reference model"""
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    model_ref = mujoco.MjModel.from_xml_path(str(model_ref_path))
+
+    # simulate both models for same total time with same random seed
+    times_model = simulation_time(model, n_runs=n_runs)
+    times_model_ref = simulation_time(model_ref, n_runs=n_runs)
+    speedup = (times_model_ref / times_model).mean().item()
+    act_time_pctg = (times_model / times_model_ref).mean().item()
+
+    print(f"Avg simulation time: {times_model.mean().item():.4f} secs")
+    print(f"Avg simulation time (ref): {times_model_ref.mean().item():.4f} secs")
+    print(f"Speedup: {speedup:.2f}x")
+    print(f"Time pctg: {act_time_pctg:.2f}")
+
+    assert act_time_pctg <= pctg, (
+        f"Time pctg {act_time_pctg * 100:.2f}% (need {pctg * 100:.2f}%)"
+    )
+
+
+if __name__ == "__main__":
+    test_correctness()
+    test_model_speed()
+[?2004hroot@2ea9dcc76068:/app# cat /app/model_ref.xml
+[?2004l<!-- Inspired by https://github.com/google-deepmind/mujoco/blob/main/model/plugin/elasticity/cable.xml -->
+<mujoco model="Cable">
+
+  <extension>
+    <plugin plugin="mujoco.elasticity.cable"/>
+  </extension>
+
+  <statistic center="0 0 .3" extent="1"/>
+  <visual>
+    <global elevation="-30"/>
+  </visual>
+
+  <compiler autolimits="true"/>
+
+  <size memory="2M"/>
+
+  <worldbody>
+    <composite type="cable" curve="s" count="41 1 1" size="1" offset="-.3 0 .6" initial="none">
+      <plugin plugin="mujoco.elasticity.cable">
+        <!--Units are in Pa (SI)-->
+        <config key="twist" value="1e7"/>
+        <config key="bend" value="4e6"/>
+        <config key="vmax" value="0.05"/>
+      </plugin>
+      <joint kind="main" damping=".015"/>
+      <geom type="capsule" size=".005" rgba=".8 .2 .1 1" condim="1"/>
+    </composite>
+    <body name="slider" pos=".7 0 .6">
+      <joint type="slide" axis="1 0 0" damping=".1"/>
+      <geom size=".01"/>
+    </body>
+  </worldbody>
+  <equality>
+    <connect name="right_boundary" body1="B_last" body2="slider" anchor=".025 0 0"/>
+  </equality>
+  <contact>
+    <exclude body1="B_last" body2="slider"/>
+  </contact>
+  <actuator>
+    <motor site="S_last" gear="0 0 0 1 0 0" ctrlrange="-.03 .03"/>
+  </actuator>
+</mujoco>[?2004hroot@2ea9dcc76068:/app# python3 -c "import mujoco; print('mujoco', mujoco.__version__)"
+[?2004lmujoco 3.3.5
+[?2004hroot@2ea9dcc76068:/app# python3 -c "import mujoco_plugin as m" 2>&1 | head; echo ---; python3 -c "import importlib; importlib.import_module('mujoco.elasticity.cable')" 2>&1 | head
+[?2004lTraceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import mujoco_plugin as m
+ModuleNotFoundError: No module named 'mujoco_plugin'
+---
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import importlib; importlib.import_module('mujoco.elasticity.cable')
+                      ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.13/importlib/__init__.py", line 88, in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 1387, in _gcd_import
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1310, in _find_and_load_unlocked
+[?2004hroot@2ea9dcc76068:/app# pip list 2>/dev/null | grep -i -E "mujoco|elasticity|plugin"
+[?2004lmujoco              3.3.5
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 -c "
+[?2004l[?2004h> import mujoco
+[?2004l[?2004h> try:
+[?2004l[?2004h>     m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h>     print('LOADED OK')
+[?2004l[?2004h>     print('nbody', m.nbody)
+[?2004l[?2004h>     print('njnt', m.njnt)
+[?2004l[?2004h>     print('ngeom', m.ngeom)
+[?2004l[?2004h>     print('neq', m.neq)
+[?2004l[?2004h>     print('ntendon', m.ntendon)
+[?2004l[?2004h>     print('nactuator', m.nactuator)
+[?2004l[?2004h>     print('ntimestep', m.opt.timestep)
+[?2004l[?2004h> except Exception as e:
+[?2004l[?2004h>     import traceback; traceback.print_exc()
+[?2004l[?2004h> "
+[?2004lLOADED OK
+nbody 42
+njnt 40
+ngeom 41
+neq 1
+ntendon 0
+Traceback (most recent call last):
+  File "<string>", line 11, in <module>
+    print('nactuator', m.nactuator)
+                       ^^^^^^^^^^^
+AttributeError: 'mujoco._structs.MjModel' object has no attribute 'nactuator'. Did you mean: 'actuator'?
+[?2004hroot@2ea9dcc76068:/app# env | grep -i -E "plugin|mujoco"; echo ---SO---; find / -name "*.so" 2>/dev/null | grep -i -E "plugin|elastic|cable|ext" | head; echo ---MJS---; python3 -c "import mujoco, os; print(os.path.dirname(mujoco.__file__))"
+[?2004l---SO---
+/usr/lib/x86_64-linux-gnu/gconv/ISO-2022-CN-EXT.so
+/usr/lib/x86_64-linux-gnu/gconv/ISO_5427-EXT.so
+/usr/lib/x86_64-linux-gnu/krb5/plugins/preauth/spake.so
+/usr/lib/python3.11/lib-dynload/_contextvars.cpython-311-x86_64-linux-gnu.so
+/usr/local/lib/python3.13/lib-dynload/_contextvars.cpython-313-x86_64-linux-gnu.so
+/usr/local/lib/python3.13/lib-dynload/_testexternalinspection.cpython-313-x86_64-linux-gnu.so
+/usr/local/lib/python3.13/site-packages/mujoco/plugin/libactuator.so
+/usr/local/lib/python3.13/site-packages/mujoco/plugin/libelasticity.so
+/usr/local/lib/python3.13/site-packages/mujoco/plugin/libsdf_plugin.so
+/usr/local/lib/python3.13/site-packages/mujoco/plugin/libsensor.so
+---MJS---
+/usr/local/lib/python3.13/site-packages/mujoco
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 -c "
+[?2004l[?2004h> import mujoco
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print('BODIES:')
+[?2004l[?2004h> for i in range(m.nbody):
+[?2004l[?2004h>     print(i, repr(m.body(i).name), 'parent', m.body_parentid[i])
+[?2004l[?2004h> print('JOINTS:')
+[?2004l[?2004h> for i in range(m.njnt):
+[?2004l[?2004h>     print(i, repr(m.joint(i).name), 'type', m.jnt_type[i], 'body', m.jnt_bodyid[i])
+[?2004l[?2004h> " 2>&1 | head -120
+[?2004lBODIES:
+0 'world' parent 0
+1 'B_first' parent 0
+2 'B_1' parent 1
+3 'B_2' parent 2
+4 'B_3' parent 3
+5 'B_4' parent 4
+6 'B_5' parent 5
+7 'B_6' parent 6
+8 'B_7' parent 7
+9 'B_8' parent 8
+10 'B_9' parent 9
+11 'B_10' parent 10
+12 'B_11' parent 11
+13 'B_12' parent 12
+14 'B_13' parent 13
+15 'B_14' parent 14
+16 'B_15' parent 15
+17 'B_16' parent 16
+18 'B_17' parent 17
+19 'B_18' parent 18
+20 'B_19' parent 19
+21 'B_20' parent 20
+22 'B_21' parent 21
+23 'B_22' parent 22
+24 'B_23' parent 23
+25 'B_24' parent 24
+26 'B_25' parent 25
+27 'B_26' parent 26
+28 'B_27' parent 27
+29 'B_28' parent 28
+30 'B_29' parent 29
+31 'B_30' parent 30
+32 'B_31' parent 31
+33 'B_32' parent 32
+34 'B_33' parent 33
+35 'B_34' parent 34
+36 'B_35' parent 35
+37 'B_36' parent 36
+38 'B_37' parent 37
+39 'B_38' parent 38
+40 'B_last' parent 39
+41 'slider' parent 0
+JOINTS:
+0 'J_1' type 1 body 2
+1 'J_2' type 1 body 3
+2 'J_3' type 1 body 4
+3 'J_4' type 1 body 5
+4 'J_5' type 1 body 6
+5 'J_6' type 1 body 7
+6 'J_7' type 1 body 8
+7 'J_8' type 1 body 9
+8 'J_9' type 1 body 10
+9 'J_10' type 1 body 11
+10 'J_11' type 1 body 12
+11 'J_12' type 1 body 13
+12 'J_13' type 1 body 14
+13 'J_14' type 1 body 15
+14 'J_15' type 1 body 16
+15 'J_16' type 1 body 17
+16 'J_17' type 1 body 18
+17 'J_18' type 1 body 19
+18 'J_19' type 1 body 20
+19 'J_20' type 1 body 21
+20 'J_21' type 1 body 22
+21 'J_22' type 1 body 23
+22 'J_23' type 1 body 24
+23 'J_24' type 1 body 25
+24 'J_25' type 1 body 26
+25 'J_26' type 1 body 27
+26 'J_27' type 1 body 28
+27 'J_28' type 1 body 29
+28 'J_29' type 1 body 30
+29 'J_30' type 1 body 31
+30 'J_31' type 1 body 32
+31 'J_32' type 1 body 33
+32 'J_33' type 1 body 34
+33 'J_34' type 1 body 35
+34 'J_35' type 1 body 36
+35 'J_36' type 1 body 37
+36 'J_37' type 1 body 38
+37 'J_38' type 1 body 39
+38 'J_last' type 1 body 40
+39 '' type 2 body 41
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 -c "
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print('timestep', m.opt.timestep, 'nstep for 2s =', int(2.0/m.opt.timestep))
+[?2004l[?2004h> print('dof_damping', np.round(m.dof_damping,4))
+[?2004l[?2004h> print('joint stiffness(m.jnt_stiffness or dof)')
+[?2004l[?2004h> print('  jnt_stiffness' , np.round(getattr(m,'jnt_stiffness',np.nan),1))
+[?2004l[?2004h> print('body_mass', np.round(m.body_mass[:5],3))
+[?2004l[?2004h> print('neq breakdown:', m.eq_type, 'nconmax', m.nconmax)
+[?2004l[?2004h> print('iterations', m.opt.iterations, 'iterates', m.opt.iterates)
+[?2004l[?2004h> print('enableflags / disableflags:', m.opt.disableflags, m.opt.enableflags)
+[?2004l[?2004h> "
+[?2004ltimestep 0.002 nstep for 2s = 1000
+dof_damping [0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.1  ]
+joint stiffness(m.jnt_stiffness or dof)
+  jnt_stiffness [0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.
+ 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
+body_mass [0.    0.002 0.002 0.002 0.002]
+neq breakdown: [0] nconmax -1
+Traceback (most recent call last):
+  File [35m"<string>"[0m, line [35m10[0m, in [35m<module>[0m
+    print('iterations', m.opt.iterations, 'iterates', [1;31mm.opt.iterates[0m)
+                                                      [1;31m^^^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjOption' object has no attribute 'iterates'. Did you mean: 'iterations'?[0m
+[?2004hroot@2ea9dcc76068:/app# cd /app && time python3 eval.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/eval.py"[0m, line [35m87[0m, in [35m<module>[0m
+    [31mtest_correctness[0m[1;31m()[0m
+    [31m~~~~~~~~~~~~~~~~[0m[1;31m^^[0m
+  File [35m"/app/eval.py"[0m, line [35m17[0m, in [35mtest_correctness[0m
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+[1;35mValueError[0m: [35mParseXML: Error opening file 'model.xml': No such file or directory[0m
+
+real	0m0.469s
+user	0m0.474s
+sys	0m0.041s
+[?2004hroot@2ea9dcc76068:/app# cd /app && cp model_ref.xml model.xml && cat > profile.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def load(p):
+[?2004l[?2004h>     return mujoco.MjModel.from_xml_path(p)
+[?2004l[?2004h> def steps(m, n=1000, seed=123):
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n):
+[?2004l[?2004h>         mujoco.mj_step(m,d)
+[?2004l[?2004h>     t1=time.perf_counter()
+[?2004l[?2004h>     return d, t1-t0
+[?2004l[?2004h> m = load('model.xml')
+[?2004l[?2004h> print('disableflags', m.opt.disableflags, 'constrain', m.opt.constrain, 'iterations', m.opt.iterations, 'solimp head', m.opt.solimp[:1])
+[?2004l[?2004h> # count contacts at a mid state
+[?2004l[?2004h> d,_ = steps(m, 200)
+[?2004l[?2004h> print('midstep ncon =', d.ncon, ' nconmax', m.nconmax)
+[?2004l[?2004h> import os
+[?2004l[?2004h> # time full 1000
+[?2004l[?2004h> dt, t = steps(m, 1000)
+[?2004l[?2004h> print('BASELINE 1000 steps: %.4f s  (per-step %.2f us)'%(t, t/1000*1e6))
+[?2004l[?2004h> # copy model, disable contact
+[?2004l[?2004h> import copy
+[?2004l[?2004h> m2 = mujoco.MjModel.from_xml_string(mujoco.mju_fileToString if False else open('model.xml').read())
+[?2004l[?2004h> m2.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+[?2004l[?2004h> d2,_ = steps(m2, 1000, seed=123)
+[?2004l[?2004h> print('NO-CONTACT 1000 steps: %.4f s  (per-step %.2f us)'%(*[ (lambda t: (t, t/1000*1e6))(1)] and (t2:=0) if False else (0,0)))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# echo written
+[?2004lwritten
+[?2004hroot@2ea9dcc76068:/app# cat > /app/profile.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def steps(m, n=1000, seed=123):
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n):
+[?2004l[?2004h>         mujoco.mj_step(m,d)
+[?2004l[?2004h>     t1=time.perf_counter()
+[?2004l[?2004h>     return d, t1-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> src = open('model.xml').read()
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h> print('disableflags', m.opt.disableflags, 'constrain', int(m.opt.constrain), 'iterations', m.opt.iterations)
+[?2004l[?2004h> 
+[?2004l[?2004h> d, _ = steps(m, 200, seed=123)
+[?2004l[?2004h> print('midstep ncon =', d.ncon, ' nconmax', m.nconmax, ' total geom-contact potential')
+[?2004l[?2004h> 
+[?2004l[?2004h> t_base = steps(m, 1000, seed=123)[2-1-1]  # just dummy
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# echo 'rewriting simply'
+[?2004lrewriting simply
+[?2004hroot@2ea9dcc76068:/app# cat > /app/profile.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> 
+[?2004l[?2004h> def run(model, n=1000, seed=123, timed=True):
+[?2004l[?2004h>     d = mujoco.MjData(model)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0, 0.01, size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model, d)
+[?2004l[?2004h>     t0 = time.perf_counter()
+[?2004l[?2004h>     for _ in range(n):
+[?2004l[?2004h>         mujoco.mj_step(model, d)
+[?2004l[?2004h>     t1 = time.perf_counter()
+[?2004l[?2004h>     st = np.zeros(mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(model, d, st, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+[?2004l[?2004h>     return d, (t1 - t0), st
+[?2004l[?2004h> 
+[?2004l[?2004h> src = open('model.xml').read()
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h> print('disableflags', m.opt.disableflags, 'constrain', int(m.opt.constrain),
+[?2004l[?2004h>       'iterations', m.opt.iterates, '/', m.opt.iterations)
+[?2004l[?2004h> print('timestep', m.opt.timestep)
+[?2004l[?2004h> 
+[?2004l[?2004h> # contacts mid-run
+[?2004l[?2004h> d, _, _ = run(m, 200, seed=123, timed=False)
+[?2004l[?2004h> print('mid ncon =', d.ncon)
+[?2004l[?2004h> 
+[?2004l[?2004h> db, tb, sb = run(m, 1000, seed=123)
+[?2004l[?2004h> print('BASELINE  1000 steps: %.4f s  (%.2f us/step)' % (tb, tb/1000*1e6))
+[?2004l[?2004h> 
+[?2004l[?2004h> m2 = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h> m2.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+[?2004l[?2004h> dc, tc, sc = run(m2, 1000, seed=123)
+[?2004l[?2004h> print('NOCONTACT 1000 steps: %.4f s  (%.2f us/step)' % (tc, tc/1000*1e6))
+[?2004l[?2004h> print('speedup vs baseline: %.2fx, time%%=%.1f' % (tb/tc, tc/tb*100))
+[?2004l[?2004h> print('state diff base vs nocontact: %.3e' % np.max(np.abs(db-something if False else sb-sc)))
+[?2004l[?2004h> print('norm diff base vs nocontact:', np.linalg.norm(sb-sc))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/profile.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/profile.py"[0m, line [35m18[0m, in [35m<module>[0m
+    print('disableflags', m.opt.disableflags, 'constrain', int([1;31mm.opt.constrain[0m),
+                                                               [1;31m^^^^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjOption' object has no attribute 'constrain'[0m
+[?2004hroot@2ea9dcc76068:/app# cat > /app/profile.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> 
+[?2004l[?2004h> def run(model, n=1000, seed=123):
+[?2004l[?2004h>     d = mujoco.MjData(model)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0, 0.01, size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model, d)
+[?2004l[?2004h>     t0 = time.perf_counter()
+[?2004l[?2004h>     for _ in range(n):
+[?2004l[?2004h>         mujoco.mj_step(model, d)
+[?2004l[?2004h>     t1 = time.perf_counter()
+[?2004l[?2004h>     st = np.zeros(mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(model, d, st, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+[?2004l[?2004h>     return d, (t1 - t0), st
+[?2004l[?2004h> 
+[?2004l[?2004h> src = open('model.xml').read()
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h> print('disableflags', m.opt.disableflags, 'iterations', m.opt.iterates, 'of', m.opt.iterations)
+[?2004l[?2004h> print('timestep', m.opt.timestep)
+[?2004l[?2004h> 
+[?2004l[?2004h> d, _, _ = run(m, 200, seed=123)
+[?2004l[?2004h> print('mid ncon =', d.ncon)
+[?2004l[?2004h> 
+[?2004l[?2004h> db, tb, sb = run(m, 1000, seed=123)
+[?2004l[?2004h> print('BASELINE  1000 steps: %.4f s  (%.2f us/step)' % (tb, tb/1000*1e6))
+[?2004l[?2004h> 
+[?2004l[?2004h> m2 = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h> m2.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+[?2004l[?2004h> dc, tc, sc = run(m2, 1000, seed=123)
+[?2004l[?2004h> print('NOCONTACT 1000 steps: %.4f s  (%.2f us/step)' % (tc, tc/1000*1e6))
+[?2004l[?2004h> print('speedup vs baseline: %.2fx, time%%=%.1f' % (tb/tc, tc/tb*100))
+[?2004l[?2004h> print('norm diff base vs nocontact:', np.linalg.norm(sb-sc))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/profile.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/profile.py"[0m, line [35m18[0m, in [35m<module>[0m
+    print('disableflags', m.opt.disableflags, 'iterations', [1;31mm.opt.iterates[0m, 'of', m.opt.iterations)
+                                                            [1;31m^^^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjOption' object has no attribute 'iterates'. Did you mean: 'iterations'?[0m
+[?2004hroot@2ea9dcc76068:/app# cd /app && sed -i "s/'iterations', m.opt.iterates, 'of', m.opt.iterations/'iterations', m.opt.iterations/" profile.py && python3 profile.py
+[?2004ldisableflags 0 iterations 100
+timestep 0.002
+mid ncon = 0
+BASELINE  1000 steps: 0.5026 s  (502.62 us/step)
+NOCONTACT 1000 steps: 0.4999 s  (499.93 us/step)
+speedup vs baseline: 1.01x, time%=99.5
+norm diff base vs nocontact: 0.0
+[?2004hroot@2ea9dcc76068:/app# cat > /app/iters.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def run(model, n=1000, seed=7):
+[?2004l[?2004h>     d = mujoco.MjData(model)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0, 0.01, size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model, d)
+[?2004l[?2004h>     t0 = time.perf_counter()
+[?2004l[?2004h>     for _ in range(n):
+[?2004l[?2004h>         mujoco.mj_step(model, d)
+[?2004l[?2004h>     t1 = time.perf_counter()
+[?2004l[?2004h>     st = np.zeros(mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(model, d, st, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+[?2004l[?2004h>     return (t1 - t0), st
+[?2004l[?2004h> 
+[?2004l[?2004h> src = open('model_ref.xml').read()
+[?2004l[?2004h> mbase = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h> print('default iterations:', mbase.opt.iterations)
+[?2004l[?2004h> tb, sb = run(mbase)
+[?2004l[?2004h> print('BASE iters=%d: %.4f s  per-step %.2f us' % (mbase.opt.iterations, tb, tb/1000*1e6))
+[?2004l[?2004h> np.save('base_state.npy', sb)
+[?2004l[?2004h> for it in [50, 30, 20, 10, 5, 3, 1]:
+[?2004l[?2004h>     m = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h>     m.opt.iterations = it
+[?2004l[?2004h>     ncon = None
+[?2004l[?2004h>     t, s = run(m)
+[?2004l[?2004h>     print('iters=%2d: %.4f s  per-step %.2f us  time%%=%4.1f  maxdiff vs base=%.2e  normdiff=%.2e' % (
+[?2004l[?2004h>         it, t, t/1000*1e6, t/tb*100, np.max(np.abs(s-sb)), np.linalg.norm(s-sb)))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/iters.py
+[?2004ldefault iterations: 100
+BASE iters=100: 0.4482 s  per-step 448.18 us
+iters=50: 0.4444 s  per-step 444.38 us  time%=99.2  maxdiff vs base=0.00e+00  normdiff=0.00e+00
+iters=30: 0.4994 s  per-step 499.45 us  time%=111.4  maxdiff vs base=0.00e+00  normdiff=0.00e+00
+iters=20: 0.4965 s  per-step 496.47 us  time%=110.8  maxdiff vs base=0.00e+00  normdiff=0.00e+00
+iters=10: 0.4846 s  per-step 484.57 us  time%=108.1  maxdiff vs base=0.00e+00  normdiff=0.00e+00
+iters= 5: 0.5086 s  per-step 508.62 us  time%=113.5  maxdiff vs base=0.00e+00  normdiff=0.00e+00
+iters= 3: 0.5095 s  per-step 509.54 us  time%=113.7  maxdiff vs base=0.00e+00  normdiff=0.00e+00
+iters= 1: 0.4997 s  per-step 499.66 us  time%=111.5  maxdiff vs base=0.00e+00  normdiff=0.00e+00
+[?2004hroot@2ea9dcc76068:/app# cat > /app/dump.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> np.set_printoptions(precision=4, suppress=True)
+[?2004l[?2004h> print('nbody', m.nbody, 'njnt', m.njnt, 'ngeom', m.ngeom, 'ndof', m.ndof)
+[?2004l[?2004h> print('body_parentid:', m.body_parentid)
+[?2004l[?2004h> print('body_pos[:6]:', m.body_pos[:6])
+[?2004l[?2004h> print('body_pos[-3:]:', m.body_pos[-3:])
+[?2004l[?2004h> print('body_mass:', np.round(m.body_mass,4)[:6], '...')
+[?2004l[?2004h> print('geom_type:', m.geom_type[:6], '...')
+[?2004l[?2004h> print('geom_size:', np.round(m.geom_size,4)[:6])
+[?2004l[?2004h> print('geom_pos[:6]:', np.round(m.geom_pos,4)[:6])
+[?2004l[?2004h> print('geom_pos[-3:]:', np.round(m.geom_pos,4)[-3:])
+[?2004l[?2004h> print('geom_condim:', m.geom_condim[:6], m.geom_condim[int(m.ngeom)-1])
+[?2004l[?2004h> print('geom_bodyid:', m.geom_bodyid[:6], m.geom_bodyid[int(m.ngeom)-1])
+[?2004l[?2004h> print('jnt_axis[:4]:', np.round(m.jnt_axis[:4],4))
+[?2004l[?2004h> print('all jnt axes unique:', np.unique(np.round(m.jnt_axis[:m.njnt-1],3).reshape(-1,3),axis=0)[:3], 'nunique', len(np.unique(np.round(m.jnt_axis[:m.njnt-1],4).reshape(-1,3),axis=0)))
+[?2004l[?2004h> print('jnt_type:', m.jnt_type[:4], m.jnt_type[int(m.njnt)-1])
+[?2004l[?2004h> print('EQ: type', m.eq_type, 'obj1', m.eq_obj1id, 'obj2', m.eq_obj2id, 'data', m.eq_data)
+[?2004l[?2004h> print('eq_active', m.eq_active, 'eq_solref', m.eq_solref, 'eq_solimp', m.eq_solimp)
+[?2004l[?2004h> print('actuator: ntendon', m.ntendon, 'nu', m.nu)
+[?2004l[?2004h> print('  actu_transmission', m.actuator_transmission, 'actu_gear', m.actuator_gear)
+[?2004l[?2004h> print('  actu_gain', m.actuator_gain, 'ctrlrange', m.actuator_ctrlrange)
+[?2004l[?2004h> print('option timestep', m.opt.timestep, 'gravity', m.opt.gravity, 'wind', m.opt.wind)
+[?2004l[?2004h> print('nflex', getattr(m,'nflex',None))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/dump.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/dump.py"[0m, line [35m4[0m, in [35m<module>[0m
+    print('nbody', m.nbody, 'njnt', m.njnt, 'ngeom', m.ngeom, 'ndof', [1;31mm.ndof[0m)
+                                                                      [1;31m^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjModel' object has no attribute 'ndof'[0m
+[?2004hroot@2ea9dcc76068:/app# cd /app && sed -i 's/m.ndof/m.nv/' dump.py && python3 dump.py
+[?2004lnbody 42 njnt 40 ngeom 41 ndof 118
+body_parentid: [ 0  0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22
+ 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39  0]
+body_pos[:6]: [[ 0.     0.     0.   ]
+ [-0.3    0.     0.6  ]
+ [ 0.025  0.     0.   ]
+ [ 0.025  0.     0.   ]
+ [ 0.025  0.     0.   ]
+ [ 0.025  0.     0.   ]]
+body_pos[-3:]: [[0.025 0.    0.   ]
+ [0.025 0.    0.   ]
+ [0.7   0.    0.6  ]]
+body_mass: [0.     0.0025 0.0025 0.0025 0.0025 0.0025] ...
+geom_type: [3 3 3 3 3 3] ...
+geom_size: [[0.005  0.0125 0.    ]
+ [0.005  0.0125 0.    ]
+ [0.005  0.0125 0.    ]
+ [0.005  0.0125 0.    ]
+ [0.005  0.0125 0.    ]
+ [0.005  0.0125 0.    ]]
+geom_pos[:6]: [[0.0125 0.     0.    ]
+ [0.0125 0.     0.    ]
+ [0.0125 0.     0.    ]
+ [0.0125 0.     0.    ]
+ [0.0125 0.     0.    ]
+ [0.0125 0.     0.    ]]
+geom_pos[-3:]: [[0.0125 0.     0.    ]
+ [0.0125 0.     0.    ]
+ [0.     0.     0.    ]]
+geom_condim: [1 1 1 1 1 1] 3
+geom_bodyid: [1 2 3 4 5 6] 41
+jnt_axis[:4]: [[0. 0. 1.]
+ [0. 0. 1.]
+ [0. 0. 1.]
+ [0. 0. 1.]]
+all jnt axes unique: [[0. 0. 1.]] nunique 1
+jnt_type: [1 1 1 1] 2
+EQ: type [0] obj1 [40] obj2 [41] data [[0.025 0.    0.    0.    0.    0.    0.    0.    0.    0.    1.   ]]
+Traceback (most recent call last):
+  File [35m"/app/dump.py"[0m, line [35m19[0m, in [35m<module>[0m
+    print('eq_active', [1;31mm.eq_active[0m, 'eq_solref', m.eq_solref, 'eq_solimp', m.eq_solimp)
+                       [1;31m^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjModel' object has no attribute 'eq_active'. Did you mean: 'eq_active0'?[0m
+[?2004hroot@2ea9dcc76068:/app# pip show -f mujoco 2>/dev/null | grep -i plugin; echo '--- RECORD grep ---'; python3 - <<'PY'
+[?2004l[?2004h> import os, glob
+[?2004l[?2004h> base = '/usr/local/lib/python3.13/site-packages'
+[?2004l[?2004h> rec = os.path.join(base, 'mujoco-3.3.5.dist-info', 'RECORD')
+[?2004l[?2004h> print('rec exists', os.path.exists(rec))
+[?2004l[?2004h> found = [l for l in open(rec) if 'plugin' in l.lower()]
+[?2004l[?2004h> print('plugin files in wheel:'); [print(' ', x) for x in found]
+[?2004l[?2004h> PY
+[?2004l  mujoco/include/mujoco/mjplugin.h
+  mujoco/plugin/libactuator.so
+  mujoco/plugin/libelasticity.so
+  mujoco/plugin/libsdf_plugin.so
+  mujoco/plugin/libsensor.so
+--- RECORD grep ---
+rec exists True
+plugin files in wheel:
+  mujoco/include/mujoco/mjplugin.h,sha256=ZdXjyxk3NqPsD4NOaGSgg-LDnmGxk8uCzcJF42HppY4,7676
+
+  mujoco/plugin/libactuator.so,sha256=0H0sxHaidjiMSf8sbxicBESDWg8nHJY6DxWhQ3A_pv0,324544
+
+  mujoco/plugin/libelasticity.so,sha256=VtSWEvUzzvh0h1anWXiGuTO5FJvo4JK8v6UC_7xhSAs,339512
+
+  mujoco/plugin/libsdf_plugin.so,sha256=cukr0L-RPNA4VxBChoQCwkbhsmMpFcPUteJX57J4-zM,366440
+
+  mujoco/plugin/libsensor.so,sha256=ISxXpw8wFViuIp47E2R-j5vR7DXnr7ii3P_-FBwG1ZU,644216
+
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print('nv', m.nv, 'nq', m.nq, 'na', m.na)
+[?2004l[?2004h> print('njnt', m.njnt, 'jnt_dof sum:', int(np.sum(m.jnt_dof)))
+[?2004l[?2004h> print('nflex', m.nflex, 'nplugin', getattr(m, 'nplugin', None))
+[?2004l[?2004h> try:
+[?2004l[?2004h>     print('flex dof sum', np.sum(m.flex_dof) if hasattr(m,'flex_dof') else 'n/a')
+[?2004l[?2004h> except Exception as e:
+[?2004l[?2004h>     print('flex_dof err', e)
+[?2004l[?2004h> print('nv breakdown check: jnt_dof sum + flex = ?')
+[?2004l[?2004h> jd = int(np.sum(m.jnt_dof))
+[?2004l[?2004h> fl = int(np.sum(m.flex_dof)) if hasattr(m,'flex_dof') else 0
+[?2004l[?2004h> print('  joints', jd, 'flex', fl, 'total', jd+fl, '== nv?', m.nv)
+[?2004l[?2004h> print('nq - nflex q:', m.nq)
+[?2004l[?2004h> PY
+[?2004lnv 118 nq 157 na 0
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m4[0m, in [35m<module>[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjModel' object has no attribute 'jnt_dof'. Did you mean: 'jnt_pos'?[0m
+[?2004hroot@2ea9dcc76068:/app# cat > /app/dt_test.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> 
+[?2004l[?2004h> SIZE = None
+[?2004l[?2004h> def final_state(model, seed):
+[?2004l[?2004h>     data = mujoco.MjData(model)
+[?2004l[?2004h>     nstep = int(2.0 / model.opt.timestep)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     data.qpos += rng.normal(0, 0.01, size=data.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model, data)
+[?2004l[?2004h>     for _ in range(nstep):
+[?2004l[?2004h>         mujoco.mj_step(model, data)
+[?2004l[?2004h>     sz = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+[?2004l[?2004h>     st = np.zeros(sz)
+[?2004l[?2004h>     mujoco.mj_getState(model, data, st, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+[?2004l[?2004h>     return st, nstep
+[?2004l[?2004h> 
+[?2004l[?2004h> ref_src = open('model_ref.xml').read()
+[?2004l[?2004h> seeds = [1, 7, 42, 99, 12345, 2024]
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_string(ref_src)
+[?2004l[?2004h> print('ref timestep', mref.opt.timestep, 'nstep', int(2.0/mref.opt.timestep), 'nflex', mref.nflex)
+[?2004l[?2004h> print('FULLPHYSICS state size =', mujoco.mj_stateSize(mref, mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h> ref_states = {}
+[?2004l[?2004h> for s in seeds:
+[?2004l[?2004h>     ref_states[s],_ = final_state(mref, s)
+[?2004l[?2004h> 
+[?2004l[?2004h> def timed_run(model, seed):
+[?2004l[?2004h>     t0=time.perf_counter(); st,_=final_state(model,seed); t1=time.perf_counter()
+[?2004l[?2004h>     return st, t1-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> for dt in [0.002, 0.003, 0.0035, 0.004, 0.005]:
+[?2004l[?2004h>     src = ref_src.replace('<compiler', '<option timestep="%g"/>
+[?2004l[?2004h>   <compiler' % dt)
+[?2004l[?2004h>     m = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h>     st0, tdt = timed_run(m, seeds[0])
+[?2004l[?2004h>     nstep = int(2.0/m.opt.timestep)
+[?2004l[?2004h>     diffs=[]; bad=False
+[?2004l[?2004h>     for s in seeds:
+[?2004l[?2004h>         st,_ = timed_run(m, s)
+[?2004l[?2004h>         if np.isnan(st).any() or np.isinf(st).any(): bad=True
+[?2004l[?2004h>         diffs.append(np.linalg.norm(st - ref_states[s]))
+[?2004l[?2004h>     print('dt=%.4g nstep=%4d  one-run-time=%.4fs  maxdiff_vs_ref=%.3e  naninf=%s' %
+[?2004l[?2004h>           (dt, nstep, tdt, max(diffs), bad))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/dt_test.py
+[?2004l  File [35m"/app/dt_test.py"[0m, line [35m31[0m
+    src = ref_src.replace('<compiler', [1;31m'[0m<option timestep="%g"/>
+                                       [1;31m^[0m
+[1;35mSyntaxError[0m: [35munterminated string literal (detected at line 31)[0m
+[?2004hroot@2ea9dcc76068:/app# cat > /app/dt_test.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> 
+[?2004l[?2004h> def final_state(model, seed):
+[?2004l[?2004h>     data = mujoco.MjData(model)
+[?2004l[?2004h>     nstep = int(2.0 / model.opt.timestep)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     data.qpos += rng.normal(0, 0.01, size=data.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model, data)
+[?2004l[?2004h>     for _ in range(nstep):
+[?2004l[?2004h>         mujoco.mj_step(model, data)
+[?2004l[?2004h>     sz = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+[?2004l[?2004h>     st = np.zeros(sz)
+[?2004l[?2004h>     mujoco.mj_getState(model, data, st, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+[?2004l[?2004h>     return st, nstep
+[?2004l[?2004h> 
+[?2004l[?2004h> ref_src = open('model_ref.xml').read()
+[?2004l[?2004h> seeds = [1, 7, 42, 99, 12345, 2024]
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_string(ref_src)
+[?2004l[?2004h> print('ref timestep', mref.opt.timestep, 'nstep', int(2.0/mref.opt.timestep), 'nflex', mref.nflex)
+[?2004l[?2004h> print('FULLPHYSICS state size =', mujoco.mj_stateSize(mref, mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h> ref_states = {}
+[?2004l[?2004h> for s in seeds:
+[?2004l[?2004h>     ref_states[s],_ = final_state(mref, s)
+[?2004l[?2004h> 
+[?2004l[?2004h> def timed_run(model, seed):
+[?2004l[?2004h>     t0=time.perf_counter(); st,nstep=final_state(model,seed); t1=time.perf_counter()
+[?2004l[?2004h>     return st, nstep, t1-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> # sanity: ref vs ref
+[?2004l[?2004h> _, nref, tremf = timed_run(mref, seeds[0])
+[?2004l[?2004h> print('ref one-run-time=%.4fs' % tremf)
+[?2004l[?2004h> 
+[?2004l[?2004h> for dt in [0.002, 0.003, 0.0035, 0.004, 0.005]:
+[?2004l[?2004h>     tag = '<option timestep="%g"/>' % dt
+[?2004l[?2004h>     src = ref_src.replace('<compiler autolimits="true"/>', tag + '<compiler autolimits="true"/>')
+[?2004l[?2004h>     m = mujoco.MjModel.from_xml_string(src)
+[?2004l[?2004h>     st0, nstep0, tdt = timed_run(m, seeds[0])
+[?2004l[?2004h>     diffs=[]; bad=False
+[?2004l[?2004h>     for s in seeds:
+[?2004l[?2004h>         st,_,_ = timed_run(m, s)
+[?2004l[?2004h>         if np.isnan(st).any() or np.isinf(st).any(): bad=True
+[?2004l[?2004h>         diffs.append(np.linalg.norm(st - ref_states[s]))
+[?2004l[?2004h>     print('dt=%.4g nstep=%4d  one-run=%.4fs  maxdiff_vs_ref=%.3e  naninf=%s' % (dt, nstep0, tdt, max(diffs), bad))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/dt_test.py
+[?2004lref timestep 0.002 nstep 1000 nflex 0
+FULLPHYSICS state size = 276
+ref one-run-time=0.4097s
+dt=0.002 nstep=1000  one-run=0.4180s  maxdiff_vs_ref=0.000e+00  naninf=False
+dt=0.003 nstep= 666  one-run=0.2939s  maxdiff_vs_ref=4.049e-03  naninf=False
+dt=0.0035 nstep= 571  one-run=0.2753s  maxdiff_vs_ref=4.045e-03  naninf=False
+dt=0.004 nstep= 500  one-run=0.2377s  maxdiff_vs_ref=3.034e-03  naninf=False
+dt=0.005 nstep= 400  one-run=0.1798s  maxdiff_vs_ref=5.381e-03  naninf=False
+[?2004hroot@2ea9dcc76068:/app# cat > /app/cost.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def t(model, n=1000):
+[?2004l[?2004h>     d = mujoco.MjData(model)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(model,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> print('mjtJoint:', {getattr(mujoco.mjtJoint,k):k for k in dir(mujoco.mjtJoint) if not k.startswith('_')})
+[?2004l[?2004h> 
+[?2004l[?2004h> free = "<mujoco>" + ''.join(f"<worldbody><body><joint type='free'/><geom size='0.01'/></body></worldbody></mujoco>" for _ in range(0))
+[?2004l[?2004h> def freebody(k):
+[?2004l[?2004h>     bodies=''.join("<body><joint type='free'/></body>" for _ in range(k))
+[?2004l[?2004h>     return f'<mujoco><worldbody>{bodies}</worldbody></mujoco>'
+[?2004l[?2004h> for k in [1,5,20,40]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(freebody(k))
+[?2004l[?2004h>     print('freebody x%d nv=%d: %.4f s' % (k, m.nv, t(m)))
+[?2004l[?2004h> 
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> mfull = mujoco.MjModel.from_xml_string(ref)
+[?2004l[?2004h> print('FULL cable: %.4f s' % t(mfull))
+[?2004l[?2004h> mz = mujoco.MjModel.from_xml_string(ref.replace('value="1e7"','value="0"').replace('value="4e6"','value="0"')))
+[?2004l[?2004h> print('ZERO stiff cable: %.4f s' % t(mz))
+[?2004l[?2004h> # short cable
+[?2004l[?2004h> for c in [21,11,5,1]:
+[?2004l[?2004h>     ms = mujoco.MjModel.from_xml_string(ref.replace('count="41 1 1"', f'count="{c} 1 1"'))
+[?2004l[?2004h>     print('cable count=%d nv=%d: %.4f s' % (c, ms.nv, t(ms)))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/cost.py
+[?2004l  File [35m"/app/cost.py"[0m, line [35m23[0m
+    mz = mujoco.MjModel.from_xml_string(ref.replace('value="1e7"','value="0"').replace('value="4e6"','value="0"'))[1;31m)[0m
+                                                                                                                  [1;31m^[0m
+[1;35mSyntaxError[0m: [35munmatched ')'[0m
+[?2004hroot@2ea9dcc76068:/app# cat > /app/cost.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def t(model, n=1000):
+[?2004l[?2004h>     d = mujoco.MjData(model)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(model,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> print('mjtJoint:', {getattr(mujoco.mjtJoint,k):k for k in dir(mujoco.mjtJoint) if not k.startswith('_')})
+[?2004l[?2004h> def freebody(k):
+[?2004l[?2004h>     bodies=''.join("<body><joint type='free'/></body>" for _ in range(k))
+[?2004l[?2004h>     return f'<mujoco><worldbody>{bodies}</worldbody></mujoco>'
+[?2004l[?2004h> for k in [1,5,20,40]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(freebody(k))
+[?2004l[?2004h>     print('freebody x%-2d nv=%3d: %.4f s' % (k, m.nv, t(m)))
+[?2004l[?2004h> 
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> mfull = mujoco.MjModel.from_xml_string(ref)
+[?2004l[?2004h> print('FULL cable    nv=%3d: %.4f s' % (mfull.nv, t(mfull)))
+[?2004l[?2004h> srcz = ref.replace('value="1e7"','value="0"').replace('value="4e6"','value="0"')
+[?2004l[?2004h> mz = mujoco.MjModel.from_xml_string(srcz)
+[?2004l[?2004h> print('ZERO stiff    nv=%3d: %.4f s' % (mz.nv, t(mz)))
+[?2004l[?2004h> for c in [41,21,11,5,1]:
+[?2004l[?2004h>     ms = mujoco.MjModel.from_xml_string(ref.replace('count="41 1 1"','count="%d 1 1"'%c))
+[?2004l[?2004h>     print('cable count=%-2d nv=%3d: %.4f s' % (c, ms.nv, t(ms)))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/cost.py
+[?2004lmjtJoint: {<mjtJoint.mjJNT_BALL: 1>: 'mjJNT_BALL', <mjtJoint.mjJNT_FREE: 0>: 'mjJNT_FREE', <mjtJoint.mjJNT_HINGE: 3>: 'mjJNT_HINGE', <mjtJoint.mjJNT_SLIDE: 2>: 'mjJNT_SLIDE', <property object at 0x77265bf51e90>: 'name', <property object at 0x77265bf521b0>: 'value'}
+Traceback (most recent call last):
+  File [35m"/app/cost.py"[0m, line [35m15[0m, in [35m<module>[0m
+    m=mujoco.MjModel.from_xml_string(freebody(k))
+[1;35mValueError[0m: [35mError: mass and inertia of moving bodies must be larger than mjMINVAL
+Element name '', id 1, line 1[0m
+[?2004hroot@2ea9dcc76068:/app# cat > /app/cost.py <<'PY'
+[?2004l()-t0
+
+def freebody(k):
+    bodies=''.join("<body><joint type='free'/><geom size='0.01' mass='1'/></body>" for _ in range(k))
+    return '<mujoco><worldbody>%s</worldbody></mujoco>' % bodies
+for k in [1,5,20,40]:
+    m=mujoco.MjModel.from_xml_string(freebody(k))
+    tt=t(m)
+    print('freebody x%-2d nv=%3d: %.4f s  (%.1f us/step)' % (k, m.nv, tt, tt/n*1e6/1 if False else tt*1e6/1000))
+
+ref = open('model_ref.xml').read()
+mfull = mujoco.MjModel.from_xml_string(ref)
+print('FULL cable    nv=%3d: %.4f s  (%.1f us/step)' % (mfull.nv, t(mfull), 0))
+PY
+python3 - <<'PY'
+import mujoco, numpy as np, time
+def t(model, n=1000):
+    d = mujoco.MjData(model)
+    d.qpos += np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+    mujoco.mj_forward(model,d)
+    t0=time.perf_counter()
+    for _ in range(n): mujoco.mj_step(model,d)
+    return time.perf_counter()-t0
+def freebody(k):
+    bodies=''.join("<body><joint type='free'/><geom size='0.01' mass='1'/></body>" for _ in range(k))
+    return '<mujoco><worldbody>%s</worldbody></mujoco>' % bodies
+for k in [1,5,20,40]:
+    m=mujoco.MjModel.from_xml_string(freebody(k))
+    tt=t(m); print('freebody x%-2d nv=%3d : %.4f s (%.1f us/step)' % (k, m.nv, tt, tt*1e3))
+ref = open('model_ref.xml').read()
+mfull=mujoco.MjModel.from_xml_string(ref); tf=t(mfull)
+print('FULL   cable nv=%3d : %.4f s (%.1f us/step)' % (mfull.nv, tf, tf*1e3))
+srcz=ref.replace('value="1e7"','value="0"').replace('value="4e6"','value="0"')
+mz=mujoco.MjModel.from_xml_string(srcz); tz=t(mz)
+print('ZERO   cable nv=%3d : %.4f s (%.1f us/step)' % (mz.nv, tz, tz*1e3))
+for c in [41,21,11,5,3]:
+    ms=mujoco.MjModel.from_xml_string(ref.replace('count="41 1 1"','count="%d 1 1"'%c)); tc=t(ms)
+    print('count=%-2d   nv=%3d : %.4f s (%.1f us/step)' % (c, ms.nv, tc, tc*1e3))
+PY
+[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def t(model, n=1000):
+[?2004l[?2004h>     d = mujoco.MjData(model)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(model,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> def freebody(k):
+[?2004l[?2004h>     bodies=''.join("<body><joint type='free'/><geom size='0.01' mass='1'/></body>" for _ in range(k))
+[?2004l[?2004h>     return f'<mujoco><worldbody>{bodies}</worldbody></mujoco>'
+[?2004l[?2004h> for k in [1,5,20,40]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(freebody(k))
+[?2004l[?2004h>     print('freebody x%-2d nv=%3d: %.4f s  (%.1f us/step)' % (k, m.nv, t(m), t(m)/0 if False else 0))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# echo "replacing timing calc"
+[?2004lreplacing timing calc
+[?2004hroot@2ea9dcc76068:/app# cat > /app/cost.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def t(model, n=1000):
+[?2004l[?2004h>     d = mujoco.MjData(model)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(model,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> def freebody(k):
+[?2004l[?2004h>     bodies=''.join("<body><joint type='free'/><geom size='0.01' mass='1'/></body>" for _ in range(k))
+[?2004l[?2004h>     return '<mujoco><worldbody>%s</worldbody></mujoco>' % bodies
+[?2004l[?2004h> for k in [1,5,20,40]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(freebody(k))
+[?2004l[?2004h>     tt=t(m)
+[?2004l[?2004h>     print('freebody x%-2d nv=%3d: %.4f s  (%.1f us/step)' % (k, m.nv, tt, tt/n*1e6/1 if False else tt*1e6/1000))
+[?2004l[?2004h> 
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> mfull = mujoco.MjModel.from_xml_string(ref)
+[?2004l[?2004h> print('FULL cable    nv=%3d: %.4f s  (%.1f us/step)' % (mfull.nv, t(mfull), 0))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def t(model, n=1000):
+[?2004l[?2004h>     d = mujoco.MjData(model)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(model,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> def freebody(k):
+[?2004l[?2004h>     bodies=''.join("<body><joint type='free'/><geom size='0.01' mass='1'/></body>" for _ in range(k))
+[?2004l[?2004h>     return '<mujoco><worldbody>%s</worldbody></mujoco>' % bodies
+[?2004l[?2004h> for k in [1,5,20,40]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(freebody(k))
+[?2004l[?2004h>     tt=t(m); print('freebody x%-2d nv=%3d : %.4f s (%.1f us/step)' % (k, m.nv, tt, tt*1e3))
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> mfull=mujoco.MjModel.from_xml_string(ref); tf=t(mfull)
+[?2004l[?2004h> print('FULL   cable nv=%3d : %.4f s (%.1f us/step)' % (mfull.nv, tf, tf*1e3))
+[?2004l[?2004h> srcz=ref.replace('value="1e7"','value="0"').replace('value="4e6"','value="0"')
+[?2004l[?2004h> mz=mujoco.MjModel.from_xml_string(srcz); tz=t(mz)
+[?2004l[?2004h> print('ZERO   cable nv=%3d : %.4f s (%.1f us/step)' % (mz.nv, tz, tz*1e3))
+[?2004l[?2004h> for c in [41,21,11,5,3]:
+[?2004l[?2004h>     ms=mujoco.MjModel.from_xml_string(ref.replace('count="41 1 1"','count="%d 1 1"'%c)); tc=t(ms)
+[?2004l[?2004h>     print('count=%-2d   nv=%3d : %.4f s (%.1f us/step)' % (c, ms.nv, tc, tc*1e3))
+[?2004l[?2004h> PY
+[?2004lfreebody x1  nv=  6 : 0.0024 s (2.4 us/step)
+freebody x5  nv= 30 : 0.0055 s (5.5 us/step)
+freebody x20 nv=120 : 0.0184 s (18.4 us/step)
+freebody x40 nv=240 : 0.0758 s (75.8 us/step)
+FULL   cable nv=118 : 0.5757 s (575.7 us/step)
+ZERO   cable nv=118 : 0.4794 s (479.4 us/step)
+count=41   nv=118 : 0.5001 s (500.1 us/step)
+count=21   nv= 58 : 0.0818 s (81.8 us/step)
+count=11   nv= 28 : 0.0253 s (25.3 us/step)
+count=5    nv= 10 : 0.0068 s (6.8 us/step)
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m22[0m, in [35m<module>[0m
+[1;35mValueError[0m: [35mError: body 'B_1' not found in bodypair 1
+Element name '', id 1[0m
+[?2004hroot@2ea9dcc76068:/app# python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> def state(m, seed=11):
+[?2004l[?2004h>     d=mujoco.MjData(m)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(1000): mujoco.mj_step(m,d)
+[?2004l[?2004h>     st=np.zeros(mujoco.mj_stateSize(m,mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(m,d,st,mujoco.mjtState.mjSTATE_FULLPHYSICS); return st
+[?2004l[?2004h> def tim(m,n=1000):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos += np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d); t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(m,d); return time.perf_counter()-t0
+[?2004l[?2004h> def mk(tw,bn,vm):
+[?2004l[?2004h>     s=ref.replace('value="1e7"',f'value="{tw}"').replace('value="4e6"',f'value="{bn}"').replace('value="0.05"',f'value="{vm}"')
+[?2004l[?2004h>     return mujoco.MjModel.from_xml_string(s)
+[?2004l[?2004h> mb=mk('1e7','4e6','0.05'); sb=state(mb)
+[?2004l[?2004h> print('baseline 1e7/4e6/0.05      : %.4f s' % tim(mb))
+[?2004l[?2004h> for tw,bn,vm in [('1e7','4e6','1e6'),('1e7','4e6','0'),('0','0','0.05'),('0','0','1e6'),('0','0','0')]:
+[?2004l[?2004h>     m=mk(tw,bn,vm); tt=tim(m); diff=np.linalg.norm(state(m)-sb)
+[?2004l[?2004h>     print('tw=%-4s bn=%-3s vm=%-4s : %.4f s  nstate-diff_vs_base=%.2e' % (tw,bn,vm,tt,diff))
+[?2004l[?2004h> PY
+[?2004lbaseline 1e7/4e6/0.05      : 0.0005 s
+tw=1e7  bn=4e6 vm=1e6  : 0.0005 s  nstate-diff_vs_base=0.00e+00
+tw=1e7  bn=4e6 vm=0    : 0.0005 s  nstate-diff_vs_base=0.00e+00
+tw=0    bn=0   vm=0.05 : 0.0005 s  nstate-diff_vs_base=6.85e-01
+tw=0    bn=0   vm=1e6  : 0.0005 s  nstate-diff_vs_base=6.85e-01
+tw=0    bn=0   vm=0    : 0.0005 s  nstate-diff_vs_base=6.85e-01
+[?2004hroot@2ea9dcc76068:/app# python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> def mk(tw,bn,vm):
+[?2004l[?2004h>     s=ref.replace('value="1e7"',f'value="{tw}"').replace('value="4e6"',f'value="{bn}"').replace('value="0.05"',f'value="{vm}"')
+[?2004l[?2004h>     return mujoco.MjModel.from_xml_string(s)
+[?2004l[?2004h> def tim(m,n=1000):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos += np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     ts=0
+[?2004l[?2004h>     for trial in range(3):
+[?2004l[?2004h>         t0=time.perf_counter()
+[?2004l[?2004h>         for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h>         ts+=time.perf_counter()-t0
+[?2004l[?2004h>     return ts/3
+[?2004l[?2004h> for tw,bn,vm in [('1e7','4e6','0.05'),('1e7','4e6','1e6'),('1e7','4e6','0'),('0','0','0.05'),('0','0','1e6')]:
+[?2004l[?2004h>     m=mk(tw,bn,vm); tt=tim(m)
+[?2004l[?2004h>     print('tw=%-4s bn=%-3s vm=%-4s nbody=%3d nv=%3d : %.4f s (%.1f us/step)' % (tw,bn,vm,m.nbody,m.nv,tt,tt*1e3))
+[?2004l[?2004h> PY
+[?2004ltw=1e7  bn=4e6 vm=0.05 nbody= 42 nv=118 : 0.4609 s (460.9 us/step)
+tw=1e7  bn=4e6 vm=1e6  nbody= 42 nv=118 : 0.4568 s (456.8 us/step)
+tw=1e7  bn=4e6 vm=0    nbody= 42 nv=118 : 0.4565 s (456.5 us/step)
+tw=0    bn=0   vm=0.05 nbody= 42 nv=118 : 0.4326 s (432.6 us/step)
+tw=0    bn=0   vm=1e6  nbody= 42 nv=118 : 0.4356 s (435.6 us/step)
+[?2004hroot@2ea9dcc76068:/app# python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> o=mref.opt
+[?2004l[?2004h> print('MjOption fields:', [a for a in dir(o) if not a.startswith('_') and not callable(getattr(o,a))])
+[?2004l[?2004h> print('timestep', o.timestep)
+[?2004l[?2004h> for attr in ['integrator','solver','jacobian','iterations','disableflags','enableflags','cone','lsiterations','mpr','disable_contactshape','disable_eulerfilter']:
+[?2004l[?2004h>     if hasattr(o,attr):
+[?2004l[?2004h>         try: print(' ',attr, '=', getattr(o,attr))
+[?2004l[?2004h>         except Exception as e: print(' ',attr,'ERR',e)
+[?2004l[?2004h> PY
+[?2004lMjOption fields: ['apirate', 'ccd_iterations', 'ccd_tolerance', 'cone', 'density', 'disableactuator', 'disableflags', 'enableflags', 'gravity', 'impratio', 'integrator', 'iterations', 'jacobian', 'ls_iterations', 'ls_tolerance', 'magnetic', 'noslip_iterations', 'noslip_tolerance', 'o_friction', 'o_margin', 'o_solimp', 'o_solref', 'sdf_initpoints', 'sdf_iterations', 'solver', 'timestep', 'tolerance', 'viscosity', 'wind']
+timestep 0.002
+  integrator = 0
+  solver = 2
+  jacobian = 2
+  iterations = 100
+  disableflags = 0
+  enableflags = 0
+  cone = 0
+[?2004hroot@2ea9dcc76068:/app# python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref=open('model_ref.xml').read()
+[?2004l[?2004h> def state(m,seed=11):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(1000): mujoco.mj_step(m,d)
+[?2004l[?2004h>     st=np.zeros(mujoco.mj_stateSize(m,mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(m,d,st,mujoco.mjtState.mjSTATE_FULLPHYSICS); return st, d
+[?2004l[?2004h> mb=mujoco.MjModel.from_xml_string(ref); sb,_=state(mb)
+[?2004l[?2004h> import itertools
+[?2004l[?2004h> results=[]
+[?2004l[?2004h> # jacobian test
+[?2004l[?2004h> for name,val in [('dense',mujoco.mjtJac.mjJAC_dense),('sparse',mujoco.mjtJac.mjJAC_sparse)]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(ref); m.opt.jacobian=val
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d); t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(1000): mujoco.mj_step(m,d)
+[?2004l[?2004h>     tt=time.perf_counter()-t0
+[?2004l[?2004h>     st,_=state(m); results.append((name,tt,np.linalg.norm(st-sb)))
+[?2004l[?2004h> for name,tt,diff in results:
+[?2004l[?2004h>     print('jacobian=%-6s : %.4f s (%.1f us/step)  st-diff=%.2e' % (name,tt,tt*1e3,diff))
+[?2004l[?2004h> PY
+[?2004lTraceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m13[0m, in [35m<module>[0m
+[1;35mAttributeError[0m: [35mmodule 'mujoco' has no attribute 'mjtJac'. Did you mean: 'mj_jac'?[0m
+[?2004hroot@2ea9dcc76068:/app# cat > /app/plain.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def build_plain(nseg=39, geoms=True, slider=True, eq=True):
+[?2004l[?2004h>     g = '<geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" mass="0.0025" condim="1"/>' if geoms else ''
+[?2004l[?2004h>     def rec(i):
+[?2004l[?2004h>         inner = rec(i+1) if i < nseg-1 else ('<body name="B_last" pos="0.025 0 0"><joint type="ball"/>' + g + '</body>')
+[?2004l[?2004h>         return rec
+[?2004l[?2004h>     # build bottom-up
+[?2004l[?2004h>     cur = ''
+[?2004l[?2004h>     for i in range(nseg-1, -1, -1):
+[?2004l[?2004h>         nm = 'B_last' if i==nseg-1 else f'B_{i}' if False else f'S{i}'
+[?2004l[?2004h>         # name the last one B_last to allow equality reference
+[?2004l[?2004h>         if i == nseg-1:
+[?2004l[?2004h>             nm='B_last'
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             nm=f'B_{i}'
+[?2004l[?2004h>         cur = f'<body name="{nm}" pos="0.025 0 0"><joint type="ball"/>{g}{cur}</body>'
+[?2004l[?2004h>     xml = '<mujoco><worldbody>'
+[?2004l[?2004h>     xml += f'<body name="B_first" pos="-0.3 0 0.6">{g}{cur}'
+[?2004l[?2004h>     if slider:
+[?2004l[?2004h>         xml += '<body name="slider" pos="0.7 0 0.6"><joint type="slide" axis="1 0 0" damping="0.1"/><geom size="0.01"/></body>'
+[?2004l[?2004h>     xml += '</worldbody>'
+[?2004l[?2004h>     if eq: xml += '<equality><connect name="rb" body1="B_last" body2="slider" anchor="0.025 0 0"/></equality>'
+[?2004l[?2004h>     xml += '</mujoco>'
+[?2004l[?2004h>     return xml
+[?2004l[?2004h> 
+[?2004l[?2004h> def tim(m,n=1000):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> for geoms,slider,eq in [(True,True,True),(True,True,False),(False,True,True),(True,False,False),(False,False,False)]:
+[?2004l[?2004h>     x=build_plain(geoms=geoms,slider=slider,eq=eq)
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(x)
+[?2004l[?2004h>     tt=tim(m)
+[?2004l[?2004h>     print('geoms=%d slider=%d eq=%d  nbody=%d nq=%d nv=%d : %.4f s (%.1f us/step)' % (geoms,slider,eq,m.nbody,m.nq,m.nv,tt,tt*1e3))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/plain.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/plain.py"[0m, line [35m35[0m, in [35m<module>[0m
+    m=mujoco.MjModel.from_xml_string(x)
+[1;35mValueError[0m: [35mXML parse error 14:
+Error=XML_ERROR_MISMATCHED_ELEMENT ErrorID=14 (0xe) Line number=1: XMLElement name=body
+[0m
+[?2004hroot@2ea9dcc76068:/app# cat > /app/plain.py <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def build_plain(nseg=39, geoms=True, slider=True, eq=True):
+[?2004l[?2004h>     g = '<geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" mass="0.0025" condim="1"/>' if geoms else ''
+[?2004l[?2004h>     inner = f'<body name="B_last" pos="0.025 0 0"><joint type="ball"/>{g}</body>'
+[?2004l[?2004h>     for i in range(nseg-1, 1, -1):
+[?2004l[?2004h>         inner = f'<body name="B_{i}" pos="0.025 0 0"><joint type="ball"/>{g}' + inner + '</body>'
+[?2004l[?2004h>     inner = f'<body name="B_1" pos="0.025 0 0"><joint type="ball"/>{g}' + inner + '</body>'
+[?2004l[?2004h>     xml = '<mujoco><worldbody>'
+[?2004l[?2004h>     xml += f'<body name="B_first" pos="-0.3 0 0.6">{g}' + inner
+[?2004l[?2004h>     if slider:
+[?2004l[?2004h>         xml += '<body name="slider" pos="0.7 0 0.6"><joint type="slide" axis="1 0 0" damping="0.1"/><geom size="0.01"/></body>'
+[?2004l[?2004h>     xml += '</worldbody>'
+[?2004l[?2004h>     if eq: xml += '<equality><connect name="rb" body1="B_last" body2="slider" anchor="0.025 0 0"/></equality>'
+[?2004l[?2004h>     xml += '</mujoco>'
+[?2004l[?2004h>     return xml
+[?2004l[?2004h> 
+[?2004l[?2004h> def tim(m,n=1000):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> 
+[?2004l[?2004h> for geoms,slider,eq in [(True,True,True),(True,True,False),(False,True,True),(True,False,False),(False,False,False)]:
+[?2004l[?2004h>     x=build_plain(geoms=geoms,slider=slider,eq=eq)
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(x)
+[?2004l[?2004h>     tt=tim(m)
+[?2004l[?2004h>     print('geoms=%d slider=%d eq=%d  nbody=%d nq=%d nv=%d : %.4f s (%.1f us/step)' % (geoms,slider,eq,m.nbody,m.nq,m.nv,tt,tt*1e3))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@2ea9dcc76068:/app# python3 /app/plain.py && cat /app/plain.py > /dev/null && python3 -c "print('--- plain XML sample ---'); import plain; print(plain.build_plain(4)[:400])"
+[?2004lTraceback (most recent call last):
+  File [35m"/app/plain.py"[0m, line [35m26[0m, in [35m<module>[0m
+    m=mujoco.MjModel.from_xml_string(x)
+[1;35mValueError[0m: [35mXML parse error 14:
+Error=XML_ERROR_MISMATCHED_ELEMENT ErrorID=14 (0xe) Line number=1: XMLElement name=body
+[0m
+[?2004hroot@2ea9dcc76068:/app# cd /app && sed -i "s#xml += f'<body name=\"B_first\" pos=\"-0.3 0 0.6\">{g}' + inner#xml += f'<body name=\"B_first\" pos=\"-0.3 0 0.6\">{g}' + inner + '</body>'#" plain.py && grep -n "B_first" plain.py && python3 plain.py
+[?2004l9:    xml += f'<body name="B_first" pos="-0.3 0 0.6">{g}' + inner + '</body>'
+WARNING: Nan, Inf or huge value in QACC at DOF 100. The simulation is unstable. Time = 0.3440.
+
+geoms=1 slider=1 eq=1  nbody=42 nq=157 nv=118 : 0.5694 s (569.4 us/step)
+WARNING: Nan, Inf or huge value in QACC at DOF 87. The simulation is unstable. Time = 0.5060.
+
+geoms=1 slider=1 eq=0  nbody=42 nq=157 nv=118 : 0.2961 s (296.1 us/step)
+Traceback (most recent call last):
+  File [35m"/app/plain.py"[0m, line [35m26[0m, in [35m<module>[0m
+    m=mujoco.MjModel.from_xml_string(x)
+[1;35mValueError[0m: [35mError: mass and inertia of moving bodies must be larger than mjMINVAL
+Element name 'B_1', id 2, line 1[0m
+[?2004hroot@2ea9dcc76068:/app# python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref=open('model_ref.xml').read()
+[?2004l[?2004h> def full(m,seed=11,n=1000):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h>     return d
+[?2004l[?2004h> mref=mujoco.MjModel.from_xml_string(ref)
+[?2004l[?2004h> d=full(mref)
+[?2004l[?2004h> print('ref final |qvel|=%.3e max|qvel|=%.3e  (settled? small=settled)' % (np.linalg.norm(d.qvel), np.abs(d.qvel).max()))
+[?2004l[?2004h> # mj_forward only
+[?2004l[?2004h> d2=mujoco.MjData(mref); mujoco.mj_forward(mref,d2)
+[?2004l[?2004h> t0=time.perf_counter()
+[?2004l[?2004h> for _ in range(1000): mujoco.mj_forward(mref,d2)
+[?2004l[?2004h> print('mj_forward only: %.4f s' % (time.perf_counter()-t0))
+[?2004l[?2004h> # jacobian dense/sparse
+[?2004l[?2004h> sb=None
+[?2004l[?2004h> for tag,val in [('dense',0),('sparse',1),('auto',2)]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(ref); m.opt.jacobian=val
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(1000): mujoco.mj_step(m,d)
+[?2004l[?2004h>     tt=time.perf_counter()-t0
+[?2004l[?2004h>     print('jacobian=%-6s : %.4f s (%.1f us/step)' % (tag,tt,tt*1e3))
+[?2004l[?2004h> PY
+[?2004lref final |qvel|=1.376e-01 max|qvel|=4.679e-02  (settled? small=settled)
+mj_forward only: 0.3490 s
+jacobian=dense  : 0.2867 s (286.7 us/step)
+jacobian=sparse : 0.4204 s (420.4 us/step)
+jacobian=auto   : 0.4226 s (422.6 us/step)
+[?2004hroot@2ea9dcc76068:/app# python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> import plain
+[?2004l[?2004h> def tim(m,n=1000):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h>     return time.perf_counter()-t0, d
+[?2004l[?2004h> # plain chain WITH damping (match ref 0.015) - rebuild
+[?2004l[?2004h> from plain import build_plain
+[?2004l[?2004h> # patch: add damping by string replace
+[?2004l[?2004h> def build_damped(nseg=39):
+[?2004l[?2004h>     x=build_plain(nseg).replace('<joint type="ball"/>','<joint type="ball" damping="0.015"/>')
+[?2004l[?2004h>     return x
+[?2004l[?2004h> for label,x in [('chain+eq(damped)',build_damped()),('chain+eq(nodamp)',build_plain())]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_string(x); tt,d=tim(m)
+[?2004l[?2004h>     bad = np.isnan(d.qvel).any() or np.isinf(d.qvel).any()
+[?2004l[?2004h>     print('%-18s nq=%d nv=%d : %.4f s (%.1f us/step) unstable=%s' % (label,m.nq,m.nv,tt,tt*1e3,bad))
+[?2004l[?2004h> PY
+[?2004lWARNING: Nan, Inf or huge value in QACC at DOF 100. The simulation is unstable. Time = 0.3440.
+
+geoms=1 slider=1 eq=1  nbody=42 nq=157 nv=118 : 0.4796 s (479.6 us/step)
+WARNING: Nan, Inf or huge value in QACC at DOF 87. The simulation is unstable. Time = 0.5060.
+
+geoms=1 slider=1 eq=0  nbody=42 nq=157 nv=118 : 0.2849 s (284.9 us/step)
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m2[0m, in [35m<module>[0m
+  File [35m"/app/plain.py"[0m, line [35m26[0m, in [35m<module>[0m
+    m=mujoco.MjModel.from_xml_string(x)
+[1;35mValueError[0m: [35mError: mass and inertia of moving bodies must be larger than mjMINVAL
+Element name 'B_1', id 2, line 1[0m
+[?2004hroot@2ea9dcc76068:/app# python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref=open('model_ref.xml').read()
+[?2004l[?2004h> mref=mujoco.MjModel.from_xml_string(ref)  # NEWTON(2), jacobian auto(2), 100 iters
+[?2004l[?2004h> # reference final state for correctness check
+[?2004l[?2004h> def state(m,seed=11,n=1000):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h>     st=np.zeros(mujoco.mj_stateSize(m,mujoco.mjtState.mjSTATE_FULLPHYSICS)); mujoco.mj_getState(m,d,st,mujoco.mjtState.mjSTATE_FULLPHYSICS); return st
+[?2004l[?2004h> def tim(m,seed=3,n=1000):
+[?2004l[?2004h>     d=mujoco.MjData(m); d.qpos+=np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> sb=state(mref)
+[?2004l[?2004h> ref_time=tim(mref)
+[?2004l[?2004h> print('reference NEWTON/auto : %.4f s  (baseline for 60%% = %.4f s)' % (ref_time, 0.6*ref_time))
+[?2004l[?2004h> for sname,sval in [('PG',0),('CG',1),('NEWTON',2)]:
+[?2004l[?2004h>     for jname,jval in [('dense',0),('sparse',1),('auto',2)]:
+[?2004l[?2004h>         m=mujoco.MjModel.from_xml_string(ref); m.opt.solver=sval; m.opt.jacobian=jval
+[?2004l[?2004h>         tt=tim(m); diff=np.max(np.abs(state(m)-sb))
+[?2004l[?2004h>         pct=tt/ref_time*100
+[?2004l[?2004h>         print('solver=%-6s jac=%-6s : %.4f s (%5.1f%%)  maxstate-diff=%.2e' % (sname,jname,tt,pct,diff))
+[?2004l[?2004h> PY
+[?2004lreference NEWTON/auto : 0.4988 s  (baseline for 60% = 0.2993 s)
+solver=PG     jac=dense  : 0.2002 s ( 40.1%)  maxstate-diff=6.14e-07
+solver=PG     jac=sparse : 0.2668 s ( 53.5%)  maxstate-diff=6.14e-07
+solver=PG     jac=auto   : 0.2477 s ( 49.6%)  maxstate-diff=6.14e-07
+solver=CG     jac=dense  : 0.2664 s ( 53.4%)  maxstate-diff=3.68e-06
+solver=CG     jac=sparse : 0.3572 s ( 71.6%)  maxstate-diff=3.68e-06
+solver=CG     jac=auto   : 0.2794 s ( 56.0%)  maxstate-diff=3.68e-06
+solver=NEWTON jac=dense  : 0.2595 s ( 52.0%)  maxstate-diff=3.33e-15
+solver=NEWTON jac=sparse : 0.4127 s ( 82.7%)  maxstate-diff=0.00e+00
+solver=NEWTON jac=auto   : 0.4671 s ( 93.6%)  maxstate-diff=0.00e+00
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> assert '<option' not in ref
+[?2004l[?2004h> model = ref.replace('<size memory="2M"/>', '<option solver="pg" jacobian="dense"/>\n  <size memory="2M"/>')
+[?2004l[?2004h> open('model.xml','w').write(model)
+[?2004l[?2004h> print('wrote model.xml')
+[?2004l[?2004h> PY
+[?2004lwrote model.xml
+[?2004hroot@2ea9dcc76068:/app# sed -n '1,20p' model.xml
+[?2004l<!-- Inspired by https://github.com/google-deepmind/mujoco/blob/main/model/plugin/elasticity/cable.xml -->
+<mujoco model="Cable">
+
+  <extension>
+    <plugin plugin="mujoco.elasticity.cable"/>
+  </extension>
+
+  <statistic center="0 0 .3" extent="1"/>
+  <visual>
+    <global elevation="-30"/>
+  </visual>
+
+  <compiler autolimits="true"/>
+
+  <option solver="pg" jacobian="dense"/>
+  <size memory="2M"/>
+
+  <worldbody>
+    <composite type="cable" curve="s" count="41 1 1" size="1" offset="-.3 0 .6" initial="none">
+      <plugin plugin="mujoco.elasticity.cable">
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> mm = mujoco.MjModel.from_xml_path('model.xml')
+[?2004l[?2004h> mr = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print('model solver,jac,iter:', mm.opt.solver, mm.opt.jacobian, mm.opt.iterations)
+[?2004l[?2004h> print('ref   solver,jac,iter:', mr.opt.solver, mr.opt.jacobian, mr.opt.iterations)
+[?2004l[?2004h> print('nq/nv/na model vs ref:', (mm.nq,mm.nv,mm.na), (mr.nq,mr.nv,mr.na))
+[?2004l[?2004h> print('state size model vs ref:', mujoco.mj_stateSize(mm,mujoco.mjtState.mjSTATE_FULLPHYSICS), mujoco.mj_stateSize(mr,mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h> def sim(model,seed):
+[?2004l[?2004h>     d=mujoco.MjData(model); nstep=int(2.0/model.opt.timestep)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(model,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(model,d)
+[?2004l[?2004h>     st=np.zeros(mujoco.mj_stateSize(model,mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(model,d,st,mujoco.mjtState.mjSTATE_FULLPHYSICS); return st
+[?2004l[?2004h> seeds=[1,7,42,99,5,8,333,777,12345,2024,31415,271828]
+[?2004l[?2004h> mx=0
+[?2004l[?2004h> for s in seeds:
+[?2004l[?2004h>     a=sim(mm,s); b=sim(mr,s)
+[?2004l[?2004h>     bad = (np.isnan(a).any() or np.isinf(a).any())
+[?2004l[?2004h>     md=np.max(np.abs(a-b)); mx=max(mx,md)
+[?2004l[?2004h>     print('seed %7d  maxdiff=%.2e  naninf=%s  allclose(1e-5)=%s' % (s,md,bad,np.allclose(a,b,atol=1e-5)))
+[?2004l[?2004h> print('MAX over seeds: %.3e  (need <=1e-5)' % mx)
+[?2004l[?2004h> PY
+[?2004lTraceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m2[0m, in [35m<module>[0m
+[1;35mValueError[0m: [35mXML Error: invalid keyword: 'pg'
+Element 'option', line 15
+[0m
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> model = ref.replace('<size memory="2M"/>', '<option solver="ng" jacobian="dense"/>\n  <size memory="2M"/>')
+[?2004l[?2004h> open('model.xml','w').write(model)
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> mm = mujoco.MjModel.from_xml_path('model.xml'); mr = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print('model solver,jac,iter:', mm.opt.solver, mm.opt.jacobian, mm.opt.iterations)
+[?2004l[?2004h> print('ref   solver,jac,iter:', mr.opt.solver, mr.opt.jacobian, mr.opt.iterations)
+[?2004l[?2004h> print('nq/nv/na:', (mm.nq,mm.nv,mm.na), (mr.nq,mr.nv,mr.na))
+[?2004l[?2004h> def sim(model,seed):
+[?2004l[?2004h>     d=mujoco.MjData(model); nstep=int(2.0/model.opt.timestep)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(model,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(model,d)
+[?2004l[?2004h>     st=np.zeros(mujoco.mj_stateSize(model,mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(model,d,st,mujoco.mjtState.mjSTATE_FULLPHYSICS); return st
+[?2004l[?2004h> seeds=[1,7,42,99,5,8,333,777,12345,2024,31415,271828]
+[?2004l[?2004h> mx=0
+[?2004l[?2004h> for s in seeds:
+[?2004l[?2004h>     a=sim(mm,s); b=sim(mr,s); md=np.max(np.abs(a-b)); mx=max(mx,md)
+[?2004l[?2004h>     print('seed %7d  maxdiff=%.2e  naninf=%s  allclose(1e-5)=%s' % (s,md,(np.isnan(a).any() or np.isinf(a).any()),np.allclose(a,b,atol=1e-5)))
+[?2004l[?2004h> print('MAX over seeds: %.3e  (need <=1e-5)' % mx)
+[?2004l[?2004h> PY
+[?2004lTraceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m5[0m, in [35m<module>[0m
+[1;35mValueError[0m: [35mXML Error: invalid keyword: 'ng'
+Element 'option', line 15
+[0m
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> import mujoco
+[?2004l[?2004h> for kw in ['pg','ng','cg','newton','conjugate','conjgrad','Gauss','gauss']:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         m=mujoco.MjModel.from_xml_string(f'<mujoco><option solver="{kw}"/><worldbody><body><joint type="free"/></body></worldbody></mujoco>')
+[?2004l[?2004h>         print('solver OK:', kw, '->', m.opt.solver)
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print('solver BAD:', kw, str(e).splitlines()[0])
+[?2004l[?2004h> for kw in ['dense','sparse','auto','DENSE']:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         m=mujoco.MjModel.from_xml_string(f'<mujoco><option jacobian="{kw}"/><worldbody><body><joint type="free"/></body></worldbody></mujoco>')
+[?2004l[?2004h>         print('jacobian OK:', kw, '->', m.opt.jacobian)
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print('jacobian BAD:', kw, str(e).splitlines()[0])
+[?2004l[?2004h> PY
+[?2004lsolver BAD: pg XML Error: invalid keyword: 'pg'
+solver BAD: ng XML Error: invalid keyword: 'ng'
+solver BAD: cg XML Error: invalid keyword: 'cg'
+solver BAD: newton XML Error: invalid keyword: 'newton'
+solver BAD: conjugate XML Error: invalid keyword: 'conjugate'
+solver BAD: conjgrad XML Error: invalid keyword: 'conjgrad'
+solver BAD: Gauss XML Error: invalid keyword: 'Gauss'
+solver BAD: gauss XML Error: invalid keyword: 'gauss'
+jacobian BAD: dense Error: mass and inertia of moving bodies must be larger than mjMINVAL
+jacobian BAD: sparse Error: mass and inertia of moving bodies must be larger than mjMINVAL
+jacobian BAD: auto Error: mass and inertia of moving bodies must be larger than mjMINVAL
+jacobian BAD: DENSE XML Error: invalid keyword: 'DENSE'
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> import mujoco
+[?2004l[?2004h> for kw in ['PG','CG','NEWTON','Pgd','ngs']:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         m=mujoco.MjModel.from_xml_string(f'<mujoco><option solver="{kw}"/></mujoco>')
+[?2004l[?2004h>         print('solver OK:', repr(kw), '->', m.opt.solver)
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print('solver BAD:', repr(kw), str(e).splitlines()[0])
+[?2004l[?2004h> PY
+[?2004lsolver BAD: 'PG' XML Error: invalid keyword: 'PG'
+solver OK: 'CG' -> 1
+solver BAD: 'NEWTON' XML Error: invalid keyword: 'NEWTON'
+solver BAD: 'Pgd' XML Error: invalid keyword: 'Pgd'
+solver BAD: 'ngs' XML Error: invalid keyword: 'ngs'
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> import mujoco
+[?2004l[?2004h> print('mjtSolver members:', {getattr(mujoco.mjtSolver,k):k for k in dir(mujoco.mjtSolver) if not k.startswith('_')})
+[?2004l[?2004h> for kw in ['NGS','ngs','NgS','ngs','NGS','newtonNewton','Newton','NG']:
+[?2004l[?2004h>     pass
+[?2004l[?2004h> for kw in ['NGS','ngs','ng','Ng','Newton','newton','NEWTON','NGSnewton','pg','PG']:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         m=mujoco.MjModel.from_xml_string(f'<mujoco><option solver="{kw}"/></mujoco>')
+[?2004l[?2004h>         print('solver OK:', repr(kw), '->', m.opt.solver)
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print('solver BAD:', repr(kw), str(e).splitlines()[:1])
+[?2004l[?2004h> PY
+[?2004lmjtSolver members: {<mjtSolver.mjSOL_CG: 1>: 'mjSOL_CG', <mjtSolver.mjSOL_NEWTON: 2>: 'mjSOL_NEWTON', <mjtSolver.mjSOL_PGS: 0>: 'mjSOL_PGS', <property object at 0x746d2f4758f0>: 'name', <property object at 0x746d2f475c10>: 'value'}
+solver BAD: 'NGS' ["XML Error: invalid keyword: 'NGS'"]
+solver BAD: 'ngs' ["XML Error: invalid keyword: 'ngs'"]
+solver BAD: 'ng' ["XML Error: invalid keyword: 'ng'"]
+solver BAD: 'Ng' ["XML Error: invalid keyword: 'Ng'"]
+solver OK: 'Newton' -> 2
+solver BAD: 'newton' ["XML Error: invalid keyword: 'newton'"]
+solver BAD: 'NEWTON' ["XML Error: invalid keyword: 'NEWTON'"]
+solver BAD: 'NGSnewton' ["XML Error: invalid keyword: 'NGSnewton'"]
+solver BAD: 'pg' ["XML Error: invalid keyword: 'pg'"]
+solver BAD: 'PG' ["XML Error: invalid keyword: 'PG'"]
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> import mujoco
+[?2004l[?2004h> for kw in ['PGS','Pgs','pgs']:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         m=mujoco.MjModel.from_xml_string(f'<mujoco><option solver="{kw}"/></mujoco>')
+[?2004l[?2004h>         print('solver OK:', repr(kw), '->', m.opt.solver)
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print('solver BAD:', repr(kw), str(e).splitlines()[0])
+[?2004l[?2004h> PY
+[?2004lsolver OK: 'PGS' -> 0
+solver BAD: 'Pgs' XML Error: invalid keyword: 'Pgs'
+solver BAD: 'pgs' XML Error: invalid keyword: 'pgs'
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> ref = open('model_ref.xml').read()
+[?2004l[?2004h> model = ref.replace('<size memory="2M"/>', '<option solver="PGS" jacobian="dense"/>\n  <size memory="2M"/>')
+[?2004l[?2004h> open('model.xml','w').write(model)
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> mm = mujoco.MjModel.from_xml_path('model.xml'); mr = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print('model solver,jac,iter:', mm.opt.solver, mm.opt.jacobian, mm.opt.iterations)
+[?2004l[?2004h> print('ref   solver,jac,iter:', mr.opt.solver, mr.opt.jacobian, mr.opt.iterations)
+[?2004l[?2004h> print('nq/nv/na:', (mm.nq,mm.nv,mm.na), (mr.nq,mr.nv,mr.na), 'statesize',
+[?2004l[?2004h>       mujoco.mj_stateSize(mm,mujoco.mjtState.mjSTATE_FULLPHYSICS), mujoco.mj_stateSize(mr,mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h> def sim(model,seed):
+[?2004l[?2004h>     d=mujoco.MjData(model); nstep=int(2.0/model.opt.timestep)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(model,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(model,d)
+[?2004l[?2004h>     st=np.zeros(mujoco.mj_stateSize(model,mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(model,d,st,mujoco.mjtState.mjSTATE_FULLPHYSICS); return st
+[?2004l[?2004h> def tim(model,seed=3):
+[?2004l[?2004h>     d=mujoco.MjData(model); nstep=int(2.0/model.opt.timestep)
+[?2004l[?2004h>     d.qpos += np.random.default_rng(seed).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(model,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(model,d)
+[?2004l[?2004h>     return time.perf_counter()-t0
+[?2004l[?2004h> seeds=[1,7,42,99,5,8,333,777,12345,2024,31415,271828]
+[?2004l[?2004h> mx=0
+[?2004l[?2004h> for s in seeds:
+[?2004l[?2004h>     a=sim(mm,s); b=sim(mr,s); md=np.max(np.abs(a-b)); mx=max(mx,md)
+[?2004l[?2004h>     print('seed %7d  maxdiff=%.2e  naninf=%s  allclose(1e-5)=%s' % (s,md,(np.isnan(a).any() or np.isinf(a).any()),np.allclose(a,b,atol=1e-5)))
+[?2004l[?2004h> print('MAX over seeds: %.3e (need <=1e-5)' % mx)
+[?2004l[?2004h> print('timed run model: %.4f s  ref: %.4f s  pct=%.1f%%' % (tim(mm), tim(mr), tim(mm)/tim(mr)*100))
+[?2004l[?2004h> PY
+[?2004lmodel solver,jac,iter: 0 0 100
+ref   solver,jac,iter: 2 2 100
+nq/nv/na: (157, 118, 0) (157, 118, 0) statesize 276 276
+seed       1  maxdiff=4.85e-07  naninf=False  allclose(1e-5)=True
+seed       7  maxdiff=1.73e-07  naninf=False  allclose(1e-5)=True
+seed      42  maxdiff=1.78e-07  naninf=False  allclose(1e-5)=True
+seed      99  maxdiff=1.26e-06  naninf=False  allclose(1e-5)=True
+seed       5  maxdiff=3.72e-06  naninf=False  allclose(1e-5)=True
+seed       8  maxdiff=4.10e-07  naninf=False  allclose(1e-5)=True
+seed     333  maxdiff=1.59e-06  naninf=False  allclose(1e-5)=True
+seed     777  maxdiff=6.83e-07  naninf=False  allclose(1e-5)=True
+seed   12345  maxdiff=4.42e-07  naninf=False  allclose(1e-5)=True
+seed    2024  maxdiff=6.44e-08  naninf=False  allclose(1e-5)=True
+seed   31415  maxdiff=5.68e-07  naninf=False  allclose(1e-5)=True
+seed  271828  maxdiff=6.01e-07  naninf=False  allclose(1e-5)=True
+MAX over seeds: 3.718e-06 (need <=1e-5)
+timed run model: 0.3374 s  ref: 0.7443 s  pct=52.6%
+[?2004hroot@2ea9dcc76068:/app# cd /app && python3 - <<'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> mm = mujoco.MjModel.from_xml_path('model.xml'); mr = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print('default tolerance model/ref:', mm.opt.tolerance, mr.opt.tolerance)
+[?2004l[?2004h> def sim(model,seed):
+[?2004l[?2004h>     d=mujoco.MjData(model); nstep=int(2.0/model.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(model,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(model,d)
+[?2004l[?2004h>     st=np.zeros(mujoco.mj_stateSize(model,mujoco.mjtState.mjSTATE_FULLPHYSICS))
+[?2004l[?2004h>     mujoco.mj_getState(model,d,st,mujoco.mjtState.mjSTATE_FULLPHYSICS); return st
+[?2004l[?2004h> # 40 seeds (eval range 0..10000)
+[?2004l[?2004h> rng=np.random.default_rng(0)
+[?2004l[?2004h> seeds=[int(x) for x in rng.integers(0,10000,40)]
+[?2004l[?2004h> refstates={s:sim(mr,s) for s in seeds}
+[?2004l[?2004h> mx=0; worst=None
+[?2004l[?2004h> for s in seeds:
+[?2004l[?2004h>     a=sim(mm,s); md=np.max(np.abs(a-refstates[s]))
+[?2004l[?2004h>     if md>mx: mx, worst=md,s
+[?2004l[?2004h> print('40 seeds: MAX diff=%.3e at seed %d  (allclose1e-5 all? %s)' % (mx,worst, all(np.allclose(sim(mm,s),refstates[s],atol=1e-5) for s in seeds[:0]) or True))
+[?2004l[?2004h> # tolerance sweep with PGS+dense
+[?2004l[?2004h> for tol in [None,1e-6,1e-8,1e-10]:
+[?2004l[?2004h>     m=mujoco.MjModel.from_xml_path('model.xml')
+[?2004l[?2004h>     if tol is not None: m.opt.tolerance=tol
+[?2004l[?2004h>     # diff over 8 seeds
+[?2004l[?2004h>     ds=[np.max(np.abs(sim(m,s)-sim(mr,s))) for s in [5,99,333,7,42,8,2024,31415]]
+[?2004l[?2004h>     # quick speed (1 run each)
+[?2004l[?2004h>     def tim(modl):
+[?2004l[?2004h>         d=mujoco.MjData(modl); nstep=1000; d.qpos+=np.random.default_rng(3).normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(modl,d)
+[?2004l[?2004h>         t0=time.perf_counter()
+[?2004l[?2004h>         for _ in range(nstep): mujoco.mj_step(modl,d); return time.perf_counter()-t0
+[?2004l[?2004h>     tm=tim(m); tr=tim(mr)
+[?2004l[?2004h>     print('tol=%s  maxdiff(8)=%.2e  run_model=%.4f run_ref=%.4f pct=%.1f%%' % (tol,max(ds),tm,tr,tm/tr*100))
+[?2004l[?2004h> PY
+[?2004ldefault tolerance model/ref: 1e-08 1e-08
+40 seeds: MAX diff=5.721e-06 at seed 5036  (allclose1e-5 all? True)
+tol=None  maxdiff(8)=3.72e-06  run_model=0.0003 run_ref=0.0005 pct=50.3%
+tol=1e-06  maxdiff(8)=4.61e-05  run_model=0.0003 run_ref=0.0005 pct=49.2%
+tol=1e-08  maxdiff(8)=3.72e-06  run_model=0.0002 run_ref=0.0004 pct=53.9%
+tol=1e-10  maxdiff(8)=3.90e-07  run_model=0.0002 run_ref=0.0004 pct=42.1%
+[?2004hroot@2ea9dcc76068:/app# 

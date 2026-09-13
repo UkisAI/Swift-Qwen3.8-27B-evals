@@ -1,0 +1,717 @@
+[?2004hroot@a3c939d94b34:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@a3c939d94b34:/app# clear
+[?2004l[H[J[3J[?2004hroot@a3c939d94b34:/app# cat > /app/parallel_linear.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with column parallelism.
+[?2004l[?2004h>     
+[?2004l[?2004h>     The weight matrix is split by columns (i.e., along the output dimension).
+[?2004l[?2004h>     Each rank computes a slice of the output. The full output would be
+[?2004l[?2004h>     obtained by all_gather (concatenation along the last dimension).
+[?2004l[?2004h>     The bias is sharded in the same way as the output dimension.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.world_size = dist.get_world_size()
+[?2004l[?2004h>         self.rank = dist.get_rank()
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Each rank gets out_features // world_size rows of the weight matrix
+[?2004l[?2004h>         out_per_rank = out_features // self.world_size
+[?2004l[?2004h>         start = self.rank * out_per_rank
+[?2004l[?2004h>         end = start + out_per_rank
+[?2004l[?2004h>         self.weight = nn.Parameter(master_weight[start:end, :].clone())
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(torch.zeros(out_per_rank))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, input):
+[?2004l[?2004h>         return F.linear(input, self.weight, self.bias)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with row parallelism.
+[?2004l[?2004h>     
+[?2004l[?2004h>     The weight matrix is split by rows (i.e., along the input dimension).
+[?2004l[?2004h>     Each rank receives a pre-scattered slice of the input (partitioned along
+[?2004l[?2004h>     the last dimension) and computes a partial output. The full output would
+[?2004l[?2004h>     be obtained by all_reduce (summing the partial outputs).
+[?2004l[?2004h>     The bias remains full on each rank.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.world_size = dist.get_world_size()
+[?2004l[?2004h>         self.rank = dist.get_rank()
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Each rank gets in_features // world_size columns of the weight matrix
+[?2004l[?2004h>         in_per_rank = in_features // self.world_size
+[?2004l[?2004h>         start = self.rank * in_per_rank
+[?2004l[?2004h>         end = start + in_per_rank
+[?2004l[?2004h>         self.weight = nn.Parameter(master_weight[:, start:end].clone())
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(torch.zeros(out_features))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, input):
+[?2004l[?2004h>         return F.linear(input, self.weight, self.bias)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a3c939d94b34:/app# cat /app/parallel_linear.py
+[?2004limport torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+class ColumnParallelLinear(nn.Module):
+    """Linear layer with column parallelism.
+    
+    The weight matrix is split by columns (i.e., along the output dimension).
+    Each rank computes a slice of the output. The full output would be
+    obtained by all_gather (concatenation along the last dimension).
+    The bias is sharded in the same way as the output dimension.
+    """
+
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+
+        # Each rank gets out_features // world_size rows of the weight matrix
+        out_per_rank = out_features // self.world_size
+        start = self.rank * out_per_rank
+        end = start + out_per_rank
+        self.weight = nn.Parameter(master_weight[start:end, :].clone())
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_per_rank))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, input):
+        return F.linear(input, self.weight, self.bias)
+
+
+class RowParallelLinear(nn.Module):
+    """Linear layer with row parallelism.
+    
+    The weight matrix is split by rows (i.e., along the input dimension).
+    Each rank receives a pre-scattered slice of the input (partitioned along
+    the last dimension) and computes a partial output. The full output would
+    be obtained by all_reduce (summing the partial outputs).
+    The bias remains full on each rank.
+    """
+
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+
+        # Each rank gets in_features // world_size columns of the weight matrix
+        in_per_rank = in_features // self.world_size
+        start = self.rank * in_per_rank
+        end = start + in_per_rank
+        self.weight = nn.Parameter(master_weight[:, start:end].clone())
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, input):
+        return F.linear(input, self.weight, self.bias)
+[?2004hroot@a3c939d94b34:/app# cat > /app/test_parallel.py << 'EOF'
+[?2004l[?2004h> import os
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l# [?2004h> import sys
+[?2004l[?2004h> 
+[?2004l[?2004h> def run_test(rank, world_size, master_weight, in_features, out_features, has_bias, test_type):
+[?2004l[?2004h>     """Run test on a single rank."""
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = '29600'
+[?2004l[?2004h>     dist.init_process_group('gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     
+[?2004l[?2004h>     from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h>     
+[?2004l[?2004h>     if test_type == 'column':
+[?2004l)[:,[?2004h>         layer = ColumnParallelLinear(in_features, out_features, has_bias, master_weight)
+[?2004l[?2004h>         
+[?2004lu[?2004h>         # Check weight shape
+[?2004l[?2004h>         expected_out = out_features // world_size
+[?2004l[?2004h>         assert layer.weight.shape == (expected_out, in_features), \
+[?2004l[?2004h>             f"Rank {rank}: Expected weight shape ({expected_out}, {in_features}), got {layer.weight.shape}"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check weight values match the slice
+[?2004l[?2004h>         start = rank * expected_out
+[?2004l[?2004h>         end = start + expected_out
+[?2004l[?2004h>         assert torch.allclose(layer.weight.data, master_weight[start:end, :]), \
+[?2004l[?2004h>             f"Rank {rank}: Weight values don't match"
+[?2004l[?2004h>         
+[?2004l)[?2004h>         # Check bias
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             assert layer.bias.shape == (expected_out,), \
+[?2004l[?2004h>                 f"Rank {rank}: Expected bias shape ({expected_out},), got {layer.bias.shape}"
+[?2004l[?2004h>             assert torch.allclose(layer.bias.data, torch.zeros(expected_out)), \
+[?2004l[?2004h>                 f"Rank {rank}: Bias not zero"
+[?2004l[?2004h>         
+[?2004lu[?2004h>         # Forward pass test
+[?2004l[?2004h>         torch.manual_seed(42)
+[?2004l[?2004h>         input_tensor = torch.randn(2, 3, in_features, requires_grad=True)
+[?2004l[?2004h>         output = layer(input_tensor)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Expected: slice of full output
+[?2004l[?2004h>         expected_slice = (input_tensor @ master_weight[start:end, :].T).view(2, 3, -1)
+[?2004l[?2004h>         if has_bias:
+[?2004ls[?2004h>             expected_slice = expected_slice + layer.bias.data
+[?2004l[?2004h>         assert torch.allclose(output, expected_slice, atol=1e-5), \
+[?2004l[?2004h>             f"Rank {rank}: Forward output mismatch"
+[?2004l[?2004h>         
+[?2004l [?2004h>         # Gradient test
+[?2004l[?2004h>         loss = output.sum()
+[?2004l[?2004h>         loss.backward()
+[?2004l[?2004h>         
+[?2004l [?2004h>         assert layer.weight.grad is not None, f"Rank {rank}: No weight gradient"
+[?2004l[?2004h>         assert layer.weight.grad.shape == layer.weight.shape, \
+[?2004l[?2004h>             f"Rank {rank}: Weight grad shape mismatch"
+[?2004l[?2004h>         
+[?2004l[?2004h>         if has_bias:
+[?2004l[[?2004h>             assert layer.bias.grad is not None, f"Rank {rank}: No bias gradient"
+[?2004l[?2004h>             assert layer.bias.grad.shape == layer.bias.shape, \
+[?2004l[?2004h>                 f"Rank {rank}: Bias grad shape mismatch"
+[?2004l[?2004h>             
+[?2004l[?2004h>         # All-gather outputs and verify
+[?2004l[?2004h>         output_slices = [torch.zeros_like(output) for _ in range(world_size)]
+[?2004l[?2004h>         dist.all_gather(output_slices, output)
+[?2004l[?2004h>         full_output = torch.cat(output_slices, dim=-1)
+[?2004l[?2004h>         
+[?2004lu[?2004h>         full_expected = input_tensor.detach() @ master_weight.T
+[?2004l[?2004h>         if has_bias:
+[?2004le[?2004h>             full_expected = full_expected + torch.zeros(out_features)
+[?2004l[?2004h>         
+[?2004l[?2004h>         assert torch.allclose(full_output, full_expected, atol=1e-5), \
+[?2004l[?2004h>             f"Rank {rank}: All-gathered output doesn't match full output"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # All-gather gradients
+[?2004l[?2004h>         grad_slices = [torch.zeros_like(layer.weight.grad) for _ in range(world_size)]
+[?2004l[?2004h>         dist.all_gather(grad_slices, layer.weight.grad)
+[?2004l[?2004h>         full_grad = torch.cat(grad_slices, dim=0)
+[?2004l[?2004h>         
+[?2004l[?2004h>         expected_grad = torch.ones(2, 3, out_features) @ input_tensor.detach().permute(1, 2, 0).reshape(3, -1).T
+[?2004l[?2004h>         # Simpler: expected_grad = input.T @ ones
+[?2004l[?2004h>         expected_grad = (input_tensor.detach().reshape(-1, in_features).T @ 
+[?2004l[?2004h>                         torch.ones(2*3, out_features))
+[?2004l[?2004h>         
+[?2004lorl[?2004h>         # Verify gradient is correct
+[?2004l[?2004h>         # d/dW of sum(output) where output = input @ W^T
+[?2004l[?2004h>         # = sum over batch of (dL/dout * input^T) for each output dim
+[?2004l[?2004h>         # For sum, dL/dout = 1
+[?2004l[?2004h>         # grad_W = input_flat^T @ ones  where input_flat is (batch*seq, in_features)
+[?2004l[?2004h>         input_flat = input_tensor.detach().reshape(-1, in_features)
+[?2004l[?2004h>         expected_weight_grad = input_flat.T  # (in_features, out_features) -> need (out_features, in_features)
+[?2004l[?2004h>         expected_weight_grad = torch.ones(input_flat.shape[0], out_features) @ input_flat  # (out_features, in_features)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Actually: output = input @ W.T, loss = output.sum()
+[?2004l[?2004h>         # dL/dW = (dL/dout)^T @ input = ones^T @ input_flat = ones(2*3, out) ^T @ input_flat(2*3, in)
+[?2004l[?2004h>         # = (out, 2*3) @ (2*3, in) = (out, in)  -- this is for full W
+[?2004l[?2004h>         # For the slice: (expected_out, in_features)
+[?2004l[?2004h>         exp_w_grad = torch.ones(input_flat.shape[0], out_features).T[:, start:end] @ input_flat
+[?2004l[?2004h>         # That's (out_features, 1)[:, start:end] @ (batch, in) -- no
+[?2004l[?2004h>         # Let me just verify: exp_w_grad = ones(batch, expected_out) @ input_flat? No.
+[?2004l[?2004h>         # dL/dW_slice = dL/dout_slice ^T @ input_flat where dL/dout_slice = ones(batch, expected_out)
+[?2004l[?2004h>         # = ones(batch, expected_out).T @ input_flat(batch, in) = (expected_out, batch) @ (batch, in) = (expected_out, in)
+[?2004l[?2004h>         exp_w_grad = torch.ones(input_flat.shape[0], expected_out).T @ input_flat
+[?2004l[?2004h>         assert torch.allclose(full_grad[start:end, :], exp_w_grad, atol=1e-4), \
+[?2004l[?2004h>             f"Rank {rank}: Weight gradient mismatch. Got {full_grad[start:end, :].sum()}, Expected {exp_w_grad.sum()}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     elif test_type == 'row':
+[?2004l[?2004h>         layer = RowParallelLinear(in_features, out_features, has_bias, master_weight)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check weight shape
+[?2004l[?2004h>         expected_in = in_features // world_size
+[?2004l[?2004h>         assert layer.weight.shape == (out_features, expected_in), \
+[?2004l[?2004h>             f"Rank {rank}: Expected weight shape ({out_features}, {expected_in}), got {layer.weight.shape}"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check weight values
+[?2004l[?2004h>         start = rank * expected_in
+[?2004l[?2004h>         end = start + expected_in
+[?2004l[?2004h>         assert torch.allclose(layer.weight.data, master_weight[:, start:end]), \
+[?2004l[?2004h>             f"Rank {rank}: Weight values don't match"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check bias is full
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             assert layer.bias.shape == (out_features,), \
+[?2004l[?2004h>                 f"Rank {rank}: Expected bias shape ({out_features},), got {layer.bias.shape}"
+[?2004l[?2004h>             assert torch.allclose(layer.bias.data, torch.zeros(out_features)), \
+[?2004l[?2004h>                 f"Rank {rank}: Bias not zero"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Forward pass test - input is pre-scattered
+[?2004l[?2004h>         torch.manual_seed(42)
+[?2004l[?2004h>         full_input = torch.randn(2, 3, in_features, requires_grad=True)
+[?2004l[?2004h>         input_slice = full_input[:, :, start:end].clone()
+[?2004l[?2004h>         input_slice.requires_grad_(True)
+[?2004l[?2004h>         output = layer(input_slice)
+[?2004l[?2004h>         
+[?2004l[?2004h>         expected_partial = input_slice @ master_weight[:, start:end].T
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             expected_partial = expected_partial + layer.bias.data
+[?2004l[?2004h>         assert torch.allclose(output, expected_partial, atol=1e-5), \
+[?2004l[?2004h>             f"Rank {rank}: Forward output mismatch"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Gradient test
+[?2004l[?2004h>         loss = output.sum()
+[?2004l[?2004h>         loss.backward()
+[?2004l[?2004h>         
+[?2004l[?2004h>         assert layer.weight.grad is not None, f"Rank {rank}: No weight gradient"
+[?2004l[?2004h>         
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             assert layer.bias.grad is not None, f"Rank {rank}: No bias gradient"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # All-reduce outputs and verify
+[?2004l[?2004h>         output_reduced = output.detach().clone()
+[?2004l[?2004h>         dist.all_reduce(output_reduced, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>         
+[?2004l[?2004h>         full_expected = full_input.detach() @ master_weight.T
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             full_expected = full_expected + torch.zeros(out_features)  # bias is zero
+[?2004l[?2004h>         
+[?2004l[?2004h>         assert torch.allclose(output_reduced, full_expected, atol=1e-5), \
+[?2004l[?2004h>             f"Rank {rank}: All-reduced output doesn't match full output. got {output_reduced[0,0,:3]}, exp {full_expected[0,0,:3]}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h>     print(f"  Rank {rank}/{world_size} PASSED for {test_type} (bias={has_bias})")
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def test_config(world_size, test_type, has_bias):
+[?2004l[?2004h>     in_features = 16
+[?2004l[?2004h>     out_features = 8
+[?2004l[?2004h>     torch.manual_seed(0)
+[?2004l[?2004h>     master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h>     
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = str(29500 + world_size * 10 + (1 if has_bias else 0) + (2 if test_type == 'row' else 0))
+[?2004l[?2004h>     
+[?2004l[?2004h>     mp.spawn(
+[?2004l[?2004h>         run_test,
+[?2004l[?2004h>         args=(world_size, master_weight, in_features, out_features, has_bias, test_type),
+[?2004l[?2004h>         nprocs=world_size,
+[?2004l[?2004h>         join=True
+[?2004l[?2004h>     )
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     for ws in [1, 2, 4]:
+[?2004l[?2004h>         for has_bias in [True, False]:
+[?2004l[?2004h>             for test_type in ['column', 'row']:
+[?2004l[?2004h>                 print(f"Testing world_size={ws}, bias={has_bias}, type={test_type}")
+[?2004l[?2004h>                 test_config(ws, test_type, has_bias)
+[?2004l[?2004h>     print("\nAll tests passed!")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a3c939d94b34:/app# cd /app && python test_parallel.py 2>&1
+[?2004lbash: python: command not found
+[?2004hroot@a3c939d94b34:/app# python3 test_parallel.py 2>&1
+[?2004lTraceback (most recent call last):
+  File "/app/test_parallel.py", line 2, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[?2004hroot@a3c939d94b34:/app# pip install torch --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -5
+[?2004lbash: pip: command not found
+[?2004hroot@a3c939d94b34:/app# python3 --version && python3 -m pip --version 2>&1
+[?2004lPython 3.12.3
+/usr/bin/python3: No module named pip
+[?2004hroot@a3c939d94b34:/app# which python3 && ls /usr/lib/python3*/dist-packages/ 2>/dev/null | head -20
+[?2004l/usr/bin/python3
+/usr/lib/python3.12/dist-packages/:
+asciinema-2.4.0.dist-info
+
+/usr/lib/python3/dist-packages/:
+asciinema
+asciinema-2.4.0.dist-info
+pkg_resources
+[?2004hroot@a3c939d94b34:/app# python3 -m ensurepip 2>&1
+[?2004l/usr/bin/python3: No module named ensurepip
+[?2004hroot@a3c939d94b34:/app# python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -10
+[?2004l/usr/bin/python3: No module named pip
+[?2004hroot@a3c939d94b34:/app# apt-get update -qq && apt-get install -y -qq python3-pip 2>&1 | tail -5
+[?2004lSetting up libgd3:amd64 (2.3.3-9ubuntu5) ...
+Setting up libc-devtools (2.39-0ubuntu8.8) ...
+Setting up libheif-plugin-aomdec:amd64 (1.17.6-1ubuntu4.8) ...
+Setting up libheif-plugin-aomenc:amd64 (1.17.6-1ubuntu4.8) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.8) ...
+[?2004hroot@a3c939d94b34:/app# pip3 install torch --index-url https://download.pytorch.org/whl/cpu --break-system-packages 2>&1 | tail -5
+[?2004l    Found existing installation: setuptools 68.1.2
+    Uninstalling setuptools-68.1.2:
+      Successfully uninstalled setuptools-68.1.2
+Successfully installed MarkupSafe-3.0.3 filelock-3.32.3 fsspec-2026.7.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 setuptools-78.1.0 sympy-1.14.0 torch-2.14.0+cpu typing-extensions-4.16.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+[?2004hroot@a3c939d94b34:/app# cd /app && python3 test_parallel.py 2>&1
+[?2004l/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+Testing world_size=1, bias=True, type=column
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+Traceback (most recent call last):
+  File "/app/test_parallel.py", line 185, in <module>
+    test_config(ws, test_type, has_bias)
+  File "/app/test_parallel.py", line 172, in test_config
+    mp.spawn(
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 340, in spawn
+    return start_processes(fn, args, nprocs, join, daemon, start_method="spawn")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 296, in start_processes
+    while not context.join():
+              ^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 211, in join
+    raise ProcessRaisedException(msg, error_index, failed_process.pid)
+torch.multiprocessing.spawn.ProcessRaisedException: 
+
+-- Process 0 terminated with the following error:
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 87, in _wrap
+    fn(i, *args)
+  File "/app/test_parallel.py", line 79, in run_test
+    expected_grad = torch.ones(2, 3, out_features) @ input_tensor.detach().permute(1, 2, 0).reshape(3, -1).T
+                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (6x8 and 32x3)
+
+[?2004hroot@a3c939d94b34:/app# cat > /app/test_parallel.py << 'EOF'
+[?2004l[?2004h> import os
+[?2004l+[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004la[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l[?2004h> import sys
+[?2004l {[?2004h> 
+[?2004lr[?2004h> def run_test(rank, world_size, in_features, out_features, has_bias, test_type, port):
+[?2004l[?2004h>     """Run test on a single rank."""
+[?2004ls[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = str(port)
+[?2004l[?2004h>     dist.init_process_group('gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     
+[?2004lr.[?2004h>     torch.manual_seed(0)
+[?2004l[?2004h>     master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h>     
+[?2004l[?2004h>     from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h>     
+[?2004l[?2004h>     if test_type == 'column':
+[?2004l[?2004h>         layer = ColumnParallelLinear(in_features, out_features, has_bias, master_weight)
+[?2004l[?2004h>         
+[?2004li[?2004h>         # Check weight shape
+[?2004lu[?2004h>         expected_out = out_features // world_size
+[?2004l[?2004h>         assert layer.weight.shape == (expected_out, in_features), \
+[?2004l[?2004h>             f"Rank {rank}: Expected weight shape ({expected_out}, {in_features}), got {layer.weight.shape}"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check weight values match the slice
+[?2004l[?2004h>         start = rank * expected_out
+[?2004l[?2004h>         end = start + expected_out
+[?2004l[?2004h>         assert torch.allclose(layer.weight.data, master_weight[start:end, :]), \
+[?2004l[?2004h>             f"Rank {rank}: Weight values don't match"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check bias
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             assert layer.bias.shape == (expected_out,), \
+[?2004l[?2004h>                 f"Rank {rank}: Expected bias shape ({expected_out},), got {layer.bias.shape}"
+[?2004l[?2004h>             assert torch.allclose(layer.bias.data, torch.zeros(expected_out)), \
+[?2004l[?2004h>                 f"Rank {rank}: Bias not zero"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Forward pass test
+[?2004l[?2004h>         torch.manual_seed(42)
+[?2004l[?2004h>         input_tensor = torch.randn(2, 3, in_features)
+[?2004l[?2004h>         output = layer(input_tensor)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Expected: slice of full output
+[?2004l[?2004h>         expected_slice = (input_tensor @ master_weight[start:end, :].T)
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             expected_slice = expected_slice + layer.bias.data
+[?2004l[?2004h>         assert torch.allclose(output, expected_slice, atol=1e-5), \
+[?2004l[?2004h>             f"Rank {rank}: Forward output mismatch"
+[?2004l[?2004h>         
+[?2004lc[?2004h>         # Gradient test
+[?2004l[?2004h>         input_tensor.requires_grad_(True)
+[?2004l[?2004h>         output = layer(input_tensor)
+[?2004l[?2004h>         loss = output.sum()
+[?2004l[?2004h>         loss.backward()
+[?2004l[?2004h>         
+[?2004l[?2004h>         assert layer.weight.grad is not None, f"Rank {rank}: No weight gradient"
+[?2004l[?2004h>         assert layer.weight.grad.shape == layer.weight.shape, \
+[?2004l[?2004h>             f"Rank {rank}: Weight grad shape mismatch"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Expected weight gradient: ones(batch, out_slice).T @ input_flat
+[?2004l[?2004h>         input_flat = input_tensor.detach().reshape(-1, in_features)
+[?2004l[?2004h>         exp_w_grad = torch.ones(input_flat.shape[0], expected_out).T @ input_flat
+[?2004l[?2004h>         assert torch.allclose(layer.weight.grad, exp_w_grad, atol=1e-4), \
+[?2004l[?2004h>             f"Rank {rank}: Weight gradient mismatch"
+[?2004l[?2004h> 
+[?2004l[[?2004h>         if has_bias:
+[?2004l[?2004h>             assert layer.bias.grad is not None, f"Rank {rank}: No bias gradient"
+[?2004l[?2004h>             assert torch.allclose(layer.bias.grad, torch.ones(expected_out) * input_flat.shape[0], atol=1e-4), \
+[?2004l[?2004h>                 f"Rank {rank}: Bias gradient mismatch. got {layer.bias.grad[:3]}, exp {input_flat.shape[0]}"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # All-gather outputs and verify (only if world_size > 1)
+[?2004l[?2004h>         if world_size > 1:
+[?2004l[?2004h>             output_slices = [torch.zeros_like(output.detach()) for _ in range(world_size)]
+[?2004l[?2004h>             dist.all_gather(output_slices, output.detach())
+[?2004l[?2004h>             full_output = torch.cat(output_slices, dim=-1)
+[?2004l[?2004h>             full_expected = input_tensor.detach() @ master_weight.T
+[?2004l[?2004h>             assert torch.allclose(full_output, full_expected, atol=1e-5), \
+[?2004l[?2004h>                 f"Rank {rank}: All-gathered output doesn't match full output"
+[?2004l[?2004h>         
+[?2004l[?2004h>     elif test_type == 'row':
+[?2004l[?2004h>         layer = RowParallelLinear(in_features, out_features, has_bias, master_weight)
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check weight shape
+[?2004l[?2004h>         expected_in = in_features // world_size
+[?2004l[?2004h>         assert layer.weight.shape == (out_features, expected_in), \
+[?2004l[?2004h>             f"Rank {rank}: Expected weight shape ({out_features}, {expected_in}), got {layer.weight.shape}"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check weight values
+[?2004l[?2004h>         start = rank * expected_in
+[?2004l[?2004h>         end = start + expected_in
+[?2004l[?2004h>         assert torch.allclose(layer.weight.data, master_weight[:, start:end]), \
+[?2004l[?2004h>             f"Rank {rank}: Weight values don't match"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check bias is full
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             assert layer.bias.shape == (out_features,), \
+[?2004l[?2004h>                 f"Rank {rank}: Expected bias shape ({out_features},), got {layer.bias.shape}"
+[?2004l[?2004h>             assert torch.allclose(layer.bias.data, torch.zeros(out_features)), \
+[?2004l[?2004h>                 f"Rank {rank}: Bias not zero"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Forward pass test - input is pre-scattered
+[?2004l[?2004h>         torch.manual_seed(42)
+[?2004l[?2004h>         full_input = torch.randn(2, 3, in_features)
+[?2004l[?2004h>         input_slice = full_input[:, :, start:end].clone().requires_grad_(True)
+[?2004l[?2004h>         output = layer(input_slice)
+[?2004l[?2004h>         
+[?2004l[?2004h>         expected_partial = input_slice.detach() @ master_weight[:, start:end].T
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             expected_partial = expected_partial + layer.bias.data
+[?2004l[?2004h>         assert torch.allclose(output, expected_partial, atol=1e-5), \
+[?2004l[?2004h>             f"Rank {rank}: Forward output mismatch"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Gradient test
+[?2004l[?2004h>         loss = output.sum()
+[?2004l[?2004h>         loss.backward()
+[?2004l[?2004h>         
+[?2004l[?2004h>         assert layer.weight.grad is not None, f"Rank {rank}: No weight gradient"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Expected weight gradient for row parallel
+[?2004l[?2004h>         input_slice_flat = input_slice.detach().reshape(-1, expected_in)
+[?2004l[?2004h>         exp_w_grad = torch.ones(input_slice_flat.shape[0], out_features).T @ input_slice_flat
+[?2004l[?2004h>         assert torch.allclose(layer.weight.grad, exp_w_grad, atol=1e-4), \
+[?2004l[?2004h>             f"Rank {rank}: Weight gradient mismatch"
+[?2004l[?2004h> 
+[?2004l[?2004h>         if has_bias:
+[?2004l[?2004h>             assert layer.bias.grad is not None, f"Rank {rank}: No bias gradient"
+[?2004l[?2004h>             assert torch.allclose(layer.bias.grad, torch.ones(out_features) * input_slice_flat.shape[0], atol=1e-4), \
+[?2004l[?2004h>                 f"Rank {rank}: Bias gradient mismatch"
+[?2004l[?2004h>         
+[?2004l[?2004h>         # All-reduce outputs and verify (only if world_size > 1)
+[?2004l[?2004h>         if world_size > 1:
+[?2004l[?2004h>             output_reduced = output.detach().clone()
+[?2004l[?2004h>             dist.all_reduce(output_reduced, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>             full_expected = full_input @ master_weight.T
+[?2004l[?2004h>             assert torch.allclose(output_reduced, full_expected, atol=1e-5), \
+[?2004l[?2004h>                 f"Rank {rank}: All-reduced output doesn't match full output"
+[?2004l[?2004h>     
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h>     if rank == 0:
+[?2004l[?2004h>         print(f"  PASSED: world_size={world_size}, bias={has_bias}, type={test_type}")
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def test_config(world_size, test_type, has_bias, port):
+[?2004l[?2004h>     in_features = 16
+[?2004l[?2004h>     out_features = 8
+[?2004l[?2004h>     
+[?2004l[?2004h>     mp.spawn(
+[?2004l[?2004h>         run_test,
+[?2004l[?2004h>         args=(world_size, in_features, out_features, has_bias, test_type, port),
+[?2004l[?2004h>         nprocs=world_size,
+[?2004l[?2004h>         join=True
+[?2004l[?2004h>     )
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     port = 29500
+[?2004l[?2004h>     for ws in [1, 2, 4]:
+[?2004l[?2004h>         for has_bias in [True, False]:
+[?2004l[?2004h>             for test_type in ['column', 'row']:
+[?2004l[?2004h>                 print(f"Testing world_size={ws}, bias={has_bias}, type={test_type}")
+[?2004l[?2004h>                 test_config(ws, test_type, has_bias, port + 1)
+[?2004l[?2004h>                 port += 10
+[?2004l[?2004h>     print("\nAll tests passed!")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a3c939d94b34:/app# python3 test_parallel.py 2>&1
+[?2004l/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+Testing world_size=1, bias=True, type=column
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=1, bias=True, type=column
+Testing world_size=1, bias=True, type=row
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=1, bias=True, type=row
+Testing world_size=1, bias=False, type=column
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=1, bias=False, type=column
+Testing world_size=1, bias=False, type=row
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=1, bias=False, type=row
+Testing world_size=2, bias=True, type=column
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=2, bias=True, type=column
+Testing world_size=2, bias=True, type=row
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=2, bias=True, type=row
+Testing world_size=2, bias=False, type=column
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=2, bias=False, type=column
+Testing world_size=2, bias=False, type=row
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=2, bias=False, type=row
+Testing world_size=4, bias=True, type=column
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=4, bias=True, type=column
+Testing world_size=4, bias=True, type=row
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=4, bias=True, type=row
+Testing world_size=4, bias=False, type=column
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=4, bias=False, type=column
+Testing world_size=4, bias=False, type=row
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+  PASSED: world_size=4, bias=False, type=row
+
+All tests passed!
+[?2004hroot@a3c939d94b34:/app# cat /app/parallel_linear.py
+[?2004limport torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+class ColumnParallelLinear(nn.Module):
+    """Linear layer with column parallelism.
+    
+    The weight matrix is split by columns (i.e., along the output dimension).
+    Each rank computes a slice of the output. The full output would be
+    obtained by all_gather (concatenation along the last dimension).
+    The bias is sharded in the same way as the output dimension.
+    """
+
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+
+        # Each rank gets out_features // world_size rows of the weight matrix
+        out_per_rank = out_features // self.world_size
+        start = self.rank * out_per_rank
+        end = start + out_per_rank
+        self.weight = nn.Parameter(master_weight[start:end, :].clone())
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_per_rank))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, input):
+        return F.linear(input, self.weight, self.bias)
+
+
+class RowParallelLinear(nn.Module):
+    """Linear layer with row parallelism.
+    
+    The weight matrix is split by rows (i.e., along the input dimension).
+    Each rank receives a pre-scattered slice of the input (partitioned along
+    the last dimension) and computes a partial output. The full output would
+    be obtained by all_reduce (summing the partial outputs).
+    The bias remains full on each rank.
+    """
+
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+
+        # Each rank gets in_features // world_size columns of the weight matrix
+        in_per_rank = in_features // self.world_size
+        start = self.rank * in_per_rank
+        end = start + in_per_rank
+        self.weight = nn.Parameter(master_weight[:, start:end].clone())
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, input):
+        return F.linear(input, self.weight, self.bias)
+[?2004hroot@a3c939d94b34:/app# 

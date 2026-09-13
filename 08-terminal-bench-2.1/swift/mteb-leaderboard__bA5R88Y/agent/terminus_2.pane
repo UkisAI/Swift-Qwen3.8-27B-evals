@@ -1,0 +1,1340 @@
+[?2004hroot@3b188f72b5ff:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@3b188f72b5ff:/app# clear
+[?2004l[H[J[3J[?2004hroot@3b188f72b5ff:/app# python3 --version; pip list 2>/dev/null | grep -i mteb; echo '---'; which curl wget
+[?2004lPython 3.10.20
+mteb                  1.38.41
+---
+/usr/bin/wget
+[?2004hroot@3b188f72b5ff:/app# curl -s -m 10 https://huggingface.co > /dev/null && echo 'HF reachable' || echo 'HF NOT reachable'
+[?2004lbash: curl: command not found
+HF NOT reachable
+[?2004hroot@3b188f72b5ff:/app# wget -q -O /dev/null --timeout=10 https://huggingface.co && echo 'HF reachable' || echo 'HF NOT reachable'
+[?2004lHF reachable
+[?2004hroot@3b188f72b5ff:/app# python3 -c "import mteb; print(mteb.__version__); import pkgutil; print([m.name for m in pkgutil.iter_modules(mteb.__path__)])"
+[?2004l1.38.41
+['__main__', 'abstasks', 'benchmarks', 'caching', 'cli', 'create_meta', 'custom_validators', 'encoder_interface', 'evaluation', 'languages', 'leaderboard', 'load_results', 'logging', 'model_meta', 'models', 'normalize_embeddings', 'overview', 'requires_package', 'task_aggregation', 'task_selection', 'tasks']
+[?2004hroot@3b188f72b5ff:/app# python3 -c "import mteb.leaderboard as lb; print(dir(lb))"
+[?2004lpython3 -c "from mteb.leaderboard import MTEBLeaderboard; import inspect; print(inspect.getsource(MTEBLeaderboard.__init__))" 2>&1 | head -50
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/usr/local/lib/python3.10/site-packages/mteb/leaderboard/__init__.py", line 3, in <module>
+    from mteb.leaderboard.app import get_leaderboard_app
+  File "/usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py", line 13, in <module>
+    import cachetools
+ModuleNotFoundError: No module named 'cachetools'
+[?2004hroot@3b188f72b5ff:/app# python3 -c "from mteb.leaderboard import MTEBLeaderboard; import inspect; print(inspect.getsource(MTEBLeaderboard.__init__))" 2>&1 | head -50
+[?2004lTraceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/usr/local/lib/python3.10/site-packages/mteb/leaderboard/__init__.py", line 3, in <module>
+    from mteb.leaderboard.app import get_leaderboard_app
+  File "/usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py", line 13, in <module>
+    import cachetools
+ModuleNotFoundError: No module named 'cachetools'
+[?2004hroot@3b188f72b5ff:/app# pip install cachetools 2>&1 | tail -5
+[?2004lSuccessfully installed cachetools-7.1.8
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+
+[notice] A new release of pip is available: 26.1 -> 26.2.1
+[notice] To update, run: pip install --upgrade pip
+[?2004hroot@3b188f72b5ff:/app# sed -n '1,40p' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py
+[?2004lfrom __future__ import annotations
+
+import itertools
+import json
+import logging
+import tempfile
+import time
+import warnings
+from pathlib import Path
+from typing import Literal, get_args
+from urllib.parse import urlencode
+
+import cachetools
+import gradio as gr
+import pandas as pd
+
+import mteb
+from mteb.abstasks.TaskMetadata import TASK_DOMAIN, TASK_TYPE
+from mteb.custom_validators import MODALITIES
+from mteb.leaderboard.benchmark_selector import (
+    BENCHMARK_ENTRIES,
+    DEFAULT_BENCHMARK_NAME,
+    make_selector,
+)
+from mteb.leaderboard.figures import performance_size_plot, radar_chart
+from mteb.leaderboard.table import create_tables
+from mteb.leaderboard.text_segments import ACKNOWLEDGEMENT, FAQ
+
+logger = logging.getLogger(__name__)
+
+
+LANGUAGE: list[str] = list({l for t in mteb.get_tasks() for l in t.metadata.languages})
+ALL_MODELS = {meta.name for meta in mteb.get_model_metas()}
+
+
+def load_results():
+    results_cache_path = Path(__file__).parent.joinpath("__cached_results.json")
+    if not results_cache_path.exists():
+        all_results = mteb.load_results(
+            only_main_score=True, require_model_meta=False, models=ALL_MODELS
+[?2004hroot@3b188f72b5ff:/app# sed -n '40,140p' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py
+[?2004l            only_main_score=True, require_model_meta=False, models=ALL_MODELS
+        ).filter_models()
+        all_results.to_disk(results_cache_path)
+        return all_results
+    else:
+        with results_cache_path.open() as cache_file:
+            return mteb.BenchmarkResults.from_validated(**json.load(cache_file))
+
+
+def produce_benchmark_link(benchmark_name: str, request: gr.Request) -> str:
+    """Produces a URL for the selected benchmark."""
+    params = urlencode(
+        {
+            "benchmark_name": benchmark_name,
+        }
+    )
+    base_url = request.request.base_url
+    url = f"{base_url}?{params}"
+    md = f"```\n{url}\n```"
+    return md
+
+
+def set_benchmark_on_load(request: gr.Request):
+    query_params = request.query_params
+    return query_params.get("benchmark_name", DEFAULT_BENCHMARK_NAME)
+
+
+def download_table(table: pd.DataFrame) -> str:
+    file = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    table.to_csv(file)
+    return file.name
+
+
+def update_citation(benchmark_name: str) -> str:
+    benchmark = mteb.get_benchmark(benchmark_name)
+    if benchmark.citation is not None:
+        citation = f"```bibtex\n{benchmark.citation}\n```"
+    else:
+        citation = ""
+    return citation
+
+
+def update_description(
+    benchmark_name: str, languages: list[str], task_types: list[str], domains: list[str]
+) -> str:
+    benchmark = mteb.get_benchmark(benchmark_name)
+    description = f"{benchmark.description}\n"
+    n_languages = len(languages)
+    n_task_types = len(task_types)
+    n_tasks = len(benchmark.tasks)
+    n_domains = len(domains)
+    description += f" - **Number of languages**: {n_languages}\n"
+    description += f" - **Number of tasks**: {n_tasks}\n"
+    description += f" - **Number of task types**: {n_task_types}\n"
+    description += f" - **Number of domains**: {n_domains}\n"
+    if benchmark.reference is not None:
+        description += f"\n[Click for More Info]({benchmark.reference})"
+
+    return description
+
+
+def format_list(props: list[str]):
+    if props is None:
+        return ""
+    if len(props) > 3:
+        return ", ".join(props[:3]) + "..."
+    return ", ".join(props)
+
+
+def update_task_info(task_names: str) -> gr.DataFrame:
+    tasks = mteb.get_tasks(tasks=task_names)
+    df = tasks.to_dataframe(
+        properties=[
+            "name",
+            "type",
+            "languages",
+            "domains",
+            "reference",
+            "main_score",
+            "modalities",
+        ]
+    )
+    df["languages"] = df["languages"].map(format_list)
+    df = df.sort_values("name")
+    df["domains"] = df["domains"].map(format_list)
+    df["name"] = "[" + df["name"] + "](" + df["reference"] + ")"
+    df["modalities"] = df["modalities"].map(format_list)
+    df = df.rename(
+        columns={
+            "name": "Task Name",
+            "type": "Task Type",
+            "languages": "Languages",
+            "domains": "Domains",
+            "main_score": "Metric",
+            "modalities": "Modality",
+        }
+    )
+    df = df.drop(columns="reference")
+    return gr.DataFrame(
+        df,
+        datatype=["markdown"] + ["str"] * (len(df.columns) - 1),
+[?2004hroot@3b188f72b5ff:/app# sed -n '1,80p' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/benchmark_selector.py
+[?2004lfrom __future__ import annotations
+
+from dataclasses import dataclass
+
+import gradio as gr
+from build.lib.mteb.benchmarks.benchmarks import MTEB_multilingual
+
+import mteb
+from mteb import Benchmark
+
+DEFAULT_BENCHMARK_NAME = MTEB_multilingual.name
+
+
+@dataclass
+class MenuEntry:
+    name: str | None
+    benchmarks: list[Benchmark | MenuEntry]
+    description: str | None = None
+    open: bool = False
+
+
+BENCHMARK_ENTRIES = [
+    MenuEntry(
+        name="Select Benchmark",
+        description="",
+        open=False,
+        benchmarks=mteb.get_benchmarks(["MTEB(Multilingual, v2)", "MTEB(eng, v2)"])
+        + [
+            MenuEntry(
+                "Image",
+                mteb.get_benchmarks(
+                    [
+                        "MIEB(Multilingual)",
+                        "MIEB(eng)",
+                        "MIEB(lite)",
+                        "MIEB(Img)",
+                        "VisualDocumentRetrieval",
+                    ]
+                ),
+            ),
+            MenuEntry(
+                "Domain-Specific",
+                mteb.get_benchmarks(
+                    [
+                        "MTEB(Code, v1)",
+                        "MTEB(Law, v1)",
+                        "MTEB(Medical, v1)",
+                        "ChemTEB",
+                    ]
+                ),
+            ),
+            MenuEntry(
+                "Language-specific",
+                mteb.get_benchmarks(
+                    [
+                        "MTEB(Europe, v1)",
+                        "MTEB(Indic, v1)",
+                        "MTEB(Scandinavian, v1)",
+                        "MTEB(cmn, v1)",
+                        "MTEB(deu, v1)",
+                        "MTEB(fra, v1)",
+                        "MTEB(jpn, v1)",
+                        "MTEB(kor, v1)",
+                        "MTEB(pol, v1)",
+                        "MTEB(rus, v1)",
+                        "MTEB(fas, v1)",
+                    ]
+                )
+                + [MenuEntry("Other", mteb.get_benchmarks(["MTEB(eng, v1)"]))],
+            ),
+            MenuEntry(
+                "Miscellaneous",  # All of these are retrieval benchmarks
+                mteb.get_benchmarks(
+                    [
+                        "BEIR",
+                        "BEIR-NL",
+                        "NanoBEIR",
+                        "BRIGHT",
+                        "BRIGHT (long)",
+                        "BuiltBench(eng)",
+[?2004hroot@3b188f72b5ff:/app# cat /usr/local/lib/python3.10/site-packages/mteb/leaderboard/table.py
+[?2004lfrom __future__ import annotations
+
+import math
+import re
+from collections import defaultdict
+
+import gradio as gr
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.colors import LinearSegmentedColormap
+from pandas.api.types import is_numeric_dtype
+
+from mteb.models.overview import get_model_meta
+from mteb.overview import get_task, get_tasks
+
+
+def borda_count(scores: pd.Series) -> pd.Series:
+    n = len(scores)
+    ranks = scores.rank(method="average", ascending=False)
+    counts = n - ranks
+    return counts
+
+
+def get_borda_rank(score_table: pd.DataFrame) -> pd.Series:
+    borda_counts = score_table.apply(borda_count, axis="index")
+    mean_borda = borda_counts.sum(axis=1)
+    return mean_borda.rank(method="min", ascending=False).astype(int)
+
+
+def format_scores(score: float) -> float:
+    return round(score * 100, 2)
+
+
+def format_n_parameters(n_parameters) -> str:
+    if (n_parameters is None) or (not int(n_parameters)):
+        return "Unknown"
+    n_thousand = int(n_parameters // 1e3)
+    if n_thousand < 1:
+        return str(int(n_parameters))
+    n_zeros = math.log10(n_thousand)
+    if n_zeros >= 6:
+        return str(n_thousand // (10**6)) + "B"
+    if n_zeros >= 3:
+        return str(n_thousand // (10**3)) + "M"
+    return str(n_thousand) + "K"
+
+
+def split_on_capital(s: str) -> str:
+    """Splits on capital letters and joins with spaces"""
+    return " ".join(re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)", s))
+
+
+def get_column_types(df: pd.DataFrame) -> list[str]:
+    types = []
+    for column_name in df.columns:
+        if is_numeric_dtype(df[column_name]):
+            types.append("number")
+        else:
+            types.append("str")
+    return types
+
+
+def get_column_widths(df: pd.DataFrame) -> list[str]:
+    # Please do not remove this function when refactoring.
+    # Column width calculation seeminlgy changes regularly with Gradio releases,
+    # and this piece of logic is good enough to quickly fix related issues.
+    widths = []
+    for column_name in df.columns:
+        column_word_lengths = [len(word) for word in column_name.split()]
+        if is_numeric_dtype(df[column_name]):
+            value_lengths = [len(f"{value:.2f}") for value in df[column_name]]
+        else:
+            value_lengths = [len(str(value)) for value in df[column_name]]
+        max_length = max(max(column_word_lengths), max(value_lengths))
+        n_pixels = 25 + (max_length * 10)
+        widths.append(f"{n_pixels}px")
+    return widths
+
+
+def get_means_per_types(per_task: pd.DataFrame):
+    task_names_per_type = defaultdict(list)
+    for task_name in per_task.columns:
+        task_type = get_task(task_name).metadata.type
+        task_names_per_type[task_type].append(task_name)
+    records = []
+    for task_type, tasks in task_names_per_type.items():
+        for model_name, scores in per_task.iterrows():
+            records.append(
+                dict(
+                    model_name=model_name,
+                    task_type=task_type,
+                    score=scores[tasks].mean(skipna=False),
+                )
+            )
+    return pd.DataFrame.from_records(records)
+
+
+def failsafe_get_model_meta(model_name):
+    try:
+        return get_model_meta(model_name)
+    except Exception:
+        return None
+
+
+def format_max_tokens(max_tokens: float | None) -> str:
+    if max_tokens is None:
+        return "Unknown"
+    if max_tokens == np.inf:
+        return "Infinite"
+    return str(int(max_tokens))
+
+
+def format_zero_shot(zero_shot_percentage: int):
+    if zero_shot_percentage == -1:
+        return "⚠️ NA"
+    return f"{zero_shot_percentage:.0f}%"
+
+
+def create_light_green_cmap():
+    cmap = plt.cm.get_cmap("Greens")
+    num_colors = 256
+    half_colors = np.linspace(0, 0.5, num_colors)
+    half_cmap = [cmap(val) for val in half_colors]
+    light_green_cmap = LinearSegmentedColormap.from_list(
+        "LightGreens", half_cmap, N=256
+    )
+    return light_green_cmap
+
+
+def scores_to_tables(scores_long: list[dict], search_query: str | None = None):
+    if not scores_long:
+        no_results_frame = pd.DataFrame(
+            {"No results": ["You can try relaxing your criteria"]}
+        )
+        return gr.DataFrame(no_results_frame), gr.DataFrame(no_results_frame)
+    data = pd.DataFrame.from_records(scores_long)
+    per_task = data.pivot(index="model_name", columns="task_name", values="score")
+    mean_per_type = get_means_per_types(per_task)
+    mean_per_type = mean_per_type.pivot(
+        index="model_name", columns="task_type", values="score"
+    )
+    mean_per_type.columns = [
+        split_on_capital(column) for column in mean_per_type.columns
+    ]
+    to_remove = per_task.isna().all(axis="columns")
+    if search_query:
+        names = per_task.index.get_level_values("model_name")
+        names = pd.Series(names, index=per_task.index)
+        to_remove |= ~names.str.contains(search_query, regex=True)
+    if to_remove.all():
+        no_results_frame = pd.DataFrame(
+            {"No results": ["You can try relaxing your criteria"]}
+        )
+        return gr.DataFrame(no_results_frame), gr.DataFrame(no_results_frame)
+    models_to_remove = list(per_task[to_remove].index)
+    typed_mean = mean_per_type.mean(skipna=False, axis=1)
+    overall_mean = per_task.mean(skipna=False, axis=1)
+    joint_table = mean_per_type.copy()
+    per_task = per_task.drop(models_to_remove, axis=0)
+    joint_table = joint_table.drop(models_to_remove, axis=0)
+    joint_table.insert(0, "mean", overall_mean)
+    joint_table.insert(1, "mean_by_task_type", typed_mean)
+    joint_table["borda_rank"] = get_borda_rank(per_task)
+    joint_table = joint_table.sort_values("borda_rank", ascending=True)
+    per_task["borda_rank"] = joint_table["borda_rank"]
+    per_task = per_task.sort_values("borda_rank", ascending=True)
+    per_task = per_task.drop(columns=["borda_rank"])
+    joint_table = joint_table.reset_index()
+    model_metas = joint_table["model_name"].map(failsafe_get_model_meta)
+    joint_table = joint_table[model_metas.notna()]
+    joint_table["model_link"] = model_metas.map(lambda m: m.reference)
+    joint_table.insert(
+        1,
+        "Max Tokens",
+        model_metas.map(lambda m: format_max_tokens(m.max_tokens)),
+    )
+    joint_table.insert(
+        1,
+        "Embedding Dimensions",
+        model_metas.map(lambda m: str(int(m.embed_dim)) if m.embed_dim else "Unknown"),
+    )
+    joint_table.insert(
+        1,
+        "Number of Parameters",
+        model_metas.map(lambda m: format_n_parameters(m.n_parameters)),
+    )
+    joint_table.insert(
+        1,
+        "Memory Usage (MB)",
+        model_metas.map(
+            lambda m: str(int(m.memory_usage_mb)) if m.memory_usage_mb else "Unknown"
+        ),
+    )
+    tasks = get_tasks(tasks=list(data["task_name"].unique()))
+    joint_table.insert(
+        1, "Zero-shot", model_metas.map(lambda m: m.zero_shot_percentage(tasks))
+    )
+    joint_table["Zero-shot"] = joint_table["Zero-shot"].fillna(-1)
+    # joint_table = joint_table[joint_table["Zero-shot"].notna()]
+    # Removing HF organization from model
+    joint_table["model_name"] = joint_table["model_name"].map(
+        lambda name: name.split("/")[-1]
+    )
+    # Adding markdown link to model names
+    name_w_link = (
+        "[" + joint_table["model_name"] + "](" + joint_table["model_link"] + ")"
+    )
+    joint_table["model_name"] = joint_table["model_name"].mask(
+        joint_table["model_link"].notna(), name_w_link
+    )
+    joint_table = joint_table.drop(columns=["model_link"])
+    joint_table = joint_table.rename(
+        columns={
+            "model_name": "Model",
+            "mean_by_task_type": "Mean (TaskType)",
+            "mean": "Mean (Task)",
+        }
+    )
+    per_task = per_task.reset_index()
+    per_task["model_name"] = per_task["model_name"].map(
+        lambda name: name.split("/")[-1]
+    )
+    per_task = per_task.rename(
+        columns={
+            "model_name": "Model",
+        }
+    )
+    joint_table.insert(0, "Rank (Borda)", joint_table.pop("borda_rank"))
+    column_types = get_column_types(joint_table)
+    # setting model name column to markdown
+    column_types[1] = "markdown"
+    score_columns = ["Mean (Task)", "Mean (TaskType)", *mean_per_type.columns]
+
+    return joint_table, per_task, score_columns, column_types
+
+
+def apply_styling(
+    joint_table: pd.DataFrame,
+    per_task: pd.DataFrame,
+    score_columns: list[str],
+    column_types: list[str],
+) -> tuple[gr.DataFrame, gr.DataFrame]:
+    excluded_columns = [
+        "Rank (Borda)",
+        "Model",
+        "Number of Parameters",
+        "Embedding Dimensions",
+        "Max Tokens",
+        "Memory Usage (MB)",
+    ]
+    gradient_columns = [
+        col for col in joint_table.columns if col not in excluded_columns
+    ]
+    light_green_cmap = create_light_green_cmap()
+    numeric_data = joint_table.copy()
+    joint_table["Zero-shot"] = joint_table["Zero-shot"].apply(format_zero_shot)
+    joint_table[score_columns] = joint_table[score_columns].map(format_scores)
+    joint_table_style = joint_table.style.format(
+        {
+            **dict.fromkeys(score_columns, "{:.2f}"),
+            "Rank (Borda)": "{:.0f}",
+        },
+        na_rep="",
+    )
+    joint_table_style = joint_table_style.highlight_min(
+        "Rank (Borda)", props="font-weight: bold"
+    ).highlight_max(subset=score_columns, props="font-weight: bold")
+
+    # Apply background gradients for each selected column
+    for col in gradient_columns:
+        if col in joint_table.columns:
+            mask = numeric_data[col].notna()
+            if col != "Zero-shot":
+                gmap_values = numeric_data[col] * 100
+                cmap = light_green_cmap
+                joint_table_style = joint_table_style.background_gradient(
+                    cmap=cmap,
+                    subset=pd.IndexSlice[mask, col],
+                    gmap=gmap_values.loc[mask],
+                )
+            else:
+                gmap_values = numeric_data[col]
+                cmap = "RdYlGn"
+                joint_table_style = joint_table_style.background_gradient(
+                    cmap=cmap,
+                    subset=pd.IndexSlice[mask, col],
+                    vmin=50,
+                    vmax=100,
+                    gmap=gmap_values.loc[mask],
+                )
+    task_score_columns = per_task.select_dtypes("number").columns
+    per_task[task_score_columns] *= 100
+    per_task_style = per_task.style.format(
+        "{:.2f}", subset=task_score_columns, na_rep=""
+    ).highlight_max(subset=task_score_columns, props="font-weight: bold")
+    # TODO: uncomment this when Gradio fixes it.
+    # The fix is already merged and contained in this release: https://github.com/gradio-app/gradio/pull/11032
+    # It will be available in Gradio 5.25.3
+    # for col in task_score_columns:
+    #     if col != "Model":
+    #         mask = per_task[col].notna()
+    #         per_task_style = per_task_style.background_gradient(
+    #             cmap=light_green_cmap,
+    #             subset=pd.IndexSlice[mask, col],
+    #             gmap=per_task[col].loc[mask],
+    #         )
+    column_widths = get_column_widths(joint_table_style.data)
+    column_widths[0] = "100px"
+    column_widths[1] = "250px"
+    return (
+        gr.DataFrame(
+            joint_table_style,
+            datatype=column_types,
+            interactive=False,
+            pinned_columns=3,
+            column_widths=column_widths,
+            wrap=True,
+            show_fullscreen_button=True,
+            show_copy_button=True,
+            show_search="filter",
+        ),
+        gr.DataFrame(
+            per_task_style,
+            interactive=False,
+            pinned_columns=1,
+            show_fullscreen_button=True,
+            show_copy_button=True,
+            show_search="filter",
+        ),
+    )
+
+
+def create_tables(
+    scores_long: list[dict], search_query: str | None = None
+) -> tuple[gr.DataFrame, gr.DataFrame]:
+    result = scores_to_tables(scores_long, search_query)
+    # dataframe with No Results is returned, so no need to apply styling
+    if len(result) == 2:
+        joint_table, per_task = result
+        return joint_table, per_task
+    joint_table, per_task, score_columns, column_types = result
+    summary_table, per_task_table = apply_styling(
+        joint_table, per_task, score_columns, column_types
+    )
+    return summary_table, per_task_table
+[?2004hroot@3b188f72b5ff:/app# grep -n 'to_remove\|mean\|skipna\|n_tasks\|len(benchmark\|all tasks\|filter' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/table.py | head -60
+[?2004l27:    mean_borda = borda_counts.sum(axis=1)
+28:    return mean_borda.rank(method="min", ascending=False).astype(int)
+81:def get_means_per_types(per_task: pd.DataFrame):
+93:                    score=scores[tasks].mean(skipna=False),
+139:    mean_per_type = get_means_per_types(per_task)
+140:    mean_per_type = mean_per_type.pivot(
+143:    mean_per_type.columns = [
+144:        split_on_capital(column) for column in mean_per_type.columns
+146:    to_remove = per_task.isna().all(axis="columns")
+150:        to_remove |= ~names.str.contains(search_query, regex=True)
+151:    if to_remove.all():
+156:    models_to_remove = list(per_task[to_remove].index)
+157:    typed_mean = mean_per_type.mean(skipna=False, axis=1)
+158:    overall_mean = per_task.mean(skipna=False, axis=1)
+159:    joint_table = mean_per_type.copy()
+160:    per_task = per_task.drop(models_to_remove, axis=0)
+161:    joint_table = joint_table.drop(models_to_remove, axis=0)
+162:    joint_table.insert(0, "mean", overall_mean)
+163:    joint_table.insert(1, "mean_by_task_type", typed_mean)
+216:            "mean_by_task_type": "Mean (TaskType)",
+217:            "mean": "Mean (Task)",
+233:    score_columns = ["Mean (Task)", "Mean (TaskType)", *mean_per_type.columns]
+321:            show_search="filter",
+329:            show_search="filter",
+[?2004hroot@3b188f72b5ff:/app# grep -n 'scores_long\|create_tables\|get_benchmark\|def get_\|def produce\|def update_\|\.tasks\|only_main\|filter' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py
+[?2004l26:from mteb.leaderboard.table import create_tables
+40:            only_main_score=True, require_model_meta=False, models=ALL_MODELS
+41:        ).filter_models()
+49:def produce_benchmark_link(benchmark_name: str, request: gr.Request) -> str:
+73:def update_citation(benchmark_name: str) -> str:
+74:    benchmark = mteb.get_benchmark(benchmark_name)
+82:def update_description(
+85:    benchmark = mteb.get_benchmark(benchmark_name)
+89:    n_tasks = len(benchmark.tasks)
+109:def update_task_info(task_names: str) -> gr.DataFrame:
+143:        show_search="filter",
+151:def filter_models(
+192:def get_leaderboard_app() -> gr.Blocks:
+197:        mteb.get_benchmarks(display_on_leaderboard=True), key=lambda x: x.name
+205:    default_benchmark = mteb.get_benchmark(DEFAULT_BENCHMARK_NAME)
+211:    filtered_models = filter_models(
+221:    summary_table, per_task_table = create_tables(
+222:        [entry for entry in default_scores if entry["model_name"] in filtered_models]
+293:        models = gr.State(filtered_models)
+423:            benchmark = mteb.get_benchmark(benchmark_name)
+424:            languages = [task.languages for task in benchmark.tasks if task.languages]
+429:                for task in benchmark.tasks
+434:                task.metadata.type for task in benchmark.tasks if task.metadata.type
+437:            for task in benchmark.tasks:
+454:                sorted([task.metadata.name for task in benchmark.tasks]),
+477:        def update_scores_on_lang_change(benchmark_name, languages):
+509:        def update_task_list(
+516:            for task in mteb.get_benchmark(benchmark_name).tasks:
+601:        def update_models(
+612:            filtered_models = filter_models(
+622:            if model_names == filtered_models:
+623:                # This indicates that the models should not be filtered
+626:            return sorted(filtered_models)
+731:        def update_tables(
+739:            benchmark = mteb.get_benchmark(benchmark_name)
+740:            benchmark_tasks = {task.metadata.name for task in benchmark.tasks}
+742:                filtered_scores = []
+750:                    filtered_scores.append(entry)
+752:                filtered_scores = scores
+753:            summary, per_task = create_tables(filtered_scores)
+786:        filtered_models = update_models(
+795:        # We have to call this both on the filtered and unfiltered task because the callbacks
+797:        update_tables(bench_scores, bench_tasks, filtered_models, benchmark.name)
+798:        filtered_tasks = update_task_list(
+805:        update_tables(bench_scores, filtered_tasks, filtered_models, benchmark.name)
+819:    warnings.filterwarnings("ignore", message="Couldn't get scores for .* due to .*")
+[?2004hroot@3b188f72b5ff:/app# sed -n '700,830p' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py
+[?2004l                instructions,
+                max_model_size,
+                zero_shot,
+            ],
+            outputs=[models],
+        )
+        zero_shot.change(
+            update_models,
+            inputs=[
+                scores,
+                task_select,
+                availability,
+                compatibility,
+                instructions,
+                max_model_size,
+                zero_shot,
+            ],
+            outputs=[models],
+        )
+
+        @cachetools.cached(
+            cache={},
+            key=lambda scores, tasks, models_to_keep, benchmark_name: hash(
+                (
+                    id(scores),
+                    hash(tuple(tasks)),
+                    id(models_to_keep),
+                    hash(benchmark_name),
+                )
+            ),
+        )
+        def update_tables(
+            scores,
+            tasks,
+            models_to_keep,
+            benchmark_name: str,
+        ):
+            start_time = time.time()
+            tasks = set(tasks)
+            benchmark = mteb.get_benchmark(benchmark_name)
+            benchmark_tasks = {task.metadata.name for task in benchmark.tasks}
+            if (benchmark_tasks != tasks) or (models_to_keep is not None):
+                filtered_scores = []
+                for entry in scores:
+                    if entry["task_name"] not in tasks:
+                        continue
+                    if (models_to_keep is not None) and (
+                        entry["model_name"] not in models_to_keep
+                    ):
+                        continue
+                    filtered_scores.append(entry)
+            else:
+                filtered_scores = scores
+            summary, per_task = create_tables(filtered_scores)
+            elapsed = time.time() - start_time
+            logger.debug(f"update_tables callback: {elapsed}s")
+            return summary, per_task
+
+        task_select.change(
+            update_tables,
+            inputs=[scores, task_select, models, benchmark_select],
+            outputs=[summary_table, per_task_table],
+        )
+        scores.change(
+            update_tables,
+            inputs=[scores, task_select, models, benchmark_select],
+            outputs=[summary_table, per_task_table],
+        )
+        models.change(
+            update_tables,
+            inputs=[scores, task_select, models, benchmark_select],
+            outputs=[summary_table, per_task_table],
+        )
+
+        gr.Markdown(ACKNOWLEDGEMENT, elem_id="ack_markdown")
+
+    # Prerun on all benchmarks, so that results of callbacks get cached
+    for benchmark in benchmarks:
+        (
+            bench_languages,
+            bench_domains,
+            bench_types,
+            bench_modalities,
+            bench_tasks,
+            bench_scores,
+        ) = on_benchmark_select(benchmark.name)
+        filtered_models = update_models(
+            bench_scores,
+            bench_tasks,
+            availability=None,
+            compatibility=[],
+            instructions=None,
+            max_model_size=MAX_MODEL_SIZE,
+            zero_shot="allow_all",
+        )
+        # We have to call this both on the filtered and unfiltered task because the callbacks
+        # also gets called twice for some reason
+        update_tables(bench_scores, bench_tasks, filtered_models, benchmark.name)
+        filtered_tasks = update_task_list(
+            benchmark.name,
+            bench_types,
+            bench_domains,
+            bench_languages,
+            bench_modalities,
+        )
+        update_tables(bench_scores, filtered_tasks, filtered_models, benchmark.name)
+    return demo
+
+
+if __name__ == "__main__":
+    logging.getLogger("mteb.load_results.task_results").setLevel(
+        logging.ERROR
+    )  # Warnings related to task split
+    logging.getLogger("mteb.model_meta").setLevel(
+        logging.ERROR
+    )  # Warning related to model metadata (fetch_from_hf=False)
+    logging.getLogger("mteb.load_results.benchmark_results").setLevel(
+        logging.ERROR
+    )  # Warning related to model metadata (fetch_from_hf=False)
+    warnings.filterwarnings("ignore", message="Couldn't get scores for .* due to .*")
+
+    app = get_leaderboard_app()
+    app.launch(server_name="0.0.0.0", server_port=7860)
+[?2004hroot@3b188f72b5ff:/app# sed -n '410,520p' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py
+[?2004l            )
+        with gr.Tab("Task information"):
+            task_info_table = gr.DataFrame(update_task_info, inputs=[task_select])  # noqa: F841
+
+        # This sets the benchmark from the URL query parameters
+        demo.load(set_benchmark_on_load, inputs=[], outputs=[benchmark_select])
+
+        @cachetools.cached(
+            cache={},
+            key=lambda benchmark_name: hash(benchmark_name),
+        )
+        def on_benchmark_select(benchmark_name):
+            start_time = time.time()
+            benchmark = mteb.get_benchmark(benchmark_name)
+            languages = [task.languages for task in benchmark.tasks if task.languages]
+            languages = set(itertools.chain.from_iterable(languages))
+            languages = sorted(languages)
+            domains = [
+                task.metadata.domains
+                for task in benchmark.tasks
+                if task.metadata.domains
+            ]
+            domains = set(itertools.chain.from_iterable(domains))
+            types = {
+                task.metadata.type for task in benchmark.tasks if task.metadata.type
+            }
+            modalities = set()
+            for task in benchmark.tasks:
+                modalities.update(task.metadata.modalities)
+            languages, domains, types, modalities = (
+                sorted(languages),
+                sorted(domains),
+                sorted(types),
+                sorted(modalities),
+            )
+            elapsed = time.time() - start_time
+            benchmark_results = all_benchmark_results[benchmark_name]
+            scores = benchmark_results.get_scores(format="long")
+            logger.debug(f"on_benchmark_select callback: {elapsed}s")
+            return (
+                languages,
+                domains,
+                types,
+                modalities,
+                sorted([task.metadata.name for task in benchmark.tasks]),
+                scores,
+            )
+
+        benchmark_select.change(
+            on_benchmark_select,
+            inputs=[benchmark_select],
+            outputs=[
+                lang_select,
+                domain_select,
+                type_select,
+                modality_select,
+                task_select,
+                scores,
+            ],
+        )
+
+        @cachetools.cached(
+            cache={},
+            key=lambda benchmark_name, languages: hash(
+                (hash(benchmark_name), hash(tuple(languages)))
+            ),
+        )
+        def update_scores_on_lang_change(benchmark_name, languages):
+            start_time = time.time()
+            if not len(languages):
+                return []
+            benchmark_results = all_benchmark_results[benchmark_name]
+            scores = benchmark_results.get_scores(languages=languages, format="long")
+            elapsed = time.time() - start_time
+            logger.debug(f"update_scores callback: {elapsed}s")
+            return scores
+
+        lang_select.input(
+            update_scores_on_lang_change,
+            inputs=[benchmark_select, lang_select],
+            outputs=[scores],
+        )
+
+        @cachetools.cached(
+            cache={},
+            key=lambda benchmark_name,
+            type_select,
+            domain_select,
+            lang_select,
+            modality_select: hash(
+                (
+                    hash(benchmark_name),
+                    hash(tuple(type_select)),
+                    hash(tuple(domain_select)),
+                    hash(tuple(lang_select)),
+                    hash(tuple(modality_select)),
+                )
+            ),
+        )
+        def update_task_list(
+            benchmark_name, type_select, domain_select, lang_select, modality_select
+        ):
+            if not len(lang_select):
+                return []
+            start_time = time.time()
+            tasks_to_keep = []
+            for task in mteb.get_benchmark(benchmark_name).tasks:
+                if task.metadata.type not in type_select:
+                    continue
+                if task.metadata.domains is not None and not (
+                    set(task.metadata.domains) & set(domain_select)
+[?2004hroot@3b188f72b5ff:/app# grep -n 'all_benchmark_results\|MAX_MODEL_SIZE\|def create_leaderboard\|to_benchmark\|BenchmarkResults\|get_benchmark_results' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py
+[?2004l46:            return mteb.BenchmarkResults.from_validated(**json.load(cache_file))
+148:MIN_MODEL_SIZE, MAX_MODEL_SIZE = 0, 100_000
+167:    if (upper == MAX_MODEL_SIZE) or (upper is None):
+199:    all_benchmark_results = {
+206:    default_results = all_benchmark_results[default_benchmark.name]
+217:        max_model_size=MAX_MODEL_SIZE,
+386:                                (">10B", MAX_MODEL_SIZE),
+388:                            value=MAX_MODEL_SIZE,
+446:            benchmark_results = all_benchmark_results[benchmark_name]
+481:            benchmark_results = all_benchmark_results[benchmark_name]
+792:            max_model_size=MAX_MODEL_SIZE,
+[?2004hroot@3b188f72b5ff:/app# sed -n '195,235p' /usr/local/lib/python3.10/site-packages/mteb/leaderboard/app.py
+[?2004l
+    benchmarks = sorted(
+        mteb.get_benchmarks(display_on_leaderboard=True), key=lambda x: x.name
+    )
+    all_benchmark_results = {
+        benchmark.name: benchmark.load_results(
+            base_results=all_results
+        ).join_revisions()
+        for benchmark in benchmarks
+    }
+    default_benchmark = mteb.get_benchmark(DEFAULT_BENCHMARK_NAME)
+    default_results = all_benchmark_results[default_benchmark.name]
+    logger.info("Benchmark results loaded")
+
+    default_scores = default_results.get_scores(format="long")
+    all_models = list({entry["model_name"] for entry in default_scores})
+    filtered_models = filter_models(
+        all_models,
+        default_results.task_names,
+        availability=None,
+        compatibility=[],
+        instructions=None,
+        max_model_size=MAX_MODEL_SIZE,
+        zero_shot_setting="allow_all",
+    )
+
+    summary_table, per_task_table = create_tables(
+        [entry for entry in default_scores if entry["model_name"] in filtered_models]
+    )
+    lang_select = gr.Dropdown(
+        LANGUAGE,
+        value=sorted(default_results.languages),
+        allow_custom_value=True,
+        multiselect=True,
+        label="Language",
+        info="Select languages to include.",
+    )
+    type_select = gr.Dropdown(
+        sorted(get_args(TASK_TYPE)),
+        value=sorted(default_results.task_types),
+        multiselect=True,
+[?2004hroot@3b188f72b5ff:/app# cat > /app/solve.py << 'EOF'
+[?2004l[?2004h> import mteb
+[?2004l[?2004h> import pandas as pd
+[?2004l[?2004h> import numpy as np
+[?2004l[?2004h> 
+[?2004l[?2004h> BENCH = "MTEB(Scandinavian, v1)"
+[?2004l[?2004h> 
+[?2004l[?2004h> benchmark = mteb.get_benchmark(BENCH)
+[?2004l[?2004h> task_names = {t.metadata.name for t in benchmark.tasks}
+[?2004l[?2004h> print("Number of tasks in benchmark:", len(task_names))
+[?2004l[?2004h> print("Tasks:", sorted(task_names))
+[?2004l[?2004h> 
+[?2004l[?2004h> ALL_MODELS = {meta.name for meta in mteb.get_model_metas()}
+[?2004l[?2004h> print("Total known models (with meta):", len(ALL_MODELS))
+[?2004l[?2004h> 
+[?2004l[?2004h> all_results = mteb.load_results(
+[?2004l[?2004h>     only_main_score=True, require_model_meta=False, models=ALL_MODELS
+[?2004l[?2004h> ).filter_models()
+[?2004l[?2004h> 
+[?2004l[?2004h> benchmark_results = benchmark.load_results(base_results=all_results).join_revisions()
+[?2004l[?2004h> scores = benchmark_results.get_scores(format="long")
+[?2004l[?2004h> print("Num score entries (long):", len(scores))
+[?2004l[?2004h> print("Sample entry:", scores[0])
+[?2004l[?2004h> 
+[?2004l[?2004h> data = pd.DataFrame.from_records(scores)
+[?2004l[?2004h> per_task = data.pivot(index="model_name", columns="task_name", values="score")
+[?2004l[?2004h> 
+[?2004l[?2004h> # restrict to benchmark tasks only (in case extra tasks present)
+[?2004l[?2004h> per_task = per_task[[c for c in per_task.columns if c in task_names]]
+[?2004l[?2004h> 
+[?2004l[?2004h> overall_mean = per_task.mean(skipna=False, axis=1)  # Mean (Task)
+[?2004l[?2004h> complete = per_task.notna().all(axis=1)  # has all tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> df = pd.DataFrame({
+[?2004l[?2004h>     "Mean(Task)": overall_mean,
+[?2004l[?2004h>     "n_tasks": per_task.notna().sum(axis=1),
+[?2004l[?2004h>     "complete": complete,
+[?2004l[?2004h> })
+[?2004l[?2004h> df = df[df["complete"]].sort_values("Mean(Task)", ascending=False)
+[?2004l[?2004h> print("\n=== Models with ALL tasks, ranked by Mean (Task) ===")
+[?2004l[?2004h> print(df.head(20).to_string())
+[?2004l[?2004h> 
+[?2004l[?2004h> print("\nTOP MODEL:", df.index[0])
+[?2004l[?2004h> print("TOP MEAN:", df["Mean(Task)"].iloc[0])
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@3b188f72b5ff:/app# python3 /app/solve.py 2>/tmp/err.log; echo "EXIT: $?"; echo '--- last errors ---'; tail -15 /tmp/err.log
+[?2004lNumber of tasks in benchmark: 28
+Tasks: ['AngryTweetsClassification', 'BornholmBitextMining', 'DKHateClassification', 'DalajClassification', 'DanFeverRetrieval', 'DanishPoliticalCommentsClassification', 'LccSentimentClassification', 'MassiveIntentClassification', 'MassiveScenarioClassification', 'NoRecClassification', 'NorQuadRetrieval', 'NordicLangClassification', 'NorwegianCourtsBitextMining', 'NorwegianParliamentClassification', 'SNLHierarchicalClusteringP2P', 'SNLHierarchicalClusteringS2S', 'SNLRetrieval', 'ScalaClassification', 'SweFaqRetrieval', 'SweRecClassification', 'SwedishSentimentClassification', 'SwednClusteringP2P', 'SwednClusteringS2S', 'SwednRetrieval', 'TV2Nordretrieval', 'TwitterHjerneRetrieval', 'VGHierarchicalClusteringP2P', 'VGHierarchicalClusteringS2S']
+Total known models (with meta): 409
+EXIT: 1
+--- last errors ---
+STS17: Missing subsets {'en-de', 'ko-ko', ...} for split test
+STS22: Missing subsets {'es', 'de-pl', ...} for split test
+NeuCLIR2023Retrieval: Missing subsets {'rus', 'zho'} for split test
+PublicHealthQA: Missing subsets {'arabic'} for split test
+RuSTSBenchmarkSTS: Missing splits {'validation'}
+Traceback (most recent call last):
+  File "/app/solve.py", line 15, in <module>
+    all_results = mteb.load_results(
+  File "/usr/local/lib/python3.10/site-packages/mteb/load_results/load_results.py", line 156, in load_results
+    task_res = TaskResult.from_disk(f)
+  File "/usr/local/lib/python3.10/site-packages/mteb/load_results/task_results.py", line 283, in from_disk
+    and Version(data["mteb_version"]) < Version("1.11.0")
+  File "/usr/local/lib/python3.10/site-packages/packaging/version.py", line 438, in __init__
+    raise InvalidVersion(f"Invalid version: {version!r}")
+packaging.version.InvalidVersion: Invalid version: '1.39.7-2.1.1'
+[?2004hroot@3b188f72b5ff:/app# sed -n '255,300p' /usr/local/lib/python3.10/site-packages/mteb/load_results/task_results.py
+[?2004l        self._round_scores(json_obj["scores"], 6)
+
+        with path.open("w") as f:
+            json.dump(json_obj, f, indent=2)
+
+    @classmethod
+    def from_disk(cls, path: Path, load_historic_data: bool = True) -> TaskResult:  # type: ignore
+        """Load TaskResult from disk.
+
+        Args:
+            path: The path to the file to load.
+            load_historic_data: Whether to attempt to load historic data from before v1.11.0.
+        """
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not load_historic_data:
+            try:
+                return cls.model_validate(data)
+            except Exception as e:
+                raise ValueError(
+                    f"Error loading TaskResult from disk. You can try to load historic data by setting `load_historic_data=True`. Error: {e}"
+                )
+
+        pre_1_11_load = (
+            (
+                "mteb_version" in data
+                and data["mteb_version"] is not None
+                and Version(data["mteb_version"]) < Version("1.11.0")
+            )
+            or "mteb_version" not in data
+        )  # assume it is before 1.11.0 if the version is not present
+
+        try:
+            obj = cls.model_validate(data)
+        except Exception as e:
+            if not pre_1_11_load:
+                raise e
+            logger.debug(
+                f"Could not load TaskResult from disk, got error: {e}. Attempting to load from disk using format from before v1.11.0"
+            )
+            obj = cls._convert_from_before_v1_11_0(data)
+
+        pre_v_12_48 = (
+            "mteb_version" in data
+            and data["mteb_version"] is not None
+[?2004hroot@3b188f72b5ff:/app# grep -rn 'Results\|hf_hub\|load_dataset\|snapshot\|to_disk\|_DATA\|Results' /usr/local/lib/python3.10/site-packages/mteb/load_results/load_results.py | head -30
+[?2004l11:from mteb.load_results.benchmark_results import BenchmarkResults, ModelResult
+49:                f"Results repository already exists in {results_directory}, updating it using git pull"
+54:                f"Results repository already exists in {results_directory}, skipping update, set download_latest=True to update it"
+94:) -> BenchmarkResults:
+110:    # TODO: in v2 we can rename it to "path" to align with load_dataset
+188:    return BenchmarkResults(model_results=model_results)
+[?2004hroot@3b188f72b5ff:/app# grep -n 'import\|Version' /usr/local/lib/python3.10/site-packages/mteb/load_results/task_results.py | head -20
+[?2004l1:from __future__ import annotations
+3:import json
+4:import logging
+5:from argparse import Namespace
+6:from collections import defaultdict
+7:from collections.abc import Iterable
+8:from functools import cached_property
+9:from importlib.metadata import version
+10:from pathlib import Path
+11:from typing import Any, Callable
+13:import numpy as np
+14:from packaging.version import Version
+15:from pydantic import BaseModel, field_validator
+17:from mteb.abstasks.AbsTask import AbsTask, ScoresDict
+18:from mteb.abstasks.TaskMetadata import ISO_LANGUAGE_SCRIPT, HFSubset
+19:from mteb.languages import ISO_LANGUAGE, LanguageScripts
+216:        from mteb.overview import get_task
+283:                and Version(data["mteb_version"]) < Version("1.11.0")
+301:            and Version(data["mteb_version"]) < Version("1.12.48")
+311:        from mteb import get_task
+[?2004hroot@3b188f72b5ff:/app# sed -n '25,95p' /usr/local/lib/python3.10/site-packages/mteb/load_results/load_results.py
+[?2004l    Args:
+        results_repo: The URL of the results repository on GitHub.
+        cache_directory: The directory where the repository should be cached. If None it will use the MTEB_CACHE environment variable or "~/.cache/mteb" by default.
+        download_latest: If True it will download the latest version of the repository, otherwise it will only update the existing repository.
+
+    Returns:
+        The path to the local cache directory.
+    """
+    default_cache_directory = Path.home() / ".cache" / "mteb"
+
+    if cache_directory is None:
+        _cache_directory = os.environ.get("MTEB_CACHE", None)
+        cache_directory = (
+            Path(_cache_directory) if _cache_directory else default_cache_directory
+        )
+
+    if not cache_directory.exists():
+        cache_directory.mkdir(parents=True)
+
+    # if "results" folder already exists update it
+    results_directory = cache_directory / os.path.basename(results_repo)
+    if results_directory.exists():
+        if download_latest:
+            logger.info(
+                f"Results repository already exists in {results_directory}, updating it using git pull"
+            )
+            subprocess.run(["git", "pull"], cwd=results_directory)
+        else:
+            logger.info(
+                f"Results repository already exists in {results_directory}, skipping update, set download_latest=True to update it"
+            )
+    else:
+        logger.info(
+            f"No results repository found in {results_directory}, cloning it from {results_repo}"
+        )
+        subprocess.run(["git", "clone", results_repo], cwd=cache_directory)
+
+    return results_directory
+
+
+def _model_name_and_revision(
+    revision_path: Path, fallback_to_path: bool
+) -> tuple[MODEL_NAME, REVISION] | None:
+    model_meta = revision_path / "model_meta.json"
+    model_path = revision_path.parent
+    if not model_meta.exists() and fallback_to_path:
+        logger.info(
+            f"model_meta.json not found in {revision_path}, extracting model_name and revision from the path"
+        )
+        model_name, revision = model_path.name, revision_path.name
+    elif not model_meta.exists():
+        return None
+    else:
+        with model_meta.open("r") as f:
+            model_meta_json = json.load(f)
+            model_name = model_meta_json["name"]
+            revision = model_meta_json["revision"]
+
+    return model_name, revision
+
+
+def load_results(
+    results_repo: str = "https://github.com/embeddings-benchmark/results",
+    download_latest: bool = True,
+    models: Sequence[ModelMeta] | Sequence[str] | None = None,
+    tasks: Sequence[AbsTask] | Sequence[str] | None = None,
+    validate_and_filter: bool = True,
+    require_model_meta: bool = True,
+    only_main_score: bool = False,
+) -> BenchmarkResults:
+    """Loads the results from the latest version of the results repository. The results are cached locally in the MTEB_CACHE directory.
+[?2004hroot@3b188f72b5ff:/app# cat > /app/solve.py << 'EOF'
+[?2004l[?2004h> import warnings
+[?2004l[?2004h> warnings.filterwarnings("ignore")
+[?2004l[?2004h> 
+[?2004l[?2004h> # --- workaround for invalid mteb_version strings in some result files ---
+[?2004l[?2004h> from packaging.version import Version as _RealVersion
+[?2004l[?2004h> import mteb
+[?2004l[?2004h> import mteb.load_results.task_results as tr
+[?2004l[?2004h> 
+[?2004l[?2004h> class _SafeVersion(_RealVersion):
+[?2004l[?2004h>     @classmethod
+[?2004l[?2004h>     def __class_getitem__(cls, item):
+[?2004l[?2004h>         return cls
+[?2004l[?2004h> def _safe_version(v):
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         return _RealVersion(v)
+[?2004l[?2004h>     except Exception:
+[?2004l[?2004h>         return _RealVersion("9999.0.0")
+[?2004l[?2004h> tr.Version = _safe_version
+[?2004l[?2004h> 
+[?2004l[?2004h> import pandas as pd
+[?2004l[?2004h> 
+[?2004l[?2004h> BENCH = "MTEB(Scandinavian, v1)"
+[?2004l[?2004h> 
+[?2004l[?2004h> benchmark = mteb.get_benchmark(BENCH)
+[?2004l[?2004h> task_names = {t.metadata.name for t in benchmark.tasks}
+[?2004l[?2004h> print("Number of tasks in benchmark:", len(task_names), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> ALL_MODELS = {meta.name for meta in mteb.get_model_metas()}
+[?2004l[?2004h> print("Total known models (with meta):", len(ALL_MODELS), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> all_results = mteb.load_results(
+[?2004l[?2004h>     only_main_score=True, require_model_meta=False, models=ALL_MODELS
+[?2004l[?2004h> ).filter_models()
+[?2004l[?2004h> 
+[?2004l[?2004h> benchmark_results = benchmark.load_results(base_results=all_results).join_revisions()
+[?2004l[?2004h> scores = benchmark_results.get_scores(format="long")
+[?2004l[?2004h> print("Num score entries (long):", len(scores), flush=True)
+[?2004l[?2004h> data = pd.DataFrame.from_records(scores)
+[?2004l[?2004h> per_task = data.pivot(index="model_name", columns="task_name", values="score")
+[?2004l[?2004h> per_task = per_task[[c for c in per_task.columns if c in task_names]]
+[?2004l[?2004h> 
+[?2004l[?2004h> overall_mean = per_task.mean(skipna=False, axis=1)  # Mean (Task)
+[?2004l[?2004h> complete = per_task.notna().all(axis=1)  # has all tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> df = pd.DataFrame({
+[?2004l[?2004h>     "MeanTask": overall_mean,
+[?2004l[?2004h>     "n_tasks": per_task.notna().sum(axis=1),
+[?2004l[?2004h>     "complete": complete,
+[?2004l[?2004h> })
+[?2004l[?2004h> df_complete = df[df["complete"]].sort_values("MeanTask", ascending=False)
+[?2004l[?2004h> print("\n=== Models with ALL tasks, ranked by Mean (Task) ===")
+[?2004l[?2004h> print(df_complete.head(20).to_string(), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> print("\nTOP MODEL (complete, by Mean Task):", df_complete.index[0], flush=True)
+[?2004l[?2004h> print("TOP MEAN:", df_complete['MeanTask'].iloc[0], flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Also show for context: top by mean ignoring the complete requirement is not allowed
+[?2004l[?2004h> print("\nTOTAL complete models:", len(df_complete), flush=True)
+[?2004l[?2004h> print("TOTAL models with any score:", len(df), flush=True)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@3b188f72b5ff:/app# python3 /app/solve.py 2>/tmp/err.log; echo "EXIT: $?"; echo '--- tail errors ---'; tail -15 /tmp/err.log
+[?2004lEXIT: 1
+--- tail errors ---
+Traceback (most recent call last):
+  File "/app/solve.py", line 7, in <module>
+    import mteb.load_results.task_results as tr
+ImportError: cannot import name 'task_results' from 'load_results' (unknown location)
+[?2004hroot@3b188f72b5ff:/app# sed -i 's/^import mteb.load_results.task_results as tr$/import importlib\ntr = importlib.import_module("mteb.load_results.task_results")/' /app/solve.py
+[?2004l[?2004hroot@3b188f72b5ff:/app# head -20 /app/solve.py
+[?2004limport warnings
+warnings.filterwarnings("ignore")
+
+# --- workaround for invalid mteb_version strings in some result files ---
+from packaging.version import Version as _RealVersion
+import mteb
+import importlib
+tr = importlib.import_module("mteb.load_results.task_results")
+
+class _SafeVersion(_RealVersion):
+    @classmethod
+    def __class_getitem__(cls, item):
+        return cls
+def _safe_version(v):
+    try:
+        return _RealVersion(v)
+    except Exception:
+        return _RealVersion("9999.0.0")
+tr.Version = _safe_version
+
+[?2004hroot@3b188f72b5ff:/app# python3 /app/solve.py 2>/tmp/err.log; echo "EXIT: $?"; echo '--- tail errors ---'; tail -15 /tmp/err.log
+[?2004lNumber of tasks in benchmark: 28
+Total known models (with meta): 409
+Already up to date.
+Num score entries (long): 4405
+
+=== Models with ALL tasks, ranked by Mean (Task) ===
+                                             MeanTask  n_tasks  complete
+model_name                                                              
+Salesforce/SFR-Embedding-2_R                 0.655559       28      True
+GritLM/GritLM-7B                             0.640838       28      True
+openai/text-embedding-3-large                0.625130       28      True
+Cohere/Cohere-embed-multilingual-v3.0        0.622178       28      True
+intfloat/e5-mistral-7b-instruct              0.620116       28      True
+intfloat/multilingual-e5-large-instruct      0.616161       28      True
+voyageai/voyage-finance-2                    0.616110       28      True
+voyageai/voyage-multilingual-2               0.612186       28      True
+Qwen/Qwen3-Embedding-0.6B                    0.609921       28      True
+voyageai/voyage-3.5                          0.604499       28      True
+voyageai/voyage-large-2-instruct             0.596998       28      True
+voyageai/voyage-3                            0.586014       28      True
+openai/text-embedding-3-small                0.583617       28      True
+voyageai/voyage-3-lite                       0.583591       28      True
+BAAI/bge-m3                                  0.579020       28      True
+Cohere/Cohere-embed-multilingual-light-v3.0  0.569458       28      True
+Snowflake/snowflake-arctic-embed-l-v2.0      0.566011       28      True
+intfloat/multilingual-e5-small               0.560919       28      True
+voyageai/voyage-large-2                      0.533033       28      True
+voyageai/voyage-2                            0.521698       28      True
+
+TOP MODEL (complete, by Mean Task): Salesforce/SFR-Embedding-2_R
+TOP MEAN: 0.6555589932049845
+
+TOTAL complete models: 27
+TOTAL models with any score: 175
+EXIT: 0
+--- tail errors ---
+MassiveIntentClassification: Missing splits {'validation'}
+MassiveScenarioClassification: Missing subsets {'da', 'sv', ...} for split test
+MassiveScenarioClassification: Missing splits {'validation'}
+MassiveIntentClassification: Missing subsets {'da', 'sv', ...} for split test
+MassiveIntentClassification: Missing splits {'validation'}
+MassiveScenarioClassification: Missing subsets {'da', 'sv', ...} for split test
+MassiveScenarioClassification: Missing splits {'validation'}
+MassiveIntentClassification: Missing subsets {'da', 'sv', ...} for split test
+MassiveIntentClassification: Missing splits {'validation'}
+MassiveScenarioClassification: Missing subsets {'da', 'sv', ...} for split test
+MassiveScenarioClassification: Missing splits {'validation'}
+MassiveIntentClassification: Missing subsets {'da', 'sv', ...} for split test
+MassiveIntentClassification: Missing splits {'validation'}
+MassiveScenarioClassification: Missing subsets {'da', 'sv', ...} for split test
+MassiveScenarioClassification: Missing splits {'validation'}
+[?2004hroot@3b188f72b5ff:/app# printf 'Salesforce/SFR-Embedding-2_R' > /app/result.txt
+[?2004l[?2004hroot@3b188f72b5ff:/app# echo '--- result.txt contents ---'; cat /app/result.txt; echo; echo '--- (with visible newline marker) ---'; cat -A /app/result.txt
+[?2004l--- result.txt contents ---
+Salesforce/SFR-Embedding-2_R
+--- (with visible newline marker) ---
+Salesforce/SFR-Embedding-2_R[?2004hroot@3b188f72b5ff:/app# printf 'Salesforce/SFR-Embedding-2_R\n' > /app/result.txt
+[?2004l[?2004hroot@3b188f72b5ff:/app# echo 'Final result.txt:'; cat -A /app/result.txt; echo 'Bytes:'; wc -c /app/result.txt
+[?2004lFinal result.txt:
+Salesforce/SFR-Embedding-2_R$
+Bytes:
+29 /app/result.txt
+[?2004hroot@3b188f72b5ff:/app# 

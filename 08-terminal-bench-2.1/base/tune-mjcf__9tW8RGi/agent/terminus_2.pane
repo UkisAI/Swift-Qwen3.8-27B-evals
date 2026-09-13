@@ -1,0 +1,1470 @@
+[?2004hroot@a1d3bec55139:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@a1d3bec55139:/app# clear
+[?2004l[H[J[3J[?2004hroot@a1d3bec55139:/app# ls -la /app/
+[?2004ltotal 8
+drwxr-xr-x 1 root root   35 Sep 13  2025 .
+drwxr-xr-x 1 root root  102 Sep  6 11:10 ..
+-rw-r--r-- 1 root root 3112 Sep 13  2025 eval.py
+-rw-r--r-- 1 root root 1254 Sep 13  2025 model_ref.xml
+[?2004hroot@a1d3bec55139:/app# cat /app/eval.py
+[?2004limport time
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+total_sim_time = 2.0
+atol = 1e-5  # absolute tolerance for state comparison
+pctg = 0.6  # target percentage of reference model time
+n_runs = 20  # number of runs to average timing
+model_path = Path("model.xml")
+model_ref_path = Path("model_ref.xml")
+
+
+def test_correctness():
+    """Compare final states of models with potentially different timesteps"""
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    model_ref = mujoco.MjModel.from_xml_path(str(model_ref_path))
+
+    seed = np.random.randint(0, 10000)
+    final_state = simulate_model(model, seed)
+    final_state_ref = simulate_model(model_ref, seed)
+
+    # compare final states
+    state_diff = np.linalg.norm(final_state - final_state_ref)
+    print(f"Final state difference: {state_diff:.4f}")
+
+    assert np.allclose(final_state, final_state_ref, atol=atol), (
+        f"Final states differ by {state_diff}, exceeding tolerance {atol}"
+    )
+
+
+def simulate_model(model, seed):
+    """Simulate model with randomized initial qpos and return only the final state"""
+    data = mujoco.MjData(model)
+    nstep = int(total_sim_time / model.opt.timestep)
+    # jiggle initial qpos for robustness
+    rng = np.random.default_rng(seed)
+    data.qpos += rng.normal(0, 0.01, size=data.qpos.shape)
+    mujoco.mj_forward(model, data)
+
+    for _ in range(nstep):
+        mujoco.mj_step(model, data)
+
+    full_physics = mujoco.mjtState.mjSTATE_FULLPHYSICS
+    state = np.zeros(mujoco.mj_stateSize(model, full_physics))
+    mujoco.mj_getState(model, data, state, full_physics)
+    assert not np.isnan(state).any(), "Final state contains NaN values"
+    assert not np.isinf(state).any(), "Final state contains Inf values"
+    return state
+
+
+def simulation_time(model, n_runs):
+    """Run n_runs times with different seeds, and return time taken."""
+    times = []
+    for _ in range(n_runs):
+        seed = np.random.randint(0, 10000)
+        time_start = time.perf_counter()
+        _ = simulate_model(model, seed)
+        time_end = time.perf_counter()
+        times.append(time_end - time_start)
+    return np.array(times)
+
+
+def test_model_speed():
+    """Test that new model is faster than the reference model"""
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    model_ref = mujoco.MjModel.from_xml_path(str(model_ref_path))
+
+    # simulate both models for same total time with same random seed
+    times_model = simulation_time(model, n_runs=n_runs)
+    times_model_ref = simulation_time(model_ref, n_runs=n_runs)
+    speedup = (times_model_ref / times_model).mean().item()
+    act_time_pctg = (times_model / times_model_ref).mean().item()
+
+    print(f"Avg simulation time: {times_model.mean().item():.4f} secs")
+    print(f"Avg simulation time (ref): {times_model_ref.mean().item():.4f} secs")
+    print(f"Speedup: {speedup:.2f}x")
+    print(f"Time pctg: {act_time_pctg:.2f}")
+
+    assert act_time_pctg <= pctg, (
+        f"Time pctg {act_time_pctg * 100:.2f}% (need {pctg * 100:.2f}%)"
+    )
+
+
+if __name__ == "__main__":
+    test_correctness()
+    test_model_speed()
+[?2004hroot@a1d3bec55139:/app# cat /app/model_ref.xml
+[?2004l<!-- Inspired by https://github.com/google-deepmind/mujoco/blob/main/model/plugin/elasticity/cable.xml -->
+<mujoco model="Cable">
+
+  <extension>
+    <plugin plugin="mujoco.elasticity.cable"/>
+  </extension>
+
+  <statistic center="0 0 .3" extent="1"/>
+  <visual>
+    <global elevation="-30"/>
+  </visual>
+
+  <compiler autolimits="true"/>
+
+  <size memory="2M"/>
+
+  <worldbody>
+    <composite type="cable" curve="s" count="41 1 1" size="1" offset="-.3 0 .6" initial="none">
+      <plugin plugin="mujoco.elasticity.cable">
+        <!--Units are in Pa (SI)-->
+        <config key="twist" value="1e7"/>
+        <config key="bend" value="4e6"/>
+        <config key="vmax" value="0.05"/>
+      </plugin>
+      <joint kind="main" damping=".015"/>
+      <geom type="capsule" size=".005" rgba=".8 .2 .1 1" condim="1"/>
+    </composite>
+    <body name="slider" pos=".7 0 .6">
+      <joint type="slide" axis="1 0 0" damping=".1"/>
+      <geom size=".01"/>
+    </body>
+  </worldbody>
+  <equality>
+    <connect name="right_boundary" body1="B_last" body2="slider" anchor=".025 0 0"/>
+  </equality>
+  <contact>
+    <exclude body1="B_last" body2="slider"/>
+  </contact>
+  <actuator>
+    <motor site="S_last" gear="0 0 0 1 0 0" ctrlrange="-.03 .03"/>
+  </actuator>
+</mujoco>[?2004hroot@a1d3bec55139:/app# python3 -c "import mujoco, sys; print('py', sys.version); print('mujoco', mujoco.__version__)"
+[?2004lpy 3.13.7 (main, Aug 15 2025, 22:13:55) [GCC 12.2.0]
+mujoco 3.3.5
+[?2004hroot@a1d3bec55139:/app# find / -iname "*elastic*" -not -path "/proc/*" -not -path "/sys/*" 2>/dev/null | head -20
+[?2004l/usr/local/lib/python3.13/site-packages/mujoco/plugin/libelasticity.so
+[?2004hroot@a1d3bec55139:/app# cat > /app/probe.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> print("version", mujoco.__version__)
+[?2004l[?2004h> print("nq,nu,ncon_max,njnt,neq,na,ngeom,nbody", m.nq, m.nu, m.ncon_max, m.njnt, m.neq, m.na, m.ngeom, m.nbody)
+[?2004l[?2004h> print("timestep", m.opt.timestep, "iterations", m.opt.iterations, "iters_ls", m.opt.iterations_ls)
+[?2004l[?2004h> print("solver", m.opt.solver, "integrator", m.opt.integrator, "tolerance", m.opt.tolerance, "conetol", m.opt.conetol, "disableflags", m.opt.disableflags)
+[?2004l[?2004h> print("enableflags", m.opt.enableflags)
+[?2004l[?2004h> nstep = int(2.0/m.opt.timestep)
+[?2004l[?2004h> rng = np.random.default_rng(123)
+[?2004l[?2004h> d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> t0=time.perf_counter()
+[?2004l[?2004h> for _ in range(nstep):
+[?2004l[?2004h>     mujoco.mj_step(m,d)
+[?2004l[?2004h> t1=time.perf_counter()
+[?2004l[?2004h> print("steps", nstep, "total", t1-t0, "per step ms", (t1-t0)/nstep*1e3)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/probe.py
+[?2004lversion 3.3.5
+Traceback (most recent call last):
+  File [35m"/app/probe.py"[0m, line [35m5[0m, in [35m<module>[0m
+    print("nq,nu,ncon_max,njnt,neq,na,ngeom,nbody", m.nq, m.nu, [1;31mm.ncon_max[0m, m.njnt, m.neq, m.na, m.ngeom, m.nbody)
+                                                                [1;31m^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjModel' object has no attribute 'ncon_max'. Did you mean: 'nconmax'?[0m
+[?2004hroot@a1d3bec55139:/app# cat > /app/probe.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> print("nq,nu,nconmax,njntmax,neq,na,ngeom,nbody", m.nq, m.nu, m.nconmax, m.njntmax, m.neq, m.na, m.ngeom, m.nbody)
+[?2004l[?2004h> print("timestep", m.opt.timestep, "iterations", m.opt.iterations, "iters_ls", m.opt.iterations_ls)
+[?2004l[?2004h> print("solver", m.opt.solver, "integrator", m.opt.integrator, "tolerance", m.opt.tolerance, "conetol", m.opt.conetol)
+[?2004l[?2004h> print("disableflags", m.opt.disableflags, "enableflags", m.opt.enableflags)
+[?2004l[?2004h> print("nplugin", m.nplugin, [m.plugin[i].name.decode() for i in range(m.nplugin)] if hasattr(m, 'plugin') else None)
+[?2004l[?2004h> print("nsense", m.nsense, "ncam", m.ncam, "nwrap", getattr(m,'nwrap',None))
+[?2004l[?2004h> nstep = int(2.0/m.opt.timestep)
+[?2004l[?2004h> rng = np.random.default_rng(123)
+[?2004l[?2004h> d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> t0=time.perf_counter()
+[?2004l[?2004h> for _ in range(nstep):
+[?2004l[?2004h>     mujoco.mj_step(m,d)
+[?2004l[?2004h> t1=time.perf_counter()
+[?2004l[?2004h> print("steps", nstep, "total s", t1-t0, "per step ms", (t1-t0)/nstep*1e3)
+[?2004l[?2004h> # breakdown: fwd only vs full step
+[?2004l[?2004h> t0=time.perf_counter()
+[?2004l[?2004h> for _ in range(nstep):
+[?2004l[?2004h>     mujoco.mj_fwd(m,d)
+[?2004l[?2004h> t1=time.perf_counter()
+[?2004l[?2004h> print("fwd only per step ms", (t1-t0)/nstep*1e3)
+[?2004l[?2004h> mj_state = mujoco.mj_stateSize(m, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+[?2004l[?2004h> print("state size", mj_state)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/probe.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/probe.py"[0m, line [35m4[0m, in [35m<module>[0m
+    print("nq,nu,nconmax,njntmax,neq,na,ngeom,nbody", m.nq, m.nu, m.nconmax, [1;31mm.njntmax[0m, m.neq, m.na, m.ngeom, m.nbody)
+                                                                             [1;31m^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjModel' object has no attribute 'njntmax'. Did you mean: 'njmax'?[0m
+[?2004hroot@a1d3bec55139:/app# cat > /app/probe.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> for attr in ["nq","nu","nconmax","njmax","nconmax","neq","na","ngeom","nbody","nsensor","ncam","nnonsense","nplugin"]:
+[?2004l[?2004h>     print(attr, getattr(m, attr, None))
+[?2004l[?2004h> try:
+[?2004l[?2004h>     print("plugins:", [m.plugin[i].name for i in range(m.nplugin)])
+[?2004l[?2004h> except Exception as e:
+[?2004l[?2004h>     print("plugin list err", e)
+[?2004l[?2004h> print("timestep", m.opt.timestep, "iterations", m.opt.iterations, "iters_ls", m.opt.iterations_ls)
+[?2004l[?2004h> print("solver", m.opt.solver, "integrator", m.opt.integrator, "tolerance", m.opt.tolerance, "conetol", m.opt.conetol)
+[?2004l[?2004h> print("disableflags", m.opt.disableflags, "enableflags", m.opt.enableflags)
+[?2004l[?2004h> nstep = int(2.0/m.opt.timestep)
+[?2004l[?2004h> rng = np.random.default_rng(123)
+[?2004l[?2004h> d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> t0=time.perf_counter()
+[?2004l[?2004h> for _ in range(nstep):
+[?2004l[?2004h>     mujoco.mj_step(m,d)
+[?2004l[?2004h> t1=time.perf_counter()
+[?2004l[?2004h> print("steps", nstep, "total s", t1-t0, "per step ms", (t1-t0)/nstep*1e3)
+[?2004l[?2004h> t0=time.perf_counter()
+[?2004l[?2004h> for _ in range(nstep):
+[?2004l[?2004h>     mujoco.mj_fwd(m,d)
+[?2004l[?2004h> t1=time.perf_counter()
+[?2004l[?2004h> print("fwd only per step ms", (t1-t0)/nstep*1e3)
+[?2004l[?2004h> st = mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> print("state size", mujoco.mj_stateSize(m, st))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/probe.py
+[?2004lnq 157
+nu 1
+nconmax -1
+njmax -1
+nconmax -1
+neq 1
+na 0
+ngeom 41
+nbody 42
+nsensor 0
+ncam 0
+nnonsense None
+nplugin 1
+plugin list err 'numpy.int32' object has no attribute 'name'
+Traceback (most recent call last):
+  File [35m"/app/probe.py"[0m, line [35m10[0m, in [35m<module>[0m
+    print("timestep", m.opt.timestep, "iterations", m.opt.iterations, "iters_ls", [1;31mm.opt.iterations_ls[0m)
+                                                                                  [1;31m^^^^^^^^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjOption' object has no attribute 'iterations_ls'. Did you mean: 'iterations'?[0m
+[?2004hroot@a1d3bec55139:/app# cat > /app/dump.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> print("nq,nu,na,nact", m.nq, m.nu, m.na, m.nact)
+[?2004l[?2004h> print("njnt", m.njnt)
+[?2004l[?2004h> import collections
+[?2004l[?2004h> types = m.jnt_type
+[?2004l[?2004h> print("jnt types:", collections.Counter(types.tolist()))
+[?2004l[?2004h> print("jnt dof:", m.jnt_dof[:10], "...", "total", m.jnt_dof.sum())
+[?2004l[?2004h> print("jnt damping:", np.unique(m.jnt_damping, return_counts=True))
+[?2004l[?2004h> print("jnt stiffness:", np.unique(m.jnt_stiffness, return_counts=True))
+[?2004l[?2004h> print("jnt limits:", np.unique(m.jnt_range, axis=0)[:5])
+[?2004l[?2004h> print("joint names sample:", [m.joint(i).name for i in range(0, min(m.njnt,10))])
+[?2004l[?2004h> print("nsite", m.nsite, "site names sample:", [m.site(i).name for i in range(0, min(m.nsite,10))])
+[?2004l[?2004h> print("neq", m.neq, m.eq_type, m.eq_solref, m.eq_solimp, m.eq_objbodyid, m.eq_objective, m.eq_anchor)
+[?2004l[?2004h> print("ngeom", m.ngeom, "geom types:", collections.Counter(m.geom_type.tolist()))
+[?2004l[?2004h> print("geom size sample:", m.geom_size[:5])
+[?2004l[?2004h> print("geom mass? density:", m.geom_density[:5])
+[?2004l[?2004h> print("nbody", m.nbody, "body mass:", m.body_mass[:5], "... max", m.body_mass.max())
+[?2004l[?2004h> print("ncon after fwd:", d.ncon, "dist:", d.contact.dist[:10] if d.ncon else None)
+[?2004l[?2004h> print("body names:", [m.body(i).name for i in range(m.nbody)])
+[?2004l[?2004h> print("actuator names:", [m.act(i).name for i in range(m.nact)])
+[?2004l[?2004h> if m.nact:
+[?2004l[?2004h>     print("actuator mode/gear:", m.actuator_mode, m.actuator_gear, m.actuator_ctrlrange, m.actuator_gaintype)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/dump.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/dump.py"[0m, line [35m5[0m, in [35m<module>[0m
+    print("nq,nu,na,nact", m.nq, m.nu, m.na, [1;31mm.nact[0m)
+                                             [1;31m^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjModel' object has no attribute 'nact'. Did you mean: 'noct'?[0m
+[?2004hroot@a1d3bec55139:/app# cat > /app/dump.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, collections
+[?2004l[?2004h> def g(o, n, dflt= None):
+[?2004l[?2004h>     try: return getattr(o, n)
+[?2004l[?2004h>     except Exception: return dfltn = dflt
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> for a in ["nq","nu","na","njnt","nsite","neq","ngeom","nbody","nact","nwrap","ntendon","nnocpose","nkey"]:
+[?2004l[?2004h>     print(a, g(m,a))
+[?2004l[?2004h> print("jnt types:", collections.Counter(g(m,'jnt_type').tolist()))
+[?2004l[?2004h> print("jnt dof:", g(m,'jnt_dof'), "sum", g(m,'jnt_dof').sum())
+[?2004l[?2004h> print("jnt damping:", np.unique(g(m,'jnt_damping'), return_counts=True))
+[?2004l[?2004h> print("jnt stiffness:", np.unique(g(m,'jnt_stiffness'), return_counts=True))
+[?2004l[?2004h> print("jnt range:", np.unique(g(m,'jnt_range'), axis=0)[:6])
+[?2004l[?2004h> print("jnt solimp:", np.unique(g(m,'jnt_solimp'), axis=0)[:6])
+[?2004l[?2004h> print("joint names:", [g(m,'jnt_name',i) for i in range(0,6)], "...", [g(m,'jnt_name',i) for i in range(m.njnt-3,m.njnt)])
+[?2004l[?2004h> print("site names:", [g(m,'site_name',i) for i in range(0,6)], "...", [g(m,'site_name',i) for i in range(m.nsite-3,m.nsite)])
+[?2004l[?2004h> print("eq type", g(m,'eq_type'), "solref", g(m,'eq_solref'), "solimp", g(m,'eq_solimp'))
+[?2004l[?2004h> print("eq objbody", g(m,'eq_objbodyid'), "objective", g(m,'eq_objective'), "anchor", g(m,'eq_anchor'))
+[?2004l[?2004h> print("geom types:", collections.Counter(g(m,'geom_type').tolist()))
+[?2004l[?2004h> print("geom size:", g(m,'geom_size')[:6])
+[?2004l[?2004h> print("body mass:", np.round(g(m,'body_mass'),6), "max", g(m,'body_mass').max())
+[?2004l[?2004h> print("ncon:", d.ncon, "contact dist:", d.contact.dist[:12] if d.ncon else None)
+[?2004l[?2004h> print("body names:", [g(m,'body_name',i) for i in range(m.nbody)])
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/dump.py
+[?2004l  File [35m"/app/dump.py"[0m, line [35m4[0m
+    except Exception: return dfltn [1;31m=[0m dflt
+                                   [1;31m^[0m
+[1;35mSyntaxError[0m: [35minvalid syntax[0m
+[?2004hroot@a1d3bec55139:/app# cat > /app/dump.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, collections
+[?2004l[?2004h> def g(o, n, dflt=None):
+[?2004l[?2004h>     try: return getattr(o, n)
+[?2004l[?2004h>     except Exception: return dflt
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> for a in ["nq","nu","na","njnt","nsite","neq","ngeom","nbody","ntendon","nkey"]:
+[?2004l[?2004h>     print(a, g(m,a))
+[?2004l[?2004h> print("jnt types:", collections.Counter(g(m,'jnt_type').tolist()))
+[?2004l[?2004h> print("jnt dof:", g(m,'jnt_dof'), "sum", g(m,'jnt_dof').sum())
+[?2004l[?2004h> print("jnt damping:", np.unique(g(m,'jnt_damping'), return_counts=True))
+[?2004l[?2004h> print("jnt stiffness:", np.unique(g(m,'jnt_stiffness'), return_counts=True))
+[?2004l[?2004h> print("jnt range:", np.unique(g(m,'jnt_range'), axis=0)[:6])
+[?2004l[?2004h> print("jnt solimp:", np.unique(g(m,'jnt_solimp'), axis=0)[:6])
+[?2004l[?2004h> print("joint names:", [g(m,'jnt_name',i) for i in range(0,6)], "...", [g(m,'jnt_name',i) for i in range(m.njnt-3,m.njnt)])
+[?2004l[?2004h> print("site names:", [g(m,'site_name',i) for i in range(0,6)], "...", [g(m,'site_name',i) for i in range(m.nsite-3,m.nsite)])
+[?2004l[?2004h> print("eq type", g(m,'eq_type'), "solref", g(m,'eq_solref'), "solimp", g(m,'eq_solimp'))
+[?2004l[?2004h> print("eq objbody", g(m,'eq_objbodyid'), "objective", g(m,'eq_objective'), "anchor", g(m,'eq_anchor'))
+[?2004l[?2004h> print("geom types:", collections.Counter(g(m,'geom_type').tolist()))
+[?2004l[?2004h> print("geom size:", g(m,'geom_size')[:6])
+[?2004l[?2004h> print("body mass:", np.round(g(m,'body_mass'),6), "max", g(m,'body_mass').max())
+[?2004l[?2004h> print("ncon:", d.ncon, "contact dist:", d.contact.dist[:12] if d.ncon else None)
+[?2004l[?2004h> print("body names:", [g(m,'body_name',i) for i in range(m.nbody)])
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/dump.py
+[?2004lnq 157
+nu 1
+na 0
+njnt 40
+nsite 2
+neq 1
+ngeom 41
+nbody 42
+ntendon 0
+nkey 0
+jnt types: Counter({1: 39, 2: 1})
+Traceback (most recent call last):
+  File [35m"/app/dump.py"[0m, line [35m11[0m, in [35m<module>[0m
+    print("jnt dof:", g(m,'jnt_dof'), "sum", [1;31mg(m,'jnt_dof').sum[0m())
+                                             [1;31m^^^^^^^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'NoneType' object has no attribute 'sum'[0m
+[?2004hroot@a1d3bec55139:/app# cat > /app/dump2.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, collections
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> print("len qpos", len(d.qpos), "len qvel", len(d.qvel), "len ctrl", len(d.ctrl) if len(str(d.ctrl))>0 else None)
+[?2004l[?2004h> attrs = sorted(a for a in dir(m) if isinstance(getattr(m,a), int))
+[?2004l[?2004h> print(attrs)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/dump2.py
+[?2004llen qpos 157 len qvel 118 len ctrl 1
+['_address', 'nB', 'nC', 'nD', 'nJmom', 'nM', 'na', 'narena', 'nbody', 'nbuffer', 'nbvh', 'nbvhdynamic', 'nbvhstatic', 'ncam', 'nconmax', 'nemax', 'neq', 'nexclude', 'nflex', 'nflexedge', 'nflexelem', 'nflexelemdata', 'nflexelemedge', 'nflexevpair', 'nflexnode', 'nflexshelldata', 'nflextexcoord', 'nflexvert', 'ngeom', 'ngravcomp', 'nhfield', 'nhfielddata', 'njmax', 'njnt', 'nkey', 'nlight', 'nmat', 'nmesh', 'nmeshface', 'nmeshgraph', 'nmeshnormal', 'nmeshpoly', 'nmeshpolymap', 'nmeshpolyvert', 'nmeshtexcoord', 'nmeshvert', 'nmocap', 'nnames', 'nnames_map', 'nnumeric', 'nnumericdata', 'noct', 'npair', 'npaths', 'nplugin', 'npluginattr', 'npluginstate', 'nq', 'nsensor', 'nsensordata', 'nsite', 'nskin', 'nskinbone', 'nskinbonevert', 'nskinface', 'nskintexvert', 'nskinvert', 'ntendon', 'ntex', 'ntexdata', 'ntext', 'ntextdata', 'ntree', 'ntuple', 'ntupledata', 'nu', 'nuser_actuator', 'nuser_body', 'nuser_cam', 'nuser_geom', 'nuser_jnt', 'nuser_sensor', 'nuser_site', 'nuser_tendon', 'nuserdata', 'nv', 'nwrap', 'signature']
+[?2004hroot@a1d3bec55139:/app# nm -D /usr/local/lib/python3.13/site-packages/mujoco/plugin/libelasticity.so 2>/dev/null | grep -i " U " | head -40; echo ---; nm -D /usr/local/lib/python3.13/site-packages/mujoco/plugin/libelasticity.so 2>/dev/null | grep -iv " U " | head -40
+[?2004l---
+[?2004hroot@a1d3bec55139:/app# cat > /app/dump3.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, collections
+[?2004l[?2004h> def g(o, n, dflt=None):
+[?2004l[?2004h>     try: return getattr(o, n)
+[?2004l[?2004h>     except Exception: return dflt
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> print("mjtJoint:", [(x, getattr(mujoco.mjtJoint, x)) for x in dir(mujoco.mjtJoint) if not x.startswith('_')])
+[?2004l[?2004h> print("joint names:", [g(m,'jnt_name',i) for i in range(m.njnt)])
+[?2004l[?2004h> print("jnt type:", g(m,'jnt_type').tolist())
+[?2004l[?2004h> print("jnt damping:", g(m,'jnt_damping'))
+[?2004l[?2004h> print("jnt stiffness:", g(m,'jnt_stiffness'))
+[?2004l[?2004h> print("jnt axis:", np.round(g(m,'jnt_axis'),3).tolist() if g(m,'jnt_axis') is not None else None)
+[?2004l[?2004h> print("jnt range:", np.round(g(m,'jnt_range'),3).tolist())
+[?2004l[?2004h> print("jnt solref:", g(m,'jnt_solref')[:3])
+[?2004l[?2004h> print("jnt solimp:", np.round(g(m,'jnt_solimp'),5).tolist()[:5])
+[?2004l[?2004h> print("body names:", [g(m,'body_name',i) for i in range(m.nbody)])
+[?2004l[?2004h> print("body parent:", g(m,'body_parent'))
+[?2004l[?2004h> print("body pos:", np.round(g(m,'body_pos'),4).tolist())
+[?2004l[?2004h> print("site names:", [g(m,'site_name',i) for i in range(m.nsite)])
+[?2004l[?2004h> print("site body:", g(m,'site_body'), "site pos:", np.round(g(m,'site_pos'),4).tolist())
+[?2004l[?2004h> print("geom names:", [g(m,'geom_name',i) for i in range(m.ngeom)][:6], "...")
+[?2004l[?2004h> print("geom body:", g(m,'geom_body').tolist()[:6])
+[?2004l[?2004h> print("geom type:", g(m,'geom_type').tolist()[:6])
+[?2004l[?2004h> print("geom size:", np.round(g(m,'geom_size'),5).tolist()[:6])
+[?2004l[?2004h> print("geom pos:", np.round(g(m,'geom_pos'),4).tolist()[:4])
+[?2004l[?2004h> print("geom mass:", np.round(g(m,'geom_mass'),6).tolist()[:6])
+[?2004l[?2004h> print("eq type:", g(m,'eq_type'), "eq solref:", g(m,'eq_solref'), "eq solimp:", g(m,'eq_solimp'))
+[?2004l[?2004h> print("eq body1/2:", g(m,'eq_objbodyid'), g(m,'eq_obj1id'), g(m,'eq_obj2id'))
+[?2004l[?2004h> print("eq anchor:", g(m,'eq_anchor'), "eq objxaxis:", g(m,'eq_objxaxis'), "objyaxis:", g(m,'eq_objyaxis'))
+[?2004l[?2004h> print("npluginstate:", g(m,'npluginstate'), "npluginattr:", g(m,'npluginattr'))
+[?2004l[?2004h> print("ncon:", d.ncon, "dist:", np.round(d.contact.dist,5)[:12] if d.ncon else None)
+[?2004l[?2004h> print("pair ids:", d.contact.geom if d.ncon else None)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/dump3.py
+[?2004lmjtJoint: [('mjJNT_BALL', <mjtJoint.mjJNT_BALL: 1>), ('mjJNT_FREE', <mjtJoint.mjJNT_FREE: 0>), ('mjJNT_HINGE', <mjtJoint.mjJNT_HINGE: 3>), ('mjJNT_SLIDE', <mjtJoint.mjJNT_SLIDE: 2>), ('name', <property object at 0x70f915a45b20>), ('value', <property object at 0x70f915a45e40>)]
+joint names: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+jnt type: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2]
+jnt damping: None
+jnt stiffness: [0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.
+ 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
+jnt axis: [[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]]
+jnt range: [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+jnt solref: [[0.02 1.  ]
+ [0.02 1.  ]
+ [0.02 1.  ]]
+jnt solimp: [[0.9, 0.95, 0.001, 0.5, 2.0], [0.9, 0.95, 0.001, 0.5, 2.0], [0.9, 0.95, 0.001, 0.5, 2.0], [0.9, 0.95, 0.001, 0.5, 2.0], [0.9, 0.95, 0.001, 0.5, 2.0]]
+body names: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+body parent: None
+body pos: [[0.0, 0.0, 0.0], [-0.3, 0.0, 0.6], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.025, 0.0, 0.0], [0.7, 0.0, 0.6]]
+site names: [0, 1]
+site body: None site pos: [[0.0, 0.0, 0.0], [0.025, 0.0, 0.0]]
+geom names: [0, 1, 2, 3, 4, 5] ...
+Traceback (most recent call last):
+  File [35m"/app/dump3.py"[0m, line [35m23[0m, in [35m<module>[0m
+    print("geom body:", [1;31mg(m,'geom_body').tolist[0m()[:6])
+                        [1;31m^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'NoneType' object has no attribute 'tolist'[0m
+[?2004hroot@a1d3bec55139:/app# strings /usr/local/lib/python3.13/site-packages/mujoco/plugin/libelasticity.so | head -80
+[?2004lbash: strings: command not found
+[?2004hroot@a1d3bec55139:/app# cat > /app/dump4.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, collections
+[?2004l[?2004h> def g(o, n, dflt=None):
+[?2004l[?2004h>     try: return getattr(o, n)
+[?2004l[?2004h>     except Exception: return dflt
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> print("ncon:", d.ncon, "constraint types:", collections.Counter(d.constraint.type.tolist()) if d.ncon else None)
+[?2004l[?2004h> idx = np.argsort(d.constraint.type)
+[?2004l[?2004h> for i in idx[:20]:
+[?2004l[?2004h>     c = d.constraint[i]
+[?2004l[?2004h>     print("con", i, "type", c.type, "objid1", c.objid1, "objid2", c.objid2, "dist", round(c.dist,4), "mag", round(c.mag,3))
+[?2004l[?2004h> arrs = [a for a in dir(m) if not a.startswith('_')]
+[?2004l[?2004h> missingish = []
+[?2004l[?2004h> interesting = [a for a in arrs if any(k in a for k in ["jnt","geom","site","body","eq","act"]) and not isinstance(getattr(m,a,int))]
+[?2004l[?2004h> import pickle
+[?2004l[?2004h> out=[]
+[?2004l[?2004h> for a in sorted(arrs):
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         v = getattr(m,a)
+[?2004l[?2004h>         if isinstance(v, np.ndarray):
+[?2004l[?2004h>             out.append(a)
+[?2004l[?2004h>     except Exception:
+[?2004l[?2004h>         pass
+[?2004l[?2004h> print("array attrs:", out)
+[?2004l[?2004h> for a in ["jnt_damping","jnt_limited","geom_body","geom_data","site_body","site_data","body_parent","eq_objbodyid","eq_obj1id","eq_obj2id","actuator_trntype","actuator_gear","actuator_gain"]:
+[?2004l[?2004h>     print(a, "=", g(m,a, None) if not isinstance(g(m,a),np.ndarray) else np.round(g(m,a),4))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/dump4.py
+[?2004lncon: 0 constraint types: None
+Traceback (most recent call last):
+  File [35m"/app/dump4.py"[0m, line [35m9[0m, in [35m<module>[0m
+    idx = np.argsort([1;31md.constraint[0m.type)
+                     [1;31m^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjData' object has no attribute 'constraint'[0m
+[?2004hroot@a1d3bec55139:/app# cat > /app/dump5.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> print("MjData attrs:", [a for a in dir(d) if isinstance(getattr(d,a), np.ndarray)][:60])
+[?2004l[?2004h> attrs=[a for a in dir(m) if isinstance(getattr(m,a), np.ndarray)]
+[?2004l[?2004h> print("MjModel array attrs:", attrs)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/app# python3 /app/dump5.py
+[?2004lMjData attrs: ['B_colind', 'B_rowadr', 'B_rownnz', 'D_colind', 'D_diag', 'D_rowadr', 'D_rownnz', 'M', 'M_colind', 'M_rowadr', 'M_rownnz', 'act', 'act_dot', 'actuator_force', 'actuator_length', 'actuator_moment', 'actuator_velocity', 'bvh_aabb_dyn', 'bvh_active', 'cacc', 'cam_xmat', 'cam_xpos', 'cdof', 'cdof_dot', 'cfrc_ext', 'cfrc_int', 'cinert', 'crb', 'ctrl', 'cvel', 'dof_island', 'efc_AR', 'efc_AR_colind', 'efc_AR_rowadr', 'efc_AR_rownnz', 'efc_D', 'efc_J', 'efc_JT', 'efc_JT_colind', 'efc_JT_rowadr', 'efc_JT_rownnz', 'efc_JT_rowsuper', 'efc_J_colind', 'efc_J_rowadr', 'efc_J_rownnz', 'efc_J_rowsuper', 'efc_KBIP', 'efc_R', 'efc_aref', 'efc_b', 'efc_diagApprox', 'efc_force', 'efc_frictionloss', 'efc_id', 'efc_island', 'efc_margin', 'efc_pos', 'efc_state', 'efc_type', 'efc_vel']
+MjModel array attrs: ['_sizes', 'actuator_acc0', 'actuator_actadr', 'actuator_actearly', 'actuator_actlimited', 'actuator_actnum', 'actuator_actrange', 'actuator_biasprm', 'actuator_biastype', 'actuator_cranklength', 'actuator_ctrllimited', 'actuator_ctrlrange', 'actuator_dynprm', 'actuator_dyntype', 'actuator_forcelimited', 'actuator_forcerange', 'actuator_gainprm', 'actuator_gaintype', 'actuator_gear', 'actuator_group', 'actuator_length0', 'actuator_lengthrange', 'actuator_plugin', 'actuator_trnid', 'actuator_trntype', 'actuator_user', 'body_bvhadr', 'body_bvhnum', 'body_conaffinity', 'body_contype', 'body_dofadr', 'body_dofnum', 'body_geomadr', 'body_geomnum', 'body_gravcomp', 'body_inertia', 'body_invweight0', 'body_ipos', 'body_iquat', 'body_jntadr', 'body_jntnum', 'body_margin', 'body_mass', 'body_mocapid', 'body_parentid', 'body_plugin', 'body_pos', 'body_quat', 'body_rootid', 'body_sameframe', 'body_simple', 'body_subtreemass', 'body_treeid', 'body_user', 'body_weldid', 'bvh_aabb', 'bvh_child', 'bvh_depth', 'bvh_nodeid', 'cam_bodyid', 'cam_fovy', 'cam_intrinsic', 'cam_ipd', 'cam_mat0', 'cam_mode', 'cam_orthographic', 'cam_pos', 'cam_pos0', 'cam_poscom0', 'cam_quat', 'cam_resolution', 'cam_sensorsize', 'cam_targetbodyid', 'cam_user', 'dof_M0', 'dof_Madr', 'dof_armature', 'dof_bodyid', 'dof_damping', 'dof_frictionloss', 'dof_invweight0', 'dof_jntid', 'dof_parentid', 'dof_simplenum', 'dof_solimp', 'dof_solref', 'dof_treeid', 'eq_active0', 'eq_data', 'eq_obj1id', 'eq_obj2id', 'eq_objtype', 'eq_solimp', 'eq_solref', 'eq_type', 'exclude_signature', 'flex_activelayers', 'flex_bending', 'flex_bvhadr', 'flex_bvhnum', 'flex_centered', 'flex_conaffinity', 'flex_condim', 'flex_contype', 'flex_damping', 'flex_dim', 'flex_edge', 'flex_edgeadr', 'flex_edgedamping', 'flex_edgeequality', 'flex_edgeflap', 'flex_edgenum', 'flex_edgestiffness', 'flex_elem', 'flex_elemadr', 'flex_elemdataadr', 'flex_elemedge', 'flex_elemedgeadr', 'flex_elemlayer', 'flex_elemnum', 'flex_elemtexcoord', 'flex_evpair', 'flex_evpairadr', 'flex_evpairnum', 'flex_flatskin', 'flex_friction', 'flex_gap', 'flex_group', 'flex_internal', 'flex_interp', 'flex_margin', 'flex_matid', 'flex_node', 'flex_node0', 'flex_nodeadr', 'flex_nodebodyid', 'flex_nodenum', 'flex_priority', 'flex_radius', 'flex_rgba', 'flex_rigid', 'flex_selfcollide', 'flex_shell', 'flex_shelldataadr', 'flex_shellnum', 'flex_solimp', 'flex_solmix', 'flex_solref', 'flex_stiffness', 'flex_texcoord', 'flex_texcoordadr', 'flex_vert', 'flex_vert0', 'flex_vertadr', 'flex_vertbodyid', 'flex_vertnum', 'flexedge_invweight0', 'flexedge_length0', 'flexedge_rigid', 'geom_aabb', 'geom_bodyid', 'geom_conaffinity', 'geom_condim', 'geom_contype', 'geom_dataid', 'geom_fluid', 'geom_friction', 'geom_gap', 'geom_group', 'geom_margin', 'geom_matid', 'geom_plugin', 'geom_pos', 'geom_priority', 'geom_quat', 'geom_rbound', 'geom_rgba', 'geom_sameframe', 'geom_size', 'geom_solimp', 'geom_solmix', 'geom_solref', 'geom_type', 'geom_user', 'hfield_adr', 'hfield_data', 'hfield_ncol', 'hfield_nrow', 'hfield_pathadr', 'hfield_size', 'jnt_actfrclimited', 'jnt_actfrcrange', 'jnt_actgravcomp', 'jnt_axis', 'jnt_bodyid', 'jnt_dofadr', 'jnt_group', 'jnt_limited', 'jnt_margin', 'jnt_pos', 'jnt_qposadr', 'jnt_range', 'jnt_solimp', 'jnt_solref', 'jnt_stiffness', 'jnt_type', 'jnt_user', 'key_act', 'key_ctrl', 'key_mpos', 'key_mquat', 'key_qpos', 'key_qvel', 'key_time', 'light_active', 'light_ambient', 'light_attenuation', 'light_bodyid', 'light_bulbradius', 'light_castshadow', 'light_cutoff', 'light_diffuse', 'light_dir', 'light_dir0', 'light_exponent', 'light_intensity', 'light_mode', 'light_pos', 'light_pos0', 'light_poscom0', 'light_range', 'light_specular', 'light_targetbodyid', 'light_texid', 'light_type', 'mat_emission', 'mat_metallic', 'mat_reflectance', 'mat_rgba', 'mat_roughness', 'mat_shininess', 'mat_specular', 'mat_texid', 'mat_texrepeat', 'mat_texuniform', 'mesh_bvhadr', 'mesh_bvhnum', 'mesh_face', 'mesh_faceadr', 'mesh_facenormal', 'mesh_facenum', 'mesh_facetexcoord', 'mesh_graph', 'mesh_graphadr', 'mesh_normal', 'mesh_normaladr', 'mesh_normalnum', 'mesh_octadr', 'mesh_octnum', 'mesh_pathadr', 'mesh_polyadr', 'mesh_polymap', 'mesh_polymapadr', 'mesh_polymapnum', 'mesh_polynormal', 'mesh_polynum', 'mesh_polyvert', 'mesh_polyvertadr', 'mesh_polyvertnum', 'mesh_pos', 'mesh_quat', 'mesh_scale', 'mesh_texcoord', 'mesh_texcoordadr', 'mesh_texcoordnum', 'mesh_vert', 'mesh_vertadr', 'mesh_vertnum', 'name_actuatoradr', 'name_bodyadr', 'name_camadr', 'name_eqadr', 'name_excludeadr', 'name_flexadr', 'name_geomadr', 'name_hfieldadr', 'name_jntadr', 'name_keyadr', 'name_lightadr', 'name_matadr', 'name_meshadr', 'name_numericadr', 'name_pairadr', 'name_pluginadr', 'name_sensoradr', 'name_siteadr', 'name_skinadr', 'name_tendonadr', 'name_texadr', 'name_textadr', 'name_tupleadr', 'names_map', 'numeric_adr', 'numeric_data', 'numeric_size', 'oct_aabb', 'oct_child', 'oct_coeff', 'oct_depth', 'pair_dim', 'pair_friction', 'pair_gap', 'pair_geom1', 'pair_geom2', 'pair_margin', 'pair_signature', 'pair_solimp', 'pair_solref', 'pair_solreffriction', 'plugin', 'plugin_attr', 'plugin_attradr', 'plugin_stateadr', 'plugin_statenum', 'qpos0', 'qpos_spring', 'sensor_adr', 'sensor_cutoff', 'sensor_datatype', 'sensor_dim', 'sensor_intprm', 'sensor_needstage', 'sensor_noise', 'sensor_objid', 'sensor_objtype', 'sensor_plugin', 'sensor_refid', 'sensor_reftype', 'sensor_type', 'sensor_user', 'site_bodyid', 'site_group', 'site_matid', 'site_pos', 'site_quat', 'site_rgba', 'site_sameframe', 'site_size', 'site_type', 'site_user', 'skin_boneadr', 'skin_bonebindpos', 'skin_bonebindquat', 'skin_bonebodyid', 'skin_bonenum', 'skin_bonevertadr', 'skin_bonevertid', 'skin_bonevertnum', 'skin_bonevertweight', 'skin_face', 'skin_faceadr', 'skin_facenum', 'skin_group', 'skin_inflate', 'skin_matid', 'skin_pathadr', 'skin_rgba', 'skin_texcoord', 'skin_texcoordadr', 'skin_vert', 'skin_vertadr', 'skin_vertnum', 'tendon_actfrclimited', 'tendon_actfrcrange', 'tendon_adr', 'tendon_armature', 'tendon_damping', 'tendon_frictionloss', 'tendon_group', 'tendon_invweight0', 'tendon_length0', 'tendon_lengthspring', 'tendon_limited', 'tendon_margin', 'tendon_matid', 'tendon_num', 'tendon_range', 'tendon_rgba', 'tendon_solimp_fri', 'tendon_solimp_lim', 'tendon_solref_fri', 'tendon_solref_lim', 'tendon_stiffness', 'tendon_user', 'tendon_width', 'tex_adr', 'tex_colorspace', 'tex_data', 'tex_height', 'tex_nchannel', 'tex_pathadr', 'tex_type', 'tex_width', 'text_adr', 'text_size', 'tuple_adr', 'tuple_objid', 'tuple_objprm', 'tuple_objtype', 'tuple_size', 'wrap_objid', 'wrap_prm', 'wrap_type']
+[?2004hroot@a1d3bec55139:/app# cd /tmp && python3 - << 'EOF'
+[?2004lst.xml','/tmp/v_vmax.xml','/tmp/v_nodamp.xml']:
+    s = sim(p)
+    dd = np.abs(s-ref)
+    print(p, "maxdiff", dd.max(), "norm", np.linalg.norm(dd), "allclose1e-5", np.allclose(s, ref, atol=1e-5))
+EOF
+python3 /app/cmp.py
+[?2004h> import re
+[?2004l[?2004h> s = open('/app/model_ref.xml').read()
+[?2004l[?2004h> open('v_twist.xml','w').write(s.replace('value="1e7"','value="1e3"').replace('value="4e6"','value="1e3"'))
+[?2004l[?2004h> open('v_vmax.xml','w').write(s.replace('value="0.05"','value="5"'))
+[?2004l[?2004h> open('v_nodamp.xml','w').write(s.replace('damping=".015"',''))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# cat > /app/cmp.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np, sys
+[?2004l[?2004h> def sim(path, seed=123, nstep=None):
+[?2004l[?2004h>     m = mujoco.MjModel.from_xml_path(path)
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     if nstep is None:
+[?2004l[?2004h>         nstep = int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(nstep):
+[?2004l[?2004h>         mujoco.mj_step(m,d)
+[?2004l[?2004h>     st = mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h>     state = np.zeros(mujoco.mj_stateSize(m, st))
+[?2004l[?2004h>     mujoco.mj_getState(m,d,state,st)
+[?2004l[?2004h>     return state
+[?2004l[?2004h> ref = sim('/app/model_ref.xml')
+[?2004l[?2004h> print("ref final qvel max", np.abs(ref[157:157+118]).max(), "qpos tail", np.round(ref[157:],3)[:5])
+[?2004l[?2004h> for p in ['/tmp/v_twist.xml','/tmp/v_vmax.xml','/tmp/v_nodamp.xml']:
+[?2004l[?2004h>     s = sim(p)
+[?2004l[?2004h>     dd = np.abs(s-ref)
+[?2004l[?2004h>     print(p, "maxdiff", dd.max(), "norm", np.linalg.norm(dd), "allclose1e-5", np.allclose(s, ref, atol=1e-5))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/cmp.py
+[?2004lref final qvel max 0.528349937787616 qpos tail [-0.528  0.001  0.024 -0.007  0.   ]
+/tmp/v_twist.xml maxdiff 0.36519604468637734 norm 0.676810862719362 allclose1e-5 False
+/tmp/v_vmax.xml maxdiff 0.0 norm 0.0 allclose1e-5 True
+WARNING: Nan, Inf or huge value in QACC at DOF 115. The simulation is unstable. Time = 0.0040.
+
+/tmp/v_nodamp.xml maxdiff 1133.947411281389 norm 2113.019284535039 allclose1e-5 False
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/dump6.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> def g(o,n,dflt=None):
+[?2004l[?2004h>     try: return getattr(o,n)
+[?2004l[?2004h>     except Exception: return dflt
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> for a in ["nflex","nflexelem","nflexedge","nflexevpair","nflexnode","nflexshelldata","npluginstate","npluginattr","nuserdata","na","nu","nq"]:
+[?2004l[?2004h>     print(a, g(m,a))
+[?2004l[?2004h> try:
+[?2004l[?2004h>     p = m.plugin(0); print("plugin:", p)
+[?2004l[?2004h> except Exception as e: print("plugin err", e)
+[?2004l[?2004h> print("dof_damping:", g(m,'dof_damping'))
+[?2004l[?2004h> print("dof_frictionloss:", g(m,'dof_frictionloss'))
+[?2004l[?2004h> print("dof_solref:", g(m,'dof_solref')[:4], "dof_solimp:", g(m,'dof_solimp')[:2])
+[?2004l[?2004h> print("eq_type:", g(m,'eq_type'), "eq_objtype:", g(m,'eq_objtype'), "eq_obj1id:", g(m,'eq_obj1id'), "eq_obj2id:", g(m,'eq_obj2id'))
+[?2004l[?2004h> print("eq_data:", g(m,'eq_data'), "eq_solref:", g(m,'eq_solref'), "eq_solimp:", np.round(g(m,'eq_solimp'),5))
+[?2004l[?2004h> print("eq_active0:", g(m,'eq_active0'))
+[?2004l[?2004h> print("geom_bodyid:", g(m,'geom_bodyid').tolist())
+[?2004l[?2004h> print("geom_type:", g(m,'geom_type').tolist(), "sizes:", np.round(g(m,'geom_size'),5).tolist())
+[?2004l[?2004h> print("geom pos:", np.round(g(m,'geom_pos'),4).tolist()[:3], "...")
+[?2004l[?2004h> print("geom condim/friction:", g(m,'geom_condim'), np.round(g(m,'geom_friction'),4))
+[?2004l[?2004h> print("site_bodyid:", g(m,'site_bodyid'), "site_pos:", g(m,'site_pos'), "site_type:", g(m,'site_type'))
+[?2004l[?2004h> print("jnt_bodyid:", g(m,'jnt_bodyid'), "jnt_dofadr:", g(m,'jnt_dofadr'), "jnt_qposadr:", g(m,'jnt_qposadr'))
+[?2004l[?2004h> print("body_parentid:", g(m,'body_parentid').tolist())
+[?2004l[?2004h> print("body_mass:", np.round(g(m,'body_mass'),6).tolist())
+[?2004l[?2004h> print("body_inertia:", np.round(g(m,'body_inertia'),8).tolist()[:5])
+[?2004l[?2004h> print("actuator gear:", g(m,'actuator_gear'), "gear trntype:", g(m,'actuator_trntype'), "trnid:", g(m,'actuator_trnid'))
+[?2004l[?2004h> full=[a for a in dir(d) if isinstance(getattr(d,a), np.ndarray)]
+[?2004l[?2004h> print("data attrs rest:", full[60:])
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/dump6.py
+[?2004lnflex 0
+nflexelem 0
+nflexedge 0
+nflexevpair 0
+nflexnode 0
+nflexshelldata 0
+npluginstate 0
+npluginattr 14
+nuserdata 0
+na 0
+nu 1
+nq 157
+plugin err 'numpy.ndarray' object is not callable
+dof_damping: [0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.1  ]
+dof_frictionloss: [0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.
+ 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.
+ 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.
+ 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.
+ 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
+dof_solref: [[0.02 1.  ]
+ [0.02 1.  ]
+ [0.02 1.  ]
+ [0.02 1.  ]] dof_solimp: [[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+ [9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]]
+eq_type: [0] eq_objtype: [1] eq_obj1id: [40] eq_obj2id: [41]
+eq_data: [[2.50000000e-02 0.00000000e+00 0.00000000e+00 2.38418579e-08
+  0.00000000e+00 0.00000000e+00 0.00000000e+00 0.00000000e+00
+  0.00000000e+00 0.00000000e+00 1.00000000e+00]] eq_solref: [[0.02 1.  ]] eq_solimp: [[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]]
+eq_active0: [1]
+geom_bodyid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41]
+geom_type: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2] sizes: [[0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.005, 0.0125, 0.0], [0.01, 0.0, 0.0]]
+geom pos: [[0.0125, 0.0, 0.0], [0.0125, 0.0, 0.0], [0.0125, 0.0, 0.0]] ...
+geom condim/friction: [1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+ 1 1 1 3] [[1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]
+ [1.e+00 5.e-03 1.e-04]]
+site_bodyid: [ 1 40] site_pos: [[0.         0.         0.        ]
+ [0.02499998 0.         0.        ]] site_type: [2 2]
+jnt_bodyid: [ 2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25
+ 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41] jnt_dofadr: [  0   3   6   9  12  15  18  21  24  27  30  33  36  39  42  45  48  51
+  54  57  60  63  66  69  72  75  78  81  84  87  90  93  96  99 102 105
+ 108 111 114 117] jnt_qposadr: [  0   4   8  12  16  20  24  28  32  36  40  44  48  52  56  60  64  68
+  72  76  80  84  88  92  96 100 104 108 112 116 120 124 128 132 136 140
+ 144 148 152 156]
+body_parentid: [0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 0]
+body_mass: [0.0, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.002487, 0.004189]
+body_inertia: [[0.0, 0.0, 0.0], [2.3e-07, 2.3e-07, 3e-08], [2.3e-07, 2.3e-07, 3e-08], [2.3e-07, 2.3e-07, 3e-08], [2.3e-07, 2.3e-07, 3e-08]]
+actuator gear: [[0. 0. 0. 1. 0. 0.]] gear trntype: [4] trnid: [[ 1 -1]]
+data attrs rest: ['energy', 'eq_active', 'flexedge_J', 'flexedge_J_colind', 'flexedge_J_rowadr', 'flexedge_J_rownnz', 'flexedge_length', 'flexedge_velocity', 'flexelem_aabb', 'flexvert_xpos', 'geom_xmat', 'geom_xpos', 'iLD', 'iLDiagInv', 'iM', 'iM_colind', 'iM_rowadr', 'iM_rownnz', 'iacc', 'iacc_smooth', 'iefc_D', 'iefc_J', 'iefc_JT', 'iefc_JT_colind', 'iefc_JT_rowadr', 'iefc_JT_rownnz', 'iefc_JT_rowsuper', 'iefc_J_colind', 'iefc_J_rowadr', 'iefc_J_rownnz', 'iefc_J_rowsuper', 'iefc_R', 'iefc_aref', 'iefc_force', 'iefc_frictionloss', 'iefc_id', 'iefc_state', 'iefc_type', 'ifrc_constraint', 'ifrc_smooth', 'island_dofadr', 'island_idofadr', 'island_iefcadr', 'island_ne', 'island_nefc', 'island_nf', 'island_nv', 'light_xdir', 'light_xpos', 'mapD2M', 'mapM2D', 'mapM2M', 'map_dof2idof', 'map_efc2iefc', 'map_idof2dof', 'map_iefc2efc', 'maxuse_threadstack', 'mocap_pos', 'mocap_quat', 'moment_colind', 'moment_rowadr', 'moment_rownnz', 'plugin', 'plugin_data', 'plugin_state', 'qDeriv', 'qH', 'qHDiagInv', 'qLD', 'qLDiagInv', 'qLU', 'qM', 'qacc', 'qacc_smooth', 'qacc_warmstart', 'qfrc_actuator', 'qfrc_applied', 'qfrc_bias', 'qfrc_constraint', 'qfrc_damper', 'qfrc_fluid', 'qfrc_gravcomp', 'qfrc_inverse', 'qfrc_passive', 'qfrc_smooth', 'qfrc_spring', 'qpos', 'qvel', 'sensordata', 'site_xmat', 'site_xpos', 'solver_fwdinv', 'solver_niter', 'solver_nnz', 'subtree_angmom', 'subtree_com', 'subtree_linvel', 'ten_J', 'ten_J_colind', 'ten_J_rowadr', 'ten_J_rownnz', 'ten_length', 'ten_velocity', 'ten_wrapadr', 'ten_wrapnum', 'tendon_efcadr', 'userdata', 'wrap_obj', 'wrap_xpos', 'xanchor', 'xaxis', 'xfrc_applied', 'ximat', 'xipos', 'xmat', 'xpos', 'xquat']
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/build_native.py << 'EOF'
+[?2004l[?2004h> import sys
+[?2004l[?2004h> kt, kb = (float(x) for x in sys.argv[1:3]) if len(sys.argv) >= 3 else (0.0, 0.0)
+[?2004l[?2004h> bodies = []
+[?2004l[?2004h> bodies.append('''    <body name="B_first" pos="-0.3 0 0.6">
+[?2004l[?2004h>       <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" rgba="0.8 0.2 0.1 1" condim="1"/>
+[?2004l[?2004h>       <site name="S_first" pos="0 0 0"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> for i in range(39):
+[?2004l[?2004h>     last = (i == 38)
+[?2004l[?2004h>     name = "B_last" if last else ("B_%d" % (i+1))
+[?2004l[?2004h>     site = '\n      <site name="S_last" pos="0.025 0 0"/>' if last else ''
+[?2004l[?2004h>     bodies.append('    <body name="%s" pos="0.025 0 0">\n      <joint type="ball" damping="0.015" axis="0 0 1" stiffness="%s %s %s"/>\n      <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" rgba="0.8 0.2 0.1 1" condim="1"/>%s\n    </body>' % (name, kt, kb, kb, site))
+[?2004l[?2004h> bodies.append('''    <body name="slider" pos="0.7 0 0.6">
+[?2004l[?2004h>       <joint type="slide" axis="1 0 0" damping="0.1"/>
+[?2004l[?2004h>       <geom size="0.01"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> xml = '''<mujoco model="CableNative">
+[?2004l[?2004h>   <statistic center="0 0 .3" extent="1"/>
+[?2004l[?2004h>   <visual>
+[?2004l[?2004h>     <global elevation="-30"/>
+[?2004l[?2004h>   </visual>
+[?2004l[?2004h>   <compiler autolimits="true"/>
+[?2004l[?2004h>   <size memory="2M"/>
+[?2004l[?2004h>   <worldbody>
+[?2004l[?2004h> %s
+[?2004l[?2004h>   </worldbody>
+[?2004l[?2004h>   <equality>
+[?2004l[?2004h>     <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>
+[?2004l[?2004h>   </equality>
+[?2004l[?2004h>   <contact>
+[?2004l[?2004h>     <exclude body1="B_last" body2="slider"/>
+[?2004l[?2004h>   </contact>
+[?2004l[?2004h>   <actuator>
+[?2004l[?2004h>     <motor site="S_last" gear="0 0 0 1 0 0" ctrlrange="-.03 .03"/>
+[?2004l[?2004h>   </actuator>
+[?2004l[?2004h> </mujoco>''' % chr(10).join(bodies)
+[?2004l[?2004h> open('/app/native.xml','w').write(xml)
+[?2004l[?2004h> print("written native.xml kt, kb =", kt, kb)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/build_native.py 0 0
+[?2004lwritten native.xml kt, kb = 0.0 0.0
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/force_extract.py << 'EOF'
+[?2004l0:6],8), "doof12-17:", np.round(F[12:18],8))
+print("F slider(117):", F[117])
+nz = np.nonzero(np.abs(F)>1e-9)[0]
+print("F nonzero dofs count:", len(nz), nz[:12])
+qref = dref.qpos[:117].reshape(39,4)
+ang = 2*np.arctan2(np.linalg.norm(qref[:,:3],axis=1), np.clip(qref[:,3],0,1))
+print("rest angles sample:", np.round(ang[:8],5), "max", ang.max())
+EOF
+python3 /app/force_extract.py
+[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> mnat = mujoco.MjModel.from_xml_path('/app/native.xml')
+[?2004l[?2004h> dref, dnat = mujoco.MjData(mref), mujoco.MjData(mnat)
+[?2004l[?2004h> print("qpos0 ref max abs:", np.abs(mref.qpos0).max(), " native:", np.abs(mnat.qpos0).max())
+[?2004l[?2004h> print("nq/nu nativE", mnat.nq, mnat.nu, " na ref/nat", len(dref.ctrl), len(dnat.ctrl))
+[?2004l[?2004h> rng = np.random.default_rng(7)
+[?2004l[?2004h> jit = rng.normal(0,0.01,size=mref.nq)
+[?2004l[?2004h> dref.qpos[:] = jit.copy(); dnat.qpos[:] = jit.copy()
+[?2004l[?2004h> dref.qvel[:] = 0; dnat.qvel[:] = 0
+[?2004l[?2004h> mujoco.mj_forward(mref, dref)
+[?2004l[?2004h> mujoco.mj_forward(mnat, dnat)
+[?2004l[?2004h> print("has qM", hasattr(dref,'qM'), getattr(dref,'qM',None).shape if hasattr(dref,'qM') else None)
+[?2004l[?2004h> print("M identical:", np.allclose(dref.qM, dnat.qM))
+[?2004l[?2004h> a_ref = dref.qacc.copy(); a_nat = dnat.qacc.copy()
+[?2004l[?2004h> F = dref.qM.dot(a_ref) - dnat.qM.dot(a_nat)
+[?2004l[?2004h> print("F_plug norm", np.linalg.norm(F), "max", np.abs(F).max())
+[?2004l[?2004h> print("first 15 F_plug:", np.round(F[:15],6))
+[?2004l[?2004h> print("F pattern dofs 0-6:", np.round(F[0:6],8), "doof12-17:", np.round(F[12:18],8))
+[?2004l[?2004h> print("F slider(117):", F[117])
+[?2004l[?2004h> nz = np.nonzero(np.abs(F)>1e-9)[0]
+[?2004l[?2004h> print("F nonzero dofs count:", len(nz), nz[:12])
+[?2004l[?2004h> qref = dref.qpos[:117].reshape(39,4)
+[?2004l[?2004h> ang = 2*np.arctan2(np.linalg.norm(qref[:,:3],axis=1), np.clip(qref[:,3],0,1))
+[?2004l[?2004h> print("rest angles sample:", np.round(ang[:8],5), "max", ang.max())
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/force_extract.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/force_extract.py"[0m, line [35m3[0m, in [35m<module>[0m
+    mnat = mujoco.MjModel.from_xml_path('/app/native.xml')
+[1;35mValueError[0m: [35mXML Error: attribute 'stiffness' has too much data
+Element 'joint', line 14
+[0m
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/build_native.py << 'EOF'
+[?2004l[?2004h> import sys
+[?2004l[?2004h> kt, kb = (float(x) for x in sys.argv[1:3]) if len(sys.argv) >= 3 else (0.0, 0.0)
+[?2004l[?2004h> bodies = []
+[?2004l[?2004h> bodies.append('''    <body name="B_first" pos="-0.3 0 0.6">
+[?2004l[?2004h>       <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" rgba="0.8 0.2 0.1 1" condim="1"/>
+[?2004l[?2004h>       <site name="S_first" pos="0 0 0"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> for i in range(39):
+[?2004l[?2004h>     last = (i == 38)
+[?2004l[?2004h>     name = "B_last" if last else ("B_%d" % (i+1))
+[?2004l[?2004h>     site = '\n      <site name="S_last" pos="0.025 0 0"/>' if last else ''
+[?2004l[?2004h>     if kt == kb:
+[?2004l[?2004h>         jstiff = " stiffness="%s""" % kt if kt != 0 else ""
+[?2004l[?2004h>         body_j = '      <joint type="ball" damping="0.015" axis="0 0 1"%s/>%s' % (jstiff, site)
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         body_j = ('      <joint type="ball" damping="0.015" axis="0 0 1">\n'
+[?2004l[?2004h>                   '        <dof stiffness="%s"/>\n' % kt +
+[?2004l[?2004h>                   '        <dof stiffness="%s"/>\n' % kb +
+[?2004l[?2004h>                   '        <dof stiffness="%s"/>\n' % kb +
+[?2004l[?2004h>                   '      </joint>%s' % site)
+[?2004l[?2004h>     bodies.append('    <body name="%s" pos="0.025 0 0">\n%s\n      <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" rgba="0.8 0.2 0.1 1" condim="1"/>\n    </body>' % (name, body_j))
+[?2004l[?2004h> bodies.append('''    <body name="slider" pos="0.7 0 0.6">
+[?2004l[?2004h>       <joint type="slide" axis="1 0 0" damping="0.1"/>
+[?2004l[?2004h>       <geom size="0.01"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> xml = '''<mujoco model="CableNative">
+[?2004l[?2004h>   <statistic center="0 0 .3" extent="1"/>
+[?2004l[?2004h>   <visual>
+[?2004l[?2004h>     <global elevation="-30"/>
+[?2004l[?2004h>   </visual>
+[?2004l[?2004h>   <compiler autolimits="true"/>
+[?2004l[?2004h>   <size memory="2M"/>
+[?2004l[?2004h>   <worldbody>
+[?2004l[?2004h> %s
+[?2004l[?2004h>   </worldbody>
+[?2004l[?2004h>   <equality>
+[?2004l[?2004h>     <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>
+[?2004l[?2004h>   </equality>
+[?2004l[?2004h>   <contact>
+[?2004l[?2004h>     <exclude body1="B_last" body2="slider"/>
+[?2004l[?2004h>   </contact>
+[?2004l[?2004h>   <actuator>
+[?2004l[?2004h>     <motor site="S_last" gear="0 0 0 1 0 0" ctrlrange="-.03 .03"/>
+[?2004l[?2004h>   </actuator>
+[?2004l[?2004h> </mujoco>''' % chr(10).join(bodies)
+[?2004l[?2004h> open('/app/native.xml','w').write(xml)
+[?2004l[?2004h> print("written native.xml kt, kb =", kt, kb)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/build_native.py 0 0 && python3 /app/force_extract.py
+[?2004l  File [35m"/app/build_native.py"[0m, line [35m13[0m
+    jstiff = " stiffness="%s[1;31m"[0m"" % kt if kt != 0 else ""
+                            [1;31m^[0m
+[1;35mSyntaxError[0m: [35munterminated triple-quoted string literal (detected at line 47)[0m
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/build_native.py << 'EOF'
+[?2004l[?2004h> import sys
+[?2004l[?2004h> kt, kb = (float(x) for x in sys.argv[1:3]) if len(sys.argv) >= 3 else (0.0, 0.0)
+[?2004l[?2004h> bodies = []
+[?2004l[?2004h> bodies.append('''    <body name="B_first" pos="-0.3 0 0.6">
+[?2004l[?2004h>       <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" rgba="0.8 0.2 0.1 1" condim="1"/>
+[?2004l[?2004h>       <site name="S_first" pos="0 0 0"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> for i in range(39):
+[?2004l[?2004h>     last = (i == 38)
+[?2004l[?2004h>     name = "B_last" if last else ("B_%d" % (i+1))
+[?2004l[?2004h>     site = '\n      <site name="S_last" pos="0.025 0 0"/>' if last else ''
+[?2004l[?2004h>     if kt == kb:
+[?2004l[?2004h>         jstiff = (' stiffness="%s"' % kt) if kt != 0 else ''
+[?2004l[?2004h>         joint = '      <joint type="ball" damping="0.015" axis="0 0 1"%s/>%s' % (jstiff, site)
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         joint = ('      <joint type="ball" damping="0.015" axis="0 0 1">\n'
+[?2004l[?2004h>                  '        <dof stiffness="%s"/>\n' % kt +
+[?2004l[?2004h>                  '        <dof stiffness="%s"/>\n' % kb +
+[?2004l[?2004h>                  '        <dof stiffness="%s"/>\n' % kb +
+[?2004l[?2004h>                  '      </joint>%s' % site)
+[?2004l[?2004h>     body = ('    <body name="%s" pos="0.025 0 0">\n%s\n'
+[?2004l[?2004h>             '      <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" rgba="0.8 0.2 0.1 1" condim="1"/>\n'
+[?2004l[?2004h>             '    </body>') % (name, joint)
+[?2004l[?2004h>     bodies.append(body)
+[?2004l[?2004h> bodies.append('''    <body name="slider" pos="0.7 0 0.6">
+[?2004l[?2004h>       <joint type="slide" axis="1 0 0" damping="0.1"/>
+[?2004l[?2004h>       <geom size="0.01"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> xml = '''<mujoco model="CableNative">
+[?2004l[?2004h>   <statistic center="0 0 .3" extent="1"/>
+[?2004l[?2004h>   <visual>
+[?2004l[?2004h>     <global elevation="-30"/>
+[?2004l[?2004h>   </visual>
+[?2004l[?2004h>   <compiler autolimits="true"/>
+[?2004l[?2004h>   <size memory="2M"/>
+[?2004l[?2004h>   <worldbody>
+[?2004l[?2004h> %s
+[?2004l[?2004h>   </worldbody>
+[?2004l[?2004h>   <equality>
+[?2004l[?2004h>     <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>
+[?2004l[?2004h>   </equality>
+[?2004l[?2004h>   <contact>
+[?2004l[?2004h>     <exclude body1="B_last" body2="slider"/>
+[?2004l[?2004h>   </contact>
+[?2004l[?2004h>   <actuator>
+[?2004l[?2004h>     <motor site="S_last" gear="0 0 0 1 0 0" ctrlrange="-.03 .03"/>
+[?2004l[?2004h>   </actuator>
+[?2004l[?2004h> </mujoco>''' % chr(10).join(bodies)
+[?2004l[?2004h> open('/app/native.xml','w').write(xml)
+[?2004l[?2004h> print("written native.xml kt, kb =", kt, kb)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/build_native.py 0 0 && python3 /app/force_extract.py
+[?2004lwritten native.xml kt, kb = 0.0 0.0
+qpos0 ref max abs: 1.0  native: 1.0
+nq/nu nativE 157 1  na ref/nat 1 1
+has qM True (6904,)
+Traceback (most recent call last):
+  File [35m"/app/force_extract.py"[0m, line [35m14[0m, in [35m<module>[0m
+    print("M identical:", [31mnp.allclose[0m[1;31m(dref.qM, dnat.qM)[0m)
+                          [31m~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^[0m
+  File [35m"/usr/local/lib/python3.13/site-packages/numpy/_core/numeric.py"[0m, line [35m2365[0m, in [35mallclose[0m
+    res = all([31misclose[0m[1;31m(a, b, rtol=rtol, atol=atol, equal_nan=equal_nan)[0m)
+              [31m~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+  File [35m"/usr/local/lib/python3.13/site-packages/numpy/_core/numeric.py"[0m, line [35m2496[0m, in [35misclose[0m
+    result = (less_equal(abs([31mx [0m[1;31m-[0m[31m y[0m), atol + rtol * abs(y))
+                             [31m~~[0m[1;31m^[0m[31m~~[0m
+[1;35mValueError[0m: [35moperands could not be broadcast together with shapes (6904,) (235,) [0m
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/force_extract.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> mnat = mujoco.MjModel.from_xml_path('/app/native.xml')
+[?2004l[?2004h> dref, dnat = mujoco.MjData(mref), mujoco.MjData(mnat)
+[?2004l[?2004h> print("dims:", dref.M.shape, dref.M_rowadr.shape, dref.M_colind.shape, "nM?", dref.nM if hasattr(dref,'nM') else None)
+[?2004l[?2004h> def denseM(d):
+[?2004l[?2004h>     nv = d.nv if hasattr(d,'nv') else len(d.qvel)
+[?2004l[?2004h>     M = np.zeros((len(d.qvel), len(d.qvel)))
+[?2004l[?2004h>     ra, nnz, ci = d.M_rowadr, d.M_rownnz, d.M
+[?2004l[?2004h>     if ra is None or nnz is None:
+[?2004l[?2004h>         return None
+[?2004l[?2004h>     for i in range(len(d.qvel)):
+[?2004l[?2004h>         a = ra[i]; n = nnz[i]
+[?2004l[?2004h>         M[i, d.M_colind[a:a+n]] = d.M[a:a+n]
+[?2004l[?2004h>     return M
+[?2004l[?2004h> Mref = denseM(dref); Mnat = denseM(dnat)
+[?2004l[?2004h> print("M shapes ok:", Mref is not None, Mnat is not None)
+[?2004l[?2004h> print("M identical:", np.allclose(Mref, Mnat))
+[?2004l[?2004h> rng = np.random.default_rng(7)
+[?2004l[?2004h> jit = rng.normal(0,0.01,size=mref.nq)
+[?2004l[?2004h> dref.qpos[:] = jit.copy(); dnat.qpos[:] = jit.copy()
+[?2004l[?2004h> dref.qvel[:] = 0; dnat.qvel[:] = 0
+[?2004l[?2004h> mujoco.mj_forward(mref, dref)
+[?2004l[?2004h> mujoco.mj_forward(mnat, dnat)
+[?2004l[?2004h> F = Mref.dot(dref.qacc) - Mnat.dot(dnat.qacc)
+[?2004l[?2004h> print("F_plug norm", np.linalg.norm(F), "max", np.abs(F).max())
+[?2004l[?2004h> print("F dofs 0-12:", np.round(F[0:13],8))
+[?2004l[?2004h> print("F dofs 30-36:", np.round(F[30:37],8), "slider:", F[117])
+[?2004l[?2004h> nz = np.nonzero(np.abs(F)>1e-12)[0]
+[?2004l[?2004h> print("F nonzero dofs count:", len(nz), nz[:14])
+[?2004l[?2004h> qref = dref.qpos[:117].reshape(39,4)
+[?2004l[?2004h> ang = 2*np.arctan2(np.linalg.norm(qref[:,:3],axis=1), np.clip(qref[:,3],0,1))
+[?2004l[?2004h> print("rest angles sample:", np.round(ang[:7],5), "max", ang.max())
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/force_extract.py
+[?2004ldims: (6904,) (118,) (6904,) nM? None
+M shapes ok: True True
+M identical: True
+F_plug norm 0.0 max 0.0
+F dofs 0-12: [0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0. 0.]
+F dofs 30-36: [0. 0. 0. 0. 0. 0. 0.] slider: 0.0
+F nonzero dofs count: 0 []
+Traceback (most recent call last):
+  File [35m"/app/force_extract.py"[0m, line [35m31[0m, in [35m<module>[0m
+    qref = dref.qpos[:117].reshape(39,4)
+[1;35mValueError[0m: [35mcannot reshape array of size 117 into shape (39,4)[0m
+[?2004hroot@a1d3bec55139:/tmp# python3 /app/build_native.py 0 0 && python3 /app/build_native.py 1 0 && cp /app/native.xml /tmp/shape_x_only.xml 2>/dev/null; echo noop
+[?2004lwritten native.xml kt, kb = 0.0 0.0
+written native.xml kt, kb = 1.0 0.0
+noop
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/bld2.py << 'EOF'
+[?2004l[?2004h> # variant builder: per-dof stiffness vector sx, ey, sz (same for all 39 joints)
+[?2004l[?2004h> sx, sy, sz = (float(x) for x in __import__('sys').argv[1:4])
+[?2004l[?2004h> bodies = []
+[?2004l[?2004h> bodies.append('''    <body name="B_first" pos="-0.3 0 0.6">
+[?2004l[?2004h>       <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" rgba="0.8 0.2 0.1 1" condim="1"/>
+[?2004l[?2004h>       <site name="S_first" pos="0 0 0"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> for i in range(39):
+[?2004l[?2004h>     last = (i == 38)
+[?2004l[?2004h>     name = "B_last" if last else ("B_%d" % (i+1))
+[?2004l[?2004h>     site = '\n      <site name="S_last" pos="0.025 0 0"/>' if last else ''
+[?2004l[?2004h>     joint = ('      <joint type="ball" damping="0.015" axis="0 0 1">\n'
+[?2004l[?2004h>              '        <dof stiffness="%s"/>\n' % sx +
+[?2004l[?2004h>              '        <dof stiffness="%s"/>\n' % sy +
+[?2004l[?2004h>              '        <dof stiffness="%s"/>\n' % sz +
+[?2004l[?2004h>              '      </joint>%s' % site)
+[?2004l[?2004h>     body = ('    <body name="%s" pos="0.025 0 0">\n%s\n'
+[?2004l[?2004h>             '      <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" rgba="0.8 0.2 0.1 1" condim="1"/>\n'
+[?2004l[?2004h>             '    </body>') % (name, joint)
+[?2004l[?2004h>     bodies.append(body)
+[?2004l[?2004h> bodies.append('''    <body name="slider" pos="0.7 0 0.6">
+[?2004l[?2004h>       <joint type="slide" axis="1 0 0" damping="0.1"/>
+[?2004l[?2004h>       <geom size="0.01"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> xml = '''<mujoco model="CableNative">
+[?2004l[?2004h>   <compiler autolimits="true"/>
+[?2004l[?2004h>   <worldbody>
+[?2004l[?2004h> %s
+[?2004l[?2004h>   </worldbody>
+[?2004l[?2004h>   <equality>
+[?2004l[?2004h>     <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>
+[?2004l[?2004h>   </equality>
+[?2004l[?2004h>   <contact>
+[?2004l[?2004h>     <exclude body1="B_last" body2="slider"/>
+[?2004l[?2004h>   </contact>
+[?2004l[?2004h>   <actuator>
+[?2004l[?2004h>     <motor site="S_last" gear="0 0 0 1 0 0" ctrlrange="-.03 .03"/>
+[?2004l[?2004h>   </actuator>
+[?2004l[?2004h> </mujoco>''' % chr(10).join(bodies)
+[?2004l[?2004h> out = __import__('sys').argv[4]
+[?2004l[?2004h> open(out,'w').write(xml)
+[?2004l[?2004h> print(out, "written with", sx, sy, sz)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/bld2.py 0 0 0 /app/nat0.xml
+[?2004l/app/nat0.xml written with 0.0 0.0 0.0
+[?2004hroot@a1d3bec55139:/tmp# python3 /app/bld2.py 1 0 0 /tmp/shape_x.xml
+[?2004l/tmp/shape_x.xml written with 1.0 0.0 0.0
+[?2004hroot@a1d3bec55139:/tmp# python3 /app/bld2.py 0 1 0 /tmp/shape_y.xml
+[?2004l/tmp/shape_y.xml written with 0.0 1.0 0.0
+[?2004hroot@a1d3bec55139:/tmp# python3 /app/bld2.py 0 0 1 /tmp/shape_z.xml
+[?2004l/tmp/shape_z.xml written with 0.0 0.0 1.0
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/step1.py << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> def denseM(d):
+[?2004l[?2004h>     M = np.zeros((len(d.qvel), len(d.qvel)))
+[?2004l[?2004h>     ra, nnz, ci, vals = d.M_rowadr, d.M_rownnz, d.M_colind, d.M
+[?2004l[?2004h>     for i in range(len(d.qvel)):
+[?2004l[?2004h>         a = ra[i]; n = nnz[i]
+[?2004l[?2004h>         M[i, ci[a:a+n]] = vals[a:a+n]
+[?2004l[?2004h>     return M
+[?2004l[?2004h> def state_of(path):
+[?2004l[?2004h>     m = mujoco.MjModel.from_xml_path(path)
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     return m, d
+[?2004l[?2004h> paths = {'ref':'/app/model_ref.xml','n0':'/app/nat0.xml','sx':'/tmp/shape_x.xml','sy':'/tmp/shape_y.xml','sz':'/tmp/shape_z.xml'}
+[?2004l[?2004h> ms = {}
+[?2004l[?2004h> for k,p in paths.items():
+[?2004l[?2004h>     m,d = state_of(p); ms[k]=(m,d)
+[?2004l[?2004h> M0 = denseM(ms['n0'][1])
+[?2004l[?2004h> print("M equal across models:", all(np.allclose(M0, denseM(ms[k][1])) for k in paths))
+[?2004l[?2004h> for seed in [7, 123]:
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     jit = rng.normal(0,0.01,size=157)
+[?2004l[?2004h>     for k in paths:
+[?2004l[?2004h>         m,d = ms[k]
+[?2004l[?2004h>         d.reset(ms[k][0])
+[?2004l[?2004h>         d.qpos[:] = jit
+[?2004l[?2004h>         d.qvel[:] = 0
+[?2004l[?2004h>         mujoco.mj_forward(m,d)
+[?2004l[?2004h>         mujoco.mj_step(m,d)
+[?2004l[?2004h>     a = {k: ms[k][1].qacc.copy() for k in paths}
+[?2004l[?2004h>     Fpl = M0.dot(a['ref']) - M0.dot(a['n0'])
+[?2004l[?2004h>     Fx  = M0.dot(a['sx'])  - M0.dot(a['n0'])
+[?2004l[?2004h>     Fy  = M0.dot(a['sy'])  - M0.dot(a['n0'])
+[?2004l[?2004h>     Fz  = M0.dot(a['sz'])  - M0.dot(a['n0'])
+[?2004l[?2004h>     print("seed", seed, "Fpl norm", round(np.linalg.norm(Fpl),6), "Fx", round(np.linalg.norm(Fx),6), "Fy", round(np.linalg.norm(Fy),6), "Fz", round(np.linalg.norm(Fz),6))
+[?2004l[?2004h>     A = np.column_stack([Fx, Fy, Fz])
+[?2004l[?2004h>     c, res, rank, sv = np.linalg.lstsq(A, Fpl, rcond=None)
+[?2004l[?2004h>     pred = A.dot(c)
+[?2004l[?2004h>     err = Fpl - pred
+[?2004l[?2004h>     print("  coeffs (kt,kby,kbz):", np.round(c,8), "resid norm:", np.linalg.norm(err), "max:", np.abs(err).max())
+[?2004l[?2004h>     # per-joint residual check
+[?2004l[?2004h>     print("  resid per joint (first 6):", np.round(np.array([np.linalg.norm(err[i*3:i*3+3]) for i in range(6)]),8))
+[?2004l[?2004h>     # qvel/qpos after step diffs
+[?2004l[?2004h>     for k in ['n0','sx','ref']:
+[?2004l[?2004h>         dd = ms[k][1]
+[?2004l[?2004h>         print("  ", k, "dqpos after step:", np.round((dd.qpos - (jit if k!='ref' else jit))[:6],6), "ncon:", dd.ncon)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/step1.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/step1.py"[0m, line [35m16[0m, in [35m<module>[0m
+    m,d = [31mstate_of[0m[1;31m(p)[0m; ms[k]=(m,d)
+          [31m~~~~~~~~[0m[1;31m^^^[0m
+  File [35m"/app/step1.py"[0m, line [35m10[0m, in [35mstate_of[0m
+    m = mujoco.MjModel.from_xml_path(path)
+[1;35mValueError[0m: [35mXML Error: Schema violation: unrecognized element
+Element 'dof', line 10
+[0m
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/tune_scan.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> m0 = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> o = m0.opt
+[?2004l[?2004h> print({k: getattr(o,k) for k in dir(o) if not k.startswith('_') and isinstance(getattr(o,k), (int, float))})
+[?2004l[?2004h> st = mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> nsize = mujoco.mj_stateSize(m0, st)
+[?2004l[?2004h> def run(m, seed, tag=""):
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     nstep = int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0 = time.perf_counter()
+[?2004l[?2004h>     maxcon = 0; pairset = set()
+[?2004l[?2004h>     for i in range(nstep):
+[?2004l[?2004h>         mujoco.mj_step(m,d)
+[?2004l[?2004h>         if d.ncon > maxcon: maxcon = d.ncon
+[?2004l[?2004h>         if d.ncon: 
+[?2004l[?2004h>             for c in d.contact.geom.reshape(-1,2):
+[?2004l[?2004h>                 pairset.add(tuple(int(x) for x in c))
+[?2004l[?2004h>     t1 = time.perf_counter()
+[?2004l[?2004h>     state = np.zeros(nsize); mujoco.mj_getState(m,d,state,st)
+[?2004l[?2004h>     print(f"  {tag}: {nstep} steps, {(t1-t0)*1e3:.1f} ms, max ncon={maxcon}, pairs={sorted(pairset)[:8]}{'...' if len(pairset)>8 else ''}")
+[?2004l[?2004h>     return state, t1-t0
+[?2004l[?2004h> ref_state, ref_t = run(m0, 7)
+[?2004l[?2004h> print(f"baseline avg step ms: {ref_t/1000*1e3:.3f}")
+[?2004l[?2004h> # accuracy of timestep changes
+[?2004l[?2004h> for dt in [0.003, 0.004, 0.006, 0.008]:
+[?2004l[?2004h>     m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h>     m.opt.timestep = dt
+[?2004l[?2004h>     s, t = run(m, 7, f"dt={dt}")
+[?2004l[?2004h>     print(f"    vs ref: maxdiff {np.abs(s-ref_state).max():.2e} allclose {np.allclose(s, ref_state, atol=1e-5)} time {t/ref_t:.3f}")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/tune_scan.py
+[?2004l{'apirate': 100.0, 'ccd_iterations': 50, 'ccd_tolerance': 1e-06, 'cone': 0, 'density': 0.0, 'disableactuator': 0, 'disableflags': 0, 'enableflags': 0, 'impratio': 1.0, 'integrator': 0, 'iterations': 100, 'jacobian': 2, 'ls_iterations': 50, 'ls_tolerance': 0.01, 'noslip_iterations': 0, 'noslip_tolerance': 1e-06, 'o_margin': 0.0, 'sdf_initpoints': 40, 'sdf_iterations': 10, 'solver': 2, 'timestep': 0.002, 'tolerance': 1e-08, 'viscosity': 0.0}
+  : 1000 steps, 459.3 ms, max ncon=0, pairs=[]
+baseline avg step ms: 0.459
+  dt=0.003: 666 steps, 296.3 ms, max ncon=0, pairs=[]
+    vs ref: maxdiff 2.00e-03 allclose False time 0.645
+  dt=0.004: 500 steps, 228.8 ms, max ncon=0, pairs=[]
+    vs ref: maxdiff 1.37e-03 allclose False time 0.498
+  dt=0.006: 333 steps, 146.9 ms, max ncon=0, pairs=[]
+    vs ref: maxdiff 3.72e-03 allclose False time 0.320
+  dt=0.008: 250 steps, 119.2 ms, max ncon=0, pairs=[]
+    vs ref: maxdiff 4.35e-03 allclose False time 0.259
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/tune2.py << 'EOF'
+[?2004ln(its))
+# 2) disable contact
+m2 = load('/app/model_ref.xml')
+m2.opt.disableflags |= DSBL_CONTACT
+s2, t2, d2 = sim(m2)
+print(f"ref contact-off: {t2*1e3:.1f} ms  ({t2/t:.3f} of base) maxdiff vs base {np.abs(s2-s).max():.2e}")
+# 3) iterations variations
+for iters in [20, 10, 5, 3]:
+    m3 = load('/app/model_ref.xml')
+    m3.opt.iterations = iters
+    s3, t3, _ = sim(m3)
+    print(f"ref it={iters}: {t3*1e3:.1f} ms ({t3/t2:.3f} of contact-off) maxdiff {np.abs(s3-s2).max():.2e} allclose {np.allclose(s3,s2,atol=1e-5)}")
+# 4) native no-plugin
+m4 = load('/app/nat0.xml')
+m4.opt.disableflags |= DSBL_CONTACT
+s4, t4, _ = sim(m4)
+print(f"nat0 contact-off: {t4*1e3:.1f} ms ({t4/t:.3f} of ref baseline)")
+EOF
+python3 /app/tune2.py
+[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> st = mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> DSBL_CONTACT = int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+[?2004l[?2004h> print("DSBL_CONTACT bit:", DSBL_CONTACT)
+[?2004l[?2004h> def load(path):
+[?2004l[?2004h>     return mujoco.MjModel.from_xml_path(path)
+[?2004l[?2004h> def sim(m, seed=7, nstep=None):
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     if nstep is None: nstep = int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0 = time.perf_counter()
+[?2004l[?2004h>     for i in range(nstep):
+[?2004l[?2004h>         mujoco.mj_step(m,d)
+[?2004l[?2004h>     t1 = time.perf_counter()
+[?2004l[?2004h>     s = np.zeros(mujoco.mj_stateSize(m, st)); mujoco.mj_getState(m,d,s,st)
+[?2004l[?2004h>     return s, (t1-t0), d
+[?2004l[?2004h> # 1) solver niter
+[?2004l[?2004h> m = load('/app/model_ref.xml')
+[?2004l[?2004h> s, t, d = sim(m)
+[?2004l[?2004h> print(f"ref baseline: {t*1e3:.1f} ms, last solver_niter={d.solver_niter}")
+[?2004l[?2004h> mujoco.mj_forward(m, d)
+[?2004l[?2004h> print("niter sample:", end=" ")
+[?2004l[?2004h> its=[]
+[?2004l[?2004h> for _ in range(50):
+[?2004l[?2004h>     mujoco.mj_step(m,d); its.append(d.solver_niter)
+[?2004l[?2004h> print(its[:5], "...", its[-5:], "mean", np.mean(its))
+[?2004l[?2004h> # 2) disable contact
+[?2004l[?2004h> m2 = load('/app/model_ref.xml')
+[?2004l[?2004h> m2.opt.disableflags |= DSBL_CONTACT
+[?2004l[?2004h> s2, t2, d2 = sim(m2)
+[?2004l[?2004h> print(f"ref contact-off: {t2*1e3:.1f} ms  ({t2/t:.3f} of base) maxdiff vs base {np.abs(s2-s).max():.2e}")
+[?2004l[?2004h> # 3) iterations variations
+[?2004l[?2004h> for iters in [20, 10, 5, 3]:
+[?2004l[?2004h>     m3 = load('/app/model_ref.xml')
+[?2004l[?2004h>     m3.opt.iterations = iters
+[?2004l[?2004h>     s3, t3, _ = sim(m3)
+[?2004l[?2004h>     print(f"ref it={iters}: {t3*1e3:.1f} ms ({t3/t2:.3f} of contact-off) maxdiff {np.abs(s3-s2).max():.2e} allclose {np.allclose(s3,s2,atol=1e-5)}")
+[?2004l[?2004h> # 4) native no-plugin
+[?2004l[?2004h> m4 = load('/app/nat0.xml')
+[?2004l[?2004h> m4.opt.disableflags |= DSBL_CONTACT
+[?2004l[?2004h> s4, t4, _ = sim(m4)
+[?2004l[?2004h> print(f"nat0 contact-off: {t4*1e3:.1f} ms ({t4/t:.3f} of ref baseline)")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/tune2.py
+[?2004lDSBL_CONTACT bit: 16
+ref baseline: 453.3 ms, last solver_niter=[1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0]
+niter sample: [array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32), array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32), array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32), array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32), array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32)] ... [array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32), array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32), array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32), array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32), array([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      dtype=int32)] mean 0.05
+ref contact-off: 451.9 ms  (0.997 of base) maxdiff vs base 0.00e+00
+ref it=20: 468.8 ms (1.037 of contact-off) maxdiff 0.00e+00 allclose True
+ref it=10: 431.6 ms (0.955 of contact-off) maxdiff 0.00e+00 allclose True
+ref it=5: 467.1 ms (1.033 of contact-off) maxdiff 0.00e+00 allclose True
+ref it=3: 493.0 ms (1.091 of contact-off) maxdiff 0.00e+00 allclose True
+Traceback (most recent call last):
+  File [35m"/app/tune2.py"[0m, line [35m41[0m, in [35m<module>[0m
+    m4 = load('/app/nat0.xml')
+  File [35m"/app/tune2.py"[0m, line [35m6[0m, in [35mload[0m
+    return [31mmujoco.MjModel.from_xml_path[0m[1;31m(path)[0m
+           [31m~~~~~~~~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^^^^^^[0m
+[1;35mValueError[0m: [35mXML Error: Schema violation: unrecognized element
+Element 'dof', line 10
+[0m
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/bld3.py << 'EOF'
+[?2004l[?2004h> # plain native chain, NO stiffness (valid MJCF, scalar attrs only)
+[?2004l[?2004h> bodies = []
+[?2004l[?2004h> bodies.append('''    <body name="B_first" pos="-0.3 0 0.6">
+[?2004l[?2004h>       <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" condim="1"/>
+[?2004l[?2004h>       <site name="S_first" pos="0 0 0"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> for i in range(39):
+[?2004l[?2004h>     last = (i == 38)
+[?2004l[?2004h>     name = "B_last" if last else ("B_%d" % (i+1))
+[?2004l[?2004h>     site = '\n      <site name="S_last" pos="0.025 0 0"/>' if last else ''
+[?2004l[?2004h>     joint = '      <joint type="ball" damping="0.015" axis="0 0 1"/>%s' % site
+[?2004l[?2004h>     body = ('    <body name="%s" pos="0.025 0 0">\n%s\n'
+[?2004l[?2004h>             '      <geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" condim="1"/>\n'
+[?2004l[?2004h>             '    </body>') % (name, joint)
+[?2004l[?2004h>     bodies.append(body)
+[?2004l[?2004h> bodies.append('''    <body name="slider" pos="0.7 0 0.6">
+[?2004l[?2004h>       <joint type="slide" axis="1 0 0" damping="0.1"/>
+[?2004l[?2004h>       <geom size="0.01"/>
+[?2004l[?2004h>     </body>''')
+[?2004l[?2004h> xml = '''<mujoco model="CableNative">
+[?2004l[?2004h>   <compiler autolimits="true"/>
+[?2004l[?2004h>   <worldbody>
+[?2004l[?2004h> %s
+[?2004l[?2004h>   </worldbody>
+[?2004l[?2004h>   <equality>
+[?2004l[?2004h>     <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>
+[?2004l[?2004h>   </equality>
+[?2004l[?2004h>   <contact>
+[?2004l[?2004h>     <exclude body1="B_last" body2="slider"/>
+[?2004l[?2004h>   </contact>
+[?2004l[?2004h>   <actuator>
+[?2004l[?2004h>     <motor site="S_last" gear="0 0 0 1 0 0" ctrlrange="-.03 .03"/>
+[?2004l[?2004h>   </actuator>
+[?2004l[?2004h> </mujoco>''' % chr(10).join(bodies)
+[?2004l[?2004h> open('/app/nat0.xml','w').write(xml)
+[?2004l[?2004h> print("nat0.xml written (no stiffness)")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/bld3.py
+[?2004lnat0.xml written (no stiffness)
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/breakdown.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> def tsim(m, fn, n=1000, seed=7):
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): fn(m,d)
+[?2004l[?2004h>     t1=time.perf_counter()
+[?2004l[?2004h>     return (t1-t0)/n*1e6
+[?2004l[?2004h> cab_open = '<mujoco><worldbody><body name="b"><joint type="ball" damping="0.015"/><geom size="0.01"/></body></worldbody></mujoco>'
+[?2004l[?2004h> import io
+[?2004l[?2004h> m_empty = mujoco.MjModel.from_xml_string('<mujoco></mujoco>')
+[?2004l[?2004h> m_cab = mujoco.MjModel.from_xml_string(cab_open)
+[?2004l[?2004h> print("empty model step us:", round(tsim(m_empty, mujoco.mj_step),2))
+[?2004l[?2004h> print("cab model step us:", round(tsim(m_cab, mujoco.mj_step),2))
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> nat  = mujoco.MjModel.from_xml_path('/app/nat0.xml')
+[?2004l[?2004h> print("ref  step us:", round(tsim(mref, mujoco.mj_step),2))
+[?2004l[?2004h> print("ref  fwd  us:", round(tsim(mref, mujoco.mj_fwd),2))
+[?2004l[?2004h> print("ref  integrate us:", round(tsim(mref, mujoco.mj_integrate),2))
+[?2004l[?2004h> print("nat  step us:", round(tsim(nat, mujoco.mj_step),2))
+[?2004l[?2004h> print("nat  fwd  us:", round(tsim(nat, mujoco.mj_fwd),2))
+[?2004l[?2004h> # factorization cost: mj_fwdInv
+[?2004l[?2004h> print("ref  fwdInv us:", round(tsim(mref, mujoco.mj_fwdInv),2))
+[?2004l[?2004h> print("nat  fwdInv us:", round(tsim(nat, mujoco.mj_fwdInv),2))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/breakdown.py
+[?2004lempty model step us: 1.72
+cab model step us: 2.34
+ref  step us: 469.44
+Traceback (most recent call last):
+  File [35m"/app/breakdown.py"[0m, line [35m20[0m, in [35m<module>[0m
+    print("ref  fwd  us:", round(tsim(mref, [1;31mmujoco.mj_fwd[0m),2))
+                                            [1;31m^^^^^^^^^^^^^[0m
+[1;35mAttributeError[0m: [35mmodule 'mujoco' has no attribute 'mj_fwd'[0m
+[?2004hroot@a1d3bec55139:/tmp# python3 -c "import mujoco; print([x for x in dir(mujoco) if x.startswith('mj_step') or x.startswith('mj_fwd') or 'forward' in x or 'integrate' in x or x in ('mj_factorM','mj_solveM','mj_Euler','mj_Kinematics','mj_Contact','mj_Collide','mj_Normal)','mj_Compile','mj_GetConstraint')])"
+[?2004l['mj_Euler', 'mj_factorM', 'mj_forward', 'mj_forwardSkip', 'mj_fwdAcceleration', 'mj_fwdActuation', 'mj_fwdConstraint', 'mj_fwdPosition', 'mj_fwdVelocity', 'mj_integratePos', 'mj_solveM', 'mj_step', 'mj_step1', 'mj_step2']
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/breakdown2.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> def tsim(m, fn, n=3000, seed=7):
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): fn(m,d)
+[?2004l[?2004h>     t1=time.perf_counter()
+[?2004l[?2004h>     return (t1-t0)/n*1e6
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> nat  = mujoco.MjModel.from_xml_path('/app/nat0.xml')
+[?2004l[?2004h> for tag, m in [("ref", mref), ("nat", nat)]:
+[?2004l[?2004h>     print(tag, "step us:", round(tsim(m, mujoco.mj_step),2), " fwd us:", round(tsim(m, mujoco.mj_forward),2), " integ us:", round(tsim(m, mujoco.mj_integrate),2) if hasattr(mujoco,'mj_integrate') else 'n/a')
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/breakdown2.py
+[?2004lref step us: 460.09  fwd us: 367.1  integ us: n/a
+nat step us: 1411.35  fwd us: 559.16  integ us: n/a
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/breakdown3.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> rng = np.random.default_rng(7)
+[?2004l[?2004h> d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> def t(fn, n=3000):
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): fn()
+[?2004l[?2004h>     return (time.perf_counter()-t0)/n*1e6
+[?2004l[?2004h> print("step:", round(t(lambda: mujoco.mj_step(m,d)),1))
+[?2004l[?2004h> print("fwdPosition:", round(t(lambda: mujoco.mj_fwdPosition(m,d)),1))
+[?2004l[?2004h> print("fwdConstraint:", round(t(lambda: mujoco.mj_fwdConstraint(m,d)),1))
+[?2004l[?2004h> print("fwdAcceleration:", round(t(lambda: mujoco.mj_fwdAcceleration(m,d)),1))
+[?2004l[?2004h> print("fwdActuation:", round(t(lambda: mujoco.mj_fwdActuation(m,d)),1))
+[?2004l[?2004h> print("fwdVelocity:", round(t(lambda: mujoco.mj_fwdVelocity(m,d)),1))
+[?2004l[?2004h> print("factorM:", round(t(lambda: mujoco.mj_factorM(m,d)),1))
+[?2004l[?2004h> print("Euler:", round(t(lambda: mujoco.mj_Euler(m,d)),1))
+[?2004l[?2004h> # with contacts disabled
+[?2004l[?2004h> DSC = int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+[?2004l[?2004h> m2 = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> m2.opt.disableflags |= DSC
+[?2004l[?2004h> d2 = mujoco.MjData(m2)
+[?2004l[?2004h> d2.qpos += rng.normal(0,0.01,size=d2.qpos.shape)  # same rng state? recreate
+[?2004l[?2004h> rng2 = np.random.default_rng(7)
+[?2004l[?2004h> d2.qpos += rng2.normal(0,0.01,size=d2.qpos.shape)
+[?2004l[?2004h> mujoco.mj_forward(m2,d2)
+[?2004l[?2004h> print("-- contact off --")
+[?2004l[?2004h> print("fwdPosition:", round(t(lambda: mujoco.mj_fwdPosition(m2,d2)),1))
+[?2004l[?2004h> print("fwdAcceleration:", round(t(lambda: mujoco.mj_fwdAcceleration(m2,d2)),1))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/breakdown3.py
+[?2004lstep: 497.2
+fwdPosition: 105.4
+fwdConstraint: 292.4
+fwdAcceleration: 8.6
+fwdActuation: 0.6
+fwdVelocity: 30.8
+factorM: 87.5
+Euler: 77.9
+-- contact off --
+fwdPosition: 84.0
+fwdAcceleration: 7.1
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/breakdown4.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> nat  = mujoco.MjModel.from_xml_path('/app/nat0.xml')
+[?2004l[?2004h> dref, dnat = mujoco.MjData(mref), mujoco.MjData(nat)
+[?2004l[?2004h> rng = np.random.default_rng(7)
+[?2004l[?2004h> jit = rng.normal(0,0.01,size=157)
+[?2004l[?2004h> rng2 = np.random.default_rng(7)
+[?2004l[?2004h> assert np.allclose(rng2.normal(0,0.01,size=157), jit)
+[?2004l[?2004h> dref.qpos[:] = jit; dnat.qpos[:] = jit
+[?2004l[?2004h> mujoco.mj_forward(mref, dref); mujoco.mj_forward(nat, dnat)
+[?2004l[?2004h> def t(fn, n=3000):
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): fn()
+[?2004l[?2004h>     return (time.perf_counter()-t0)/n*1e6
+[?2004l[?2004h> phases = [('fwdPosition', mujoco.mj_fwdPosition), ('fwdConstraint', mujoco.mj_fwdConstraint), ('fwdAcceleration', mujoco.mj_fwdAcceleration), ('fwdActuation', mujoco.mj_fwdActuation), ('fwdVelocity', mujoco.mj_fwdVelocity), ('factorM', mujoco.mj_factorM), ('Euler', mujoco.mj_Euler)]
+[?2004l[?2004h> for name, fn in phases:
+[?2004l[?2004h>     print(f"{name:16s} ref {t(lambda: fn(mref,dref)):8.1f} us   nat {t(lambda: fn(nat,dnat)):8.1f} us")
+[?2004l[?2004h> # solver internals info
+[?2004l[?2004h> print("solver_nnz:", dref.solver_nnz, "island:", dref.island_nf if hasattr(dref,'island_nf') else None)
+[?2004l[?2004h> import collections
+[?2004l[?2004h> print("ncon dref/dnat:", dref.ncon, dnat.ncon, " ef rows efc:", dref.nefc if hasattr(dref,'nefc') else len(dref.efc_type))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/breakdown4.py
+[?2004lfwdPosition      ref    193.0 us   nat    127.6 us
+fwdConstraint    ref    460.7 us   nat    279.0 us
+fwdAcceleration  ref      7.0 us   nat      1.0 us
+fwdActuation     ref      0.6 us   nat      0.5 us
+fwdVelocity      ref     27.3 us   nat      7.2 us
+factorM          ref     60.2 us   nat      1.1 us
+Euler            ref     58.3 us   nat      2.4 us
+solver_nnz: [20946     0     0     0     0     0     0     0     0     0     0     0
+     0     0     0     0     0     0     0     0] island: []
+ncon dref/dnat: 45 368  ef rows efc: 48
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/breakdown5.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> nat  = mujoco.MjModel.from_xml_path('/app/nat0.xml')
+[?2004l[?2004h> def prep(m, seed=7, nrun=250):
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(nrun): mujoco.mj_step(m,d)
+[?2004l[?2004h>     return d
+[?2004l[?2004h> dr = prep(mref)
+[?2004l[?2004h> q_r, v_r = dr.qpos.copy(), dr.qvel.copy()
+[?2004l[?2004h> print("ref snapshot t=0.5s: ncon =", dr.ncon)
+[?2004l[?2004h> dn = prep(nat, nrun=1)  # nat only needs forward for same-state comparison
+[?2004l[?2004h> dn.reset(nat); dn.qpos[:] = q_r; dn.qvel[:] = v_r
+[?2004l[?2004h> mujoco.mj_forward(nat, dn)
+[?2004l[?2004h> print("nat at same state: ncon =", dn.ncon)
+[?2004l[?2004h> def t(fn, n=3000):
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): fn()
+[?2004l[?2004h>     return (time.perf_counter()-t0)/n*1e6
+[?2004l[?2004h> for name in ['fwdPosition','fwdConstraint','fwdAcceleration','fwdActuation','fwdVelocity','factorM','Euler']:
+[?2004l[?2004h>     fn = getattr(mujoco, 'mj_'+name)
+[?2004l[?2004h>     print(f"{name:16s} ref {t(lambda: fn(mref,dr)):8.1f}   nat {t(lambda: fn(nat,dn)):8.1f}   diff {t(lambda: fn(mref,dr))-t(lambda: fn(nat,dn)):8.1f}")
+[?2004l[?2004h> # step1/step2 with same state
+[?2004l[?2004h> d1 = prep(mref, nrun=1); d1.qpos[:]=q_r; d1.qvel[:]=v_r
+[?2004l[?2004h> mujoco.mj_forward(mref, d1)
+[?2004l[?2004h> db = prep(nat, nrun=1); db.qpos[:]=q_r; db.qvel[:]=v_r
+[?2004l[?2004h> mujoco.mj_forward(nat, db)
+[?2004l[?2004h> mujoco.mj_step1(mref, d1); mujoco.mj_step1(nat, db)
+[?2004l[?2004h> print("after step1: qacc diff:", np.abs(d1.qacc-db.qacc).max(), " qvel diff:", np.abs(d1.qvel-db.qvel).max())
+[?2004l[?2004h> print("d1.ncon, db.ncon:", d1.ncon, db.ncon, " efc:", len(d1.efc_type), len(db.efc_type))
+[?2004l[?2004h> import collections
+[?2004l[?2004h> print("efc types d1:", collections.Counter(d1.efc_type.tolist()))
+[?2004l[?2004h> print("step1 t: ref", round(t(lambda: mujoco.mj_step1(mref,d1),500),1), "nat", round(t(lambda: mujoco.mj_step1(nat,db),500),1))
+[?2004l[?2004h> print("step2 t: ref", round(t(lambda: mujoco.mj_step2(mref,d1),500),1), "nat", round(t(lambda: mujoco.mj_step2(nat,db),500),1))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/breakdown5.py
+[?2004lref snapshot t=0.5s: ncon = 0
+Traceback (most recent call last):
+  File [35m"/app/breakdown5.py"[0m, line [35m15[0m, in [35m<module>[0m
+    [1;31mdn.reset[0m(nat); dn.qpos[:] = q_r; dn.qvel[:] = v_r
+    [1;31m^^^^^^^^[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjData' object has no attribute 'reset'[0m
+[?2004hroot@a1d3bec55139:/tmp# cat > /app/breakdown5.py << 'EOF'
+[?2004l[?2004h> import time, mujoco, numpy as np
+[?2004l[?2004h> mref = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> nat  = mujoco.MjModel.from_xml_path('/app/nat0.xml')
+[?2004l[?2004h> def prep(m, seed=7, nrun=250):
+[?2004l[?2004h>     d = mujoco.MjData(m)
+[?2004l[?2004h>     rng = np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(nrun): mujoco.mj_step(m,d)
+[?2004l[?2004h>     return d
+[?2004l[?2004h> dr = prep(mref)
+[?2004l[?2004h> q_r, v_r = dr.qpos.copy(), dr.qvel.copy()
+[?2004l[?2004h> print("ref snapshot t=0.5s: ncon =", dr.ncon)
+[?2004l[?2004h> dn = mujoco.MjData(nat)
+[?2004l[?2004h> dn.qpos[:] = q_r; dn.qvel[:] = v_r
+[?2004l[?2004h> mujoco.mj_forward(nat, dn)
+[?2004l[?2004h> print("nat at same state: ncon =", dn.ncon)
+[?2004l[?2004h> def t(fn, n=3000):
+[?2004l[?2004h>     t0=time.perf_counter()
+[?2004l[?2004h>     for _ in range(n): fn()
+[?2004l[?2004h>     return (time.perf_counter()-t0)/n*1e6
+[?2004l[?2004h> for name in ['fwdPosition','fwdConstraint','fwdAcceleration','fwdActuation','fwdVelocity','factorM','Euler']:
+[?2004l[?2004h>     fn = getattr(mujoco, 'mj_'+name)
+[?2004l[?2004h>     tr = t(lambda: fn(mref,dr)); tn = t(lambda: fn(nat,dn))
+[?2004l[?2004h>     print(f"{name:16s} ref {tr:8.1f}   nat {tn:8.1f}   diff {tr-tn:8.1f}")
+[?2004l[?2004h> d1 = mujoco.MjData(mref); d1.qpos[:]=q_r; d1.qvel[:]=v_r
+[?2004l[?2004h> mujoco.mj_forward(mref, d1)
+[?2004l[?2004h> db = mujoco.MjData(nat); db.qpos[:]=q_r; db.qvel[:]=v_r
+[?2004l[?2004h> mujoco.mj_forward(nat, db)
+[?2004l[?2004h> mujoco.mj_step1(mref, d1); mujoco.mj_step1(nat, db)
+[?2004l[?2004h> print("after step1: qacc diff:", np.abs(d1.qacc-db.qacc).max(), " qvel diff:", np.abs(d1.qvel-db.qvel).max())
+[?2004l[?2004h> print("d1.ncon, db.ncon:", d1.ncon, db.ncon, " nefc:", len(d1.efc_type), len(db.efc_type))
+[?2004l[?2004h> import collections
+[?2004l[?2004h> print("efc types d1:", collections.Counter(d1.efc_type.tolist()))
+[?2004l[?2004h> print("step1 t: ref", round(t(lambda: mujoco.mj_step1(mref,d1),500),1), "nat", round(t(lambda: mujoco.mj_step1(nat,db),500),1))
+[?2004l[?2004h> print("step2 t: ref", round(t(lambda: mujoco.mj_step2(mref,d1),500),1), "nat", round(t(lambda: mjoco.mj_step2(nat,db),500),1) if False else round(t(lambda: mujoco.mj_step2(nat,db),500),1))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a1d3bec55139:/tmp# python3 /app/breakdown5.py
+[?2004lref snapshot t=0.5s: ncon = 0
+nat at same state: ncon = 742
+fwdPosition      ref     92.5   nat    215.7   diff   -123.1
+fwdConstraint    ref    260.7   nat    342.1   diff    -81.3
+fwdAcceleration  ref      7.7   nat      1.1   diff      6.6
+fwdActuation     ref      0.6   nat      0.6   diff      0.0
+fwdVelocity      ref     25.0   nat      9.9   diff     15.1
+factorM          ref     53.1   nat      1.0   diff     52.0
+Euler            ref     63.7   nat      2.8   diff     61.0
+after step1: qacc diff: 13830.254155503279  qvel diff: 0.0
+d1.ncon, db.ncon: 0 742  nefc: 3 745
+efc types d1: Counter({0: 3})
+step1 t: ref 118.2 nat 228.4
+step2 t: ref 328.2 nat 332.4
+[?2004hroot@a1d3bec55139:/tmp# python3 - << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('/app/model_ref.xml')
+[?2004l[?2004h> print("geom_contype:", m.geom_contype.tolist())
+[?2004l[?2004h> print("geom_conaffinity:", m.geom_conaffinity.tolist())
+[?2004l[?2004h> print("geom_condim:", m.geom_condim.tolist()[:5])
+[?2004l[?2004h> print("geom_margin:", m.geom_margin[:5])
+[?2004l[?2004h> print("opt cone/disable:", m.opt.cone, m.opt.disableflags)
+[?2004l[?2004h> print("---step1 doc:"); print(mujoco.mj_step1.__doc__)
+[?2004l[?2004h> print("---step2 doc:"); print(mujoco.mj_step2.__doc__)
+[?2004l[?2004h> print("---step doc:"); print(mujoco.mj_step.__doc__)
+[?2004l[?2004h> EOF
+[?2004lgeom_contype: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+geom_conaffinity: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+geom_condim: [1, 1, 1, 1, 1]
+geom_margin: [0. 0. 0. 0. 0.]
+opt cone/disable: 0 0
+---step1 doc:
+mj_step1(m: mujoco._structs.MjModel, d: mujoco._structs.MjData) -> None
+
+Advance simulation in two steps: before external force and control is set by user.
+
+---step2 doc:
+mj_step2(m: mujoco._structs.MjModel, d: mujoco._structs.MjData) -> None
+
+Advance simulation in two steps: after external force and control is set by user.
+
+---step doc:
+mj_step(m: mujoco._structs.MjModel, d: mujoco._structs.MjData, nstep: typing.SupportsInt = 1) -> None
+
+Advance simulation, use control callback to obtain external force and control. Optionally, repeat nstep times.
+
+[?2004hroot@a1d3bec55139:/tmp# 

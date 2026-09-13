@@ -1,0 +1,318 @@
+[?2004hroot@eab14e8855f7:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@eab14e8855f7:/app# clear
+[?2004l[H[J[3J[?2004hroot@eab14e8855f7:/app# cat > /app/parallel_linear.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l#[?2004h> def _get_world_size():
+[?2004l[?2004h>     if dist.is_initialized():
+[?2004l[?2004h>         return dist.get_world_size()
+[?2004l[?2004h>     return 1
+[?2004l[?2004h> 
+[?2004lg[?2004h> 
+[?2004lh[?2004h> def _get_rank():
+[?2004l[?2004h>     if dist.is_initialized():
+[?2004l[?2004h>         return dist.get_rank()
+[?2004l[?2004h>     return 0
+[?2004leFromModelPar[?2004h> 
+[?2004la[?2004h> 
+[?2004ll[?2004h> class _ReduceFromModelParallelRegion(torch.autograd.Function):
+[?2004l[?2004h>     """All-reduce (sum) across model-parallel ranks. Identity backward."""
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, input_):
+[?2004l[?2004h>         world_size = _get_world_size()
+[?2004l[?2004h>         if world_size == 1:
+[?2004l[?2004h>             return input_
+[?2004l[?2004h>         output = input_.clone()
+[?2004l[?2004h>         dist.all_reduce(output, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         # Since forward sums across ranks, each rank receives the full gradient
+[?2004l[?2004h>         return grad_output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _GatherFromModelParallelRegion(torch.autograd.Function):
+[?2004l[?2004h>     """All-gather along the last dimension. Slice backward."""
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, input_):
+[?2004l[?2004h>         world_size = _get_world_size()
+[?2004l[?2004h>         rank = _get_rank()
+[?2004l[?2004h>         if world_size == 1:
+[?2004l[?2004h>             return input_
+[?2004l[?2004h>         gathered = [torch.empty_like(input_) for _ in range(world_size)]
+[?2004l[?2004h>         dist.all_gather(gathered, input_.contiguous())
+[?2004l[?2004h>         output = torch.cat(gathered, dim=-1)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         world_size = _get_world_size()
+[?2004l[?2004h>         rank = _get_rank()
+[?2004l[?2004h>         if world_size == 1:
+[?2004l[?2004h>             return grad_output
+[?2004l[?2004h>         chunk_size = grad_output.size(-1) // world_size
+[?2004l[?2004h>         return grad_output.narrow(-1, rank * chunk_size, chunk_size).contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     """
+[?2004l[?2004h>     Linear layer with column parallelism.
+[?2004l[?2004h>     Weight (out_features, in_features) is split along dim 0 (out_features).
+[?2004l[?2004h>     Output is gathered along the last dimension (like all_gather).
+[?2004l[?2004h>     Bias is sharded the same way as the output dimension.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.world_size = _get_world_size()
+[?2004l[?2004h>         self.rank = _get_rank()
+[?2004l[?2004h>         self.out_features_per_rank = out_features // self.world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Split weight (out_features, in_features) along dim 0
+[?2004l[?2004h>         start = self.rank * self.out_features_per_rank
+[?2004l[?2004h>         end = start + self.out_features_per_rank
+[?2004l[?2004h>         weight_shard = master_weight[start:end, :].detach().clone()
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_shard)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(torch.zeros(self.out_features_per_rank))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         # x shape: (..., in_features)
+[?2004l[?2004h>         local_output = F.linear(x, self.weight)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             local_output = local_output + self.bias
+[?2004l[?2004h>         # Gather across ranks to form full output
+[?2004l[?2004h>         output = _GatherFromModelParallelRegion.apply(local_output)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     """
+[?2004l[?2004h>     Linear layer with row parallelism.
+[?2004l[?2004h>     Weight (out_features, in_features) is split along dim 1 (in_features).
+[?2004l[?2004h>     Input is expected to be pre-partitioned along the last dimension.
+[?2004l[?2004h>     Partial outputs are summed across ranks (like all_reduce).
+[?2004l[?2004h>     Bias is full (unsharded) on each rank.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.world_size = _get_world_size()
+[?2004l[?2004h>         self.rank = _get_rank()
+[?2004l[?2004h>         self.in_features_per_rank = in_features // self.world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Split weight (out_features, in_features) along dim 1
+[?2004l[?2004h>         start = self.rank * self.in_features_per_rank
+[?2004l[?2004h>         end = start + self.in_features_per_rank
+[?2004l[?2004h>         weight_shard = master_weight[:, start:end].detach().clone()
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_shard)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(torch.zeros(out_features))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         # x shape: (..., in_features_per_rank) - already partitioned
+[?2004l[?2004h>         local_output = F.linear(x, self.weight)
+[?2004l[?2004h>         # Reduce (sum) partial outputs across ranks
+[?2004l[?2004h>         output = _ReduceFromModelParallelRegion.apply(local_output)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             output = output + self.bias
+[?2004l[?2004h>         return output
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@eab14e8855f7:/app# cat /app/parallel_linear.py
+[?2004limport torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+def _get_world_size():
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
+
+
+def _get_rank():
+    if dist.is_initialized():
+        return dist.get_rank()
+    return 0
+
+
+class _ReduceFromModelParallelRegion(torch.autograd.Function):
+    """All-reduce (sum) across model-parallel ranks. Identity backward."""
+    @staticmethod
+    def forward(ctx, input_):
+        world_size = _get_world_size()
+        if world_size == 1:
+            return input_
+        output = input_.clone()
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Since forward sums across ranks, each rank receives the full gradient
+        return grad_output
+
+
+class _GatherFromModelParallelRegion(torch.autograd.Function):
+    """All-gather along the last dimension. Slice backward."""
+    @staticmethod
+    def forward(ctx, input_):
+        world_size = _get_world_size()
+        rank = _get_rank()
+        if world_size == 1:
+            return input_
+        gathered = [torch.empty_like(input_) for _ in range(world_size)]
+        dist.all_gather(gathered, input_.contiguous())
+        output = torch.cat(gathered, dim=-1)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        world_size = _get_world_size()
+        rank = _get_rank()
+        if world_size == 1:
+            return grad_output
+        chunk_size = grad_output.size(-1) // world_size
+        return grad_output.narrow(-1, rank * chunk_size, chunk_size).contiguous()
+
+
+class ColumnParallelLinear(nn.Module):
+    """
+    Linear layer with column parallelism.
+    Weight (out_features, in_features) is split along dim 0 (out_features).
+    Output is gathered along the last dimension (like all_gather).
+    Bias is sharded the same way as the output dimension.
+    """
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.world_size = _get_world_size()
+        self.rank = _get_rank()
+        self.out_features_per_rank = out_features // self.world_size
+
+        # Split weight (out_features, in_features) along dim 0
+        start = self.rank * self.out_features_per_rank
+        end = start + self.out_features_per_rank
+        weight_shard = master_weight[start:end, :].detach().clone()
+        self.weight = nn.Parameter(weight_shard)
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(self.out_features_per_rank))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x):
+        # x shape: (..., in_features)
+        local_output = F.linear(x, self.weight)
+        if self.bias is not None:
+            local_output = local_output + self.bias
+        # Gather across ranks to form full output
+        output = _GatherFromModelParallelRegion.apply(local_output)
+        return output
+
+
+class RowParallelLinear(nn.Module):
+    """
+    Linear layer with row parallelism.
+    Weight (out_features, in_features) is split along dim 1 (in_features).
+    Input is expected to be pre-partitioned along the last dimension.
+    Partial outputs are summed across ranks (like all_reduce).
+    Bias is full (unsharded) on each rank.
+    """
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.world_size = _get_world_size()
+        self.rank = _get_rank()
+        self.in_features_per_rank = in_features // self.world_size
+
+        # Split weight (out_features, in_features) along dim 1
+        start = self.rank * self.in_features_per_rank
+        end = start + self.in_features_per_rank
+        weight_shard = master_weight[:, start:end].detach().clone()
+        self.weight = nn.Parameter(weight_shard)
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x):
+        # x shape: (..., in_features_per_rank) - already partitioned
+        local_output = F.linear(x, self.weight)
+        # Reduce (sum) partial outputs across ranks
+        output = _ReduceFromModelParallelRegion.apply(local_output)
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+[?2004hroot@eab14e8855f7:/app# python3 -c "import ast; ast.parse(open('/app/parallel_linear.py').read()); print('Syntax OK')"
+[?2004lSyntax OK
+[?2004hroot@eab14e8855f7:/app# ls -la /app/
+[?2004ltotal 8
+drwxr-xr-x 1 root root   40 Sep  6 13:30 [0m[01;34m.[0m
+drwxr-xr-x 1 root root  117 Sep  6 13:20 [01;34m..[0m
+-rw-r--r-- 1 root root 4521 Sep  6 13:30 parallel_linear.py
+[?2004hroot@eab14e8855f7:/app# python3 -c "
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h> 
+[?2004l[?2004h> # Test with world_size=1 (no distributed)
+[?2004l[?2004h> in_f, out_f = 8, 4
+[?2004l[?2004h> W = torch.randn(out_f, in_f)
+[?2004l[?2004h> 
+[?2004l[?2004h> # ColumnParallel
+[?2004l[?2004h> cpl = ColumnParallelLinear(in_f, out_f, True, W)
+[?2004l[?2004h> print('Col weight shape:', cpl.weight.shape)
+[?2004l[?2004h> print('Col bias shape:', cpl.bias.shape)
+[?2004l[?2004h> x = torch.randn(2, in_f, requires_grad=True)
+[?2004l[?2004h> out = cpl(x)
+[?2004l[?2004h> print('Col output shape:', out.shape)
+[?2004l[?2004h> out.sum().backward()
+[?2004l[?2004h> print('Col weight grad shape:', cpl.weight.grad.shape)
+[?2004l[?2004h> print('Col bias grad shape:', cpl.bias.grad.shape)
+[?2004l[?2004h> 
+[?2004l[?2004h> # RowParallel
+[?2004l[?2004h> W2 = torch.randn(out_f, in_f)
+[?2004l[?2004h> rpl = RowParallelLinear(in_f, out_f, True, W2)
+[?2004l[?2004h> print('Row weight shape:', rpl.weight.shape)
+[?2004l[?2004h> print('Row bias shape:', rpl.bias.shape)
+[?2004l[?2004h> x2 = torch.randn(2, in_f, requires_grad=True)
+[?2004l[?2004h> out2 = rpl(x2)
+[?2004l[?2004h> print('Row output shape:', out2.shape)
+[?2004l[?2004h> out2.sum().backward()
+[?2004l[?2004h> print('Row weight grad shape:', rpl.weight.grad.shape)
+[?2004l[?2004h> print('Row bias grad shape:', rpl.bias.grad.shape)
+[?2004l[?2004h> print('All basic tests passed!')
+[?2004l[?2004h> "
+[?2004lTraceback (most recent call last):
+  File "<string>", line 2, in <module>
+ModuleNotFoundError: No module named 'torch'
+[?2004hroot@eab14e8855f7:/app# which python3 && python3 --version
+[?2004l/usr/bin/python3
+Python 3.12.3
+[?2004hroot@eab14e8855f7:/app# find / -name 'torch' -type d 2>/dev/null | head -5
+[?2004l[?2004hroot@eab14e8855f7:/app# pip list 2>/dev/null | grep -i torch; pip3 list 2>/dev/null | grep -i torch
+[?2004l[?2004hroot@eab14e8855f7:/app# python3 -c "import ast; tree = ast.parse(open('/app/parallel_linear.py').read()); print([n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)])"
+[?2004l['_ReduceFromModelParallelRegion', '_GatherFromModelParallelRegion', 'ColumnParallelLinear', 'RowParallelLinear']
+[?2004hroot@eab14e8855f7:/app# wc -l /app/parallel_linear.py
+[?2004l129 /app/parallel_linear.py
+[?2004hroot@eab14e8855f7:/app# 

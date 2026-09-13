@@ -1,0 +1,2319 @@
+[?2004hroot@f1ab57b2984f:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@f1ab57b2984f:/app# clear
+[?2004l[H[J[3J[?2004hroot@f1ab57b2984f:/app# ls -la /app/
+[?2004ltotal 0
+drwxr-xr-x 2 root root  10 Sep 13  2025 .
+drwxr-xr-x 1 root root 102 Sep  7 00:33 ..
+[?2004hroot@f1ab57b2984f:/app# python3 --version && pip list 2>/dev/null | grep -i -E 'beautifulsoup|bs4|lxml|html5lib|soupsieve'
+[?2004lPython 3.13.7
+beautifulsoup4    4.13.4
+soupsieve         2.8
+[?2004hroot@f1ab57b2984f:/app# cat > /app/filter.py << 'EOF'
+[?2004ld",
+    "xlink:href", "cite", "longdesc", "usemap", "profile", "codebase",
+    "classid", "lowsrc", "dynsrc",
+}
+
+# Elements where *any* data: URL is an XSS vector
+FRAME_LIKE = {"iframe", "frame", "object", "embed", "applet"}
+
+# Whitespace / control characters used to obfuscate scheme prefixes
+SCHEME_JUNK = re.compile(r"[\x00-\x20\x7f\u2028\u2029\ufeff]+")
+
+ACTIVE_SCHMES = ("javascript:", "vbscript:", "livescript:", "mocha:")
+
+# Dangerous CSS constructs
+CSS_BAD = re.compile(
+    r"expression\s*\(|"
+    r"(javascript|vbscript|livescript|mocha)\s*[:)]|"
+    r"-moz-binding",
+    re.IGNORECASE,
+)
+
+# Replaces a dangerous substring inside <style> text with an empty string
+CSS_REMOVE = re.compile(
+    r"expression\s*\([^)]*\)\)?"
+    r"|(javascript|vbscript|livescript|mocha)\s*:[^\"'()<>\s]*"
+    r"|-moz-binding\s*:[^;}>\"]*",
+    re.IGNORECASE,
+)
+
+
+def scheme_clean(value):
+    """Lowercase a URL value with whitespace/control chars stripped out."""
+    return SCHEME_JUNK.sub("", str(value)).lower()
+
+
+def is_dangerous_url(value, tag_name=""):
+    if value is None:
+        return False
+    v = scheme_clean(value)
+    for scheme in ACTIVE_SCHMES:
+        if v.startswith(scheme):
+            return True
+    if v.startswith("data:"):
+        if "text/html" in v:
+            return True
+        if tag_name in FRAME_LIKE:
+            return True
+    return False
+
+
+def dangerous_css(value):
+    return bool(CSS_BAD.search(str(value)))
+
+
+def clean_url_attr(tag, attr, value, tag_name):
+    if attr == "srcset" or attr == "imagesrcset":
+        urls = []
+        for entry in str(value).split(","):
+            entry = entry.strip()
+            if entry:
+                urls.append(entry.split()[0])
+        return any(is_dangerous_url(u, tag_name) for u in urls)
+    return is_dangerous_url(value, tag_name)
+
+
+def clean_meta_refresh(tag):
+    """Drop the content attr of <meta http-equiv=refresh> active redirects."""
+    if tag.get("http-equiv", "").lower() != "refresh":
+        return
+    content = tag.get("content")
+    if not content:
+        return
+    for part in re.findall(r"url\s*=\s*([^;\s]+)", str(content), re.IGNORECASE):
+        if is_dangerous_url(part, "meta"):
+            del tag["content"]
+            return
+
+
+def clean_tag(tag):
+    tag_name = (tag.name or "").lower()
+    for attr in list(tag.attrs.keys()):
+        lname = attr.lower().strip()
+        value = tag.attrs[attr]
+        if isinstance(value, list):
+            value = " ".join(str(v) for v in value)
+
+        # Event handler attributes
+        if lname.startswith("on") and len(lname) > 2:
+            del tag.attrs[attr]
+            continue
+
+        # Untrusted inline HTML
+        if lname == "srcdoc":
+            del tag.attrs[attr]
+            continue
+
+        # Inline styles with active CSS
+        if lname == "style":
+            if dangerous_css(value):
+                del tag.attrs[attr]
+            continue
+
+        # URLs with active content schemes
+        if lname in URL_ATTRS:
+            if clean_url_attr(tag, lname, value, tag_name):
+                del tag.attrs[attr]
+           [?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> """filter.py - Remove JavaScript from an HTML file to mitigate XSS attacks.
+[?2004l[?2004h> 
+[?2004lt[?2004h> Usage:
+[?2004l[?2004h>     python3 filter.py <path-to-html-file>
+[?2004l[?2004h> 
+[?2004ls[?2004h> The file is modified in-place.  Legitimate HTML structure, formatting and
+[?2004l[?2004h> non-dangerous attributes are preserved; only potentially executable content
+[?2004ly[?2004h> is removed:
+[?2004l[?2004h> 
+[?2004lg[?2004h>   * <script> elements (anywhere, e.g. inside <svg>)
+[?2004l[?2004h>   * HTML event-handler attributes (onclick, onerror, onload, ...)
+[?2004l[?2004h>   * URLs using active content schemes (javascript:, vbscript:,
+[?2004l[?2004h>     data:text/html, and data: URLs on frame-like elements)
+[?2004l[?2004h>   * active CSS constructs (expression(), -moz-binding, javascript: urls)
+[?2004l[?2004h>   * <meta http-equiv=refresh> redirects pointing at active schemes
+[?2004l[?2004h>   * <iframe srcdoc> attributes (untrusted inline HTML)
+[?2004l[?2004h>   * comments that contain <script> markup
+[?2004l[?2004h> """
+[?2004l[?2004h> 
+[?2004l[?2004h> import re
+[?2004l[?2004h> import sys
+[?2004l[?2004h> 
+[?2004le[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> from bs4.element import Comment
+[?2004l[?2004h> 
+[?2004li[?2004h> # Attributes that carry URLs
+[?2004l[?2004h> URL_ATTRS = {
+[?2004la[?2004h>     "href", "src", "action", "formaction", "data", "poster", "background",
+[?2004l[?2004h>     "xlink:href", "cite", "longdesc", "usemap", "profile", "codebase",
+[?2004l[?2004h>     "classid", "lowsrc", "dynsrc",
+[?2004li[?2004h> }
+[?2004l[?2004h> 
+[?2004ll[?2004h> # Elements where *any* data: URL is an XSS vector
+[?2004l[?2004h> FRAME_LIKE = {"iframe", "frame", "object", "embed", "applet"}
+[?2004l[?2004h> 
+[?2004l[?2004h> # Whitespace / control characters used to obfuscate scheme prefixes
+[?2004l[?2004h> SCHEME_JUNK = re.compile(r"[\x00-\x20\x7f\u2028\u2029\ufeff]+")
+[?2004l[?2004h> 
+[?2004l[?2004h> ACTIVE_SCHMES = ("javascript:", "vbscript:", "livescript:", "mocha:")
+[?2004l([?2004h> 
+[?2004lc[?2004h> # Dangerous CSS constructs
+[?2004l[?2004h> CSS_BAD = re.compile(
+[?2004l":[?2004h>     r"expression\s*\(|"
+[?2004l[?2004h>     r"(javascript|vbscript|livescript|mocha)\s*[:)]|"
+[?2004l[?2004h>     r"-moz-binding",
+[?2004l[?2004h>     re.IGNORECASE,
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> # Replaces a dangerous substring inside <style> text with an empty string
+[?2004l[?2004h> CSS_REMOVE = re.compile(
+[?2004l[?2004h>     r"expression\s*\([^)]*\)\)?"
+[?2004l[?2004h>     r"|(javascript|vbscript|livescript|mocha)\s*:[^\"'()<>\s]*"
+[?2004l[?2004h>     r"|-moz-binding\s*:[^;}>\"]*",
+[?2004l[?2004h>     re.IGNORECASE,
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def scheme_clean(value):
+[?2004l[?2004h>     """Lowercase a URL value with whitespace/control chars stripped out."""
+[?2004l[?2004h>     return SCHEME_JUNK.sub("", str(value)).lower()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def is_dangerous_url(value, tag_name=""):
+[?2004l[?2004h>     if value is None:
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     v = scheme_clean(value)
+[?2004l[?2004h>     for scheme in ACTIVE_SCHMES:
+[?2004l[?2004h>         if v.startswith(scheme):
+[?2004l[?2004h>             return True
+[?2004l[?2004h>     if v.startswith("data:"):
+[?2004l[?2004h>         if "text/html" in v:
+[?2004l[?2004h>             return True
+[?2004l[?2004h>         if tag_name in FRAME_LIKE:
+[?2004l[?2004h>             return True
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def dangerous_css(value):
+[?2004l[?2004h>     return bool(CSS_BAD.search(str(value)))
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_url_attr(tag, attr, value, tag_name):
+[?2004l[?2004h>     if attr == "srcset" or attr == "imagesrcset":
+[?2004l[?2004h>         urls = []
+[?2004l[?2004h>         for entry in str(value).split(","):
+[?2004l[?2004h>             entry = entry.strip()
+[?2004l[?2004h>             if entry:
+[?2004l[?2004h>                 urls.append(entry.split()[0])
+[?2004l[?2004h>         return any(is_dangerous_url(u, tag_name) for u in urls)
+[?2004l[?2004h>     return is_dangerous_url(value, tag_name)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_meta_refresh(tag):
+[?2004l[?2004h>     """Drop the content attr of <meta http-equiv=refresh> active redirects."""
+[?2004l[?2004h>     if tag.get("http-equiv", "").lower() != "refresh":
+[?2004l[?2004h>         return
+[?2004l[?2004h>     content = tag.get("content")
+[?2004l[?2004h>     if not content:
+[?2004l[?2004h>         return
+[?2004l[?2004h>     for part in re.findall(r"url\s*=\s*([^;\s]+)", str(content), re.IGNORECASE):
+[?2004l[?2004h>         if is_dangerous_url(part, "meta"):
+[?2004l[?2004h>             del tag["content"]
+[?2004l[?2004h>             return
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_tag(tag):
+[?2004l[?2004h>     tag_name = (tag.name or "").lower()
+[?2004l[?2004h>     for attr in list(tag.attrs.keys()):
+[?2004l[?2004h>         lname = attr.lower().strip()
+[?2004l[?2004h>         value = tag.attrs[attr]
+[?2004l[?2004h>         if isinstance(value, list):
+[?2004l[?2004h>             value = " ".join(str(v) for v in value)
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Event handler attributes
+[?2004l[?2004h>         if lname.startswith("on") and len(lname) > 2:
+[?2004l[?2004h>             del tag.attrs[attr]
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Untrusted inline HTML
+[?2004l[?2004h>         if lname == "srcdoc":
+[?2004l[?2004h>             del tag.attrs[attr]
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Inline styles with active CSS
+[?2004l[?2004h>         if lname == "style":
+[?2004l[?2004h>             if dangerous_css(value):
+[?2004l[?2004h>                 del tag.attrs[attr]
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # URLs with active content schemes
+[?2004l[?2004h>         if lname in URL_ATTRS:
+[?2004l[?2004h>             if clean_url_attr(tag, lname, value, tag_name):
+[?2004l[?2004h>                 del tag.attrs[attr]
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>     clean_meta_refresh(tag)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_style_element(style_tag):
+[?2004l[?2004h>     text = style_tag.string if style_tag.string is not None \
+[?2004l[?2004h>         else "".join(style_tag.text_parts) if hasattr(style_tag, "text_parts") else style_tag.decode_contents()
+[?2004l[?2004h>     if text and CSS_BAD.search(text):
+[?2004l[?2004h>         style_tag.string = CSS_REMOVE.sub("", text)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_script_comments(soup):
+[?2004l[?2004h>     for comment in soup.find_all(string=lambda s: isinstance(s, Comment)):
+[?2004l[?2004h>         if re.search(r"(?is)\<\s*script", str(comment)):
+[?2004l[?2004h>             comment.extract()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def filter_html(html):
+[?2004l[?2004h>     soup = BeautifulSoup(html, "html.parser")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 1. Remove all <script> elements (including <svg><script>)
+[?2004l[?2004h>     for el in soup.find_all("script"):
+[?2004l[?2004h>         el.decompose()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 2. Neutralize comments that smuggle <script> markup
+[?2004l[?2004h>     clean_script_comments(soup)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 3. Clean every remaining element
+[?2004l[?2004h>     for tag in soup.find_all(True):
+[?2004l[?2004h>         clean_tag(tag)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 4. Purge active CSS inside <style> blocks
+[?2004l[?2004h>     for style_tag in soup.find_all("style"):
+[?2004l[?2004h>         clean_style_element(style_tag)
+[?2004l[?2004h> 
+[?2004l[?2004h>     return str(soup)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def main(argv):
+[?2004l[?2004h>     if len(argv) < 2:
+[?2004l[?2004h>         sys.stderr.write("usage: filter.py <html-file>\n")
+[?2004l[?2004h>         return 1
+[?2004l[?2004h> 
+[?2004l[?2004h>     path = argv[1]
+[?2004l[?2004h>     with open(path, "r", encoding="utf-8", errors="replace") as fh:
+[?2004l[?2004h>         html = fh.read()
+[?2004l[?2004h> 
+[?2004l[?2004h>     cleaned = filter_html(html)
+[?2004l[?2004h> 
+[?2004l[?2004h>     with open(path, "w", encoding="utf-8", newline="") as fh:
+[?2004l[?2004h>         fh.write(cleaned)
+[?2004l[?2004h>     return 0
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == "__main__":
+[?2004l[?2004h>     sys.exit(main(sys.argv))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f1ab57b2984f:/app# python3 -c "import ast; ast.parse(open('/app/filter.py').read()); print('syntax OK')"
+[?2004lsyntax OK
+[?2004hroot@f1ab57b2984f:/app# head -40 /app/filter.py
+[?2004l#!/usr/bin/env python3
+"""filter.py - Remove JavaScript from an HTML file to mitigate XSS attacks.
+
+Usage:
+    python3 filter.py <path-to-html-file>
+
+The file is modified in-place.  Legitimate HTML structure, formatting and
+non-dangerous attributes are preserved; only potentially executable content
+is removed:
+
+  * <script> elements (anywhere, e.g. inside <svg>)
+  * HTML event-handler attributes (onclick, onerror, onload, ...)
+  * URLs using active content schemes (javascript:, vbscript:,
+    data:text/html, and data: URLs on frame-like elements)
+  * active CSS constructs (expression(), -moz-binding, javascript: urls)
+  * <meta http-equiv=refresh> redirects pointing at active schemes
+  * <iframe srcdoc> attributes (untrusted inline HTML)
+  * comments that contain <script> markup
+"""
+
+import re
+import sys
+
+from bs4 import BeautifulSoup
+from bs4.element import Comment
+
+# Attributes that carry URLs
+URL_ATTRS = {
+    "href", "src", "action", "formaction", "data", "poster", "background",
+    "xlink:href", "cite", "longdesc", "usemap", "profile", "codebase",
+    "classid", "lowsrc", "dynsrc",
+}
+
+# Elements where *any* data: URL is an XSS vector
+FRAME_LIKE = {"iframe", "frame", "object", "embed", "applet"}
+
+# Whitespace / control characters used to obfuscate scheme prefixes
+SCHEME_JUNK = re.compile(r"[\x00-\x20\x7f\u2028\u2029\ufeff]+")
+
+ACTIVE_SCHMES = ("javascript:", "vbscript:", "livescript:", "mocha:")
+[?2004hroot@f1ab57b2984f:/app# grep -n 'ACTIVE_SCHMES\|text_parts' /app/filter.py
+[?2004l40:ACTIVE_SCHMES = ("javascript:", "vbscript:", "livescript:", "mocha:")
+68:    for scheme in ACTIVE_SCHMES:
+142:        else "".join(style_tag.text_parts) if hasattr(style_tag, "text_parts") else style_tag.decode_contents()
+[?2004hroot@f1ab57b2984f:/app# cat > /tmp/evil.html << 'EOF'
+[?2004l[?2004h> <!DOCTYPE html>
+[?2004l[?2004h> <html>
+[?2004l[?2004h> <head>
+[?2004l[?2004h> <meta charset="utf-8">
+[?2004l[?2004h> <meta http-equiv="refresh" content="0; url=javascript:alert(1)">
+[?2004l[?2004h> <title>Test Page</title>
+[?2004l[?2004h> <style>
+[?2004l[?2004h> body { color: blue; }
+[?2004l[?2004h> .a { background: url(javascript:alert(1)); }
+[?2004l[?2004h> .b { width: expression(alert(2)); }
+[?2004l[?2004h> .c { font-family: sans-serif; }
+[?2004l[?2004h> </style>
+[?2004l[?2004h> <script>alert('top script')</script>
+[?2004l[?2004h> </head>
+[?2004l[?2004h> <body onload="alert('body onload')">
+[?2004l[?2004h> <h1 id="header" class="main">Hello World</h1>
+[?2004l[?2004h> <p style="margin: 0 auto">A normal paragraph. &amp; entities preserved.</p>
+[?2004l[?2004h> <a href="https://example.com/">Safe link</a>
+[?2004l[?2004h> <a href="javascript:alert(1)">bad link</a>
+[?2004l[?2004h> <a href="JaVaScRiPt:alert(2)">bad link 2</a>
+[?2004l[?2004h> <a href="filter.py" javascript:alert(3)" style="color:red">bad link 3</a>
+[?2004l[?2004h> <a href="vbscript:msgbox(1)">bad vbscript link</a>
+[?2004l[?2004h> <a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">bad data link</a>
+[?2004l[?2004h> <img src="x" onerror="alert(1)" alt="broken">
+[?2004l[?2004h> <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="ok gif">
+[?2004l[?2004h> <svg width="10" height="10"><script>alert('svg')</script><circle r="5"/></svg>
+[?2004l[?2004h> <iframe src="javascript:alert(4)"></iframe>
+[?2004l[?2004h> <iframe srcdoc="<script>alert(5)</script>"></iframe>
+[?2004l[?2004h> <iframe src="https://example.com/"></iframe>
+[?2004l[?2004h> <form action="javascript:alert(6)" method="post"><input type="text" name="q" value="v" onfocus="alert(7)"><button formaction="javascript:alert(8)">Go</button></form>
+[?2004l[?2004h> <!-- a normal comment -->
+[?2004l[?2004h> <table border="1">
+[?2004l[?2004h> <tr><th>Head</th></tr>
+[?2004l[?2004h> <tr><td>Cell content</td></tr>
+[?2004l[?2004h> </table>
+[?2004l[?2004h> <button onclick="alert(10)" class="btn">Click me</button>
+[?2004l[?2004h> <div onmouseover=alert(11) title="keep me">div text</div>
+[?2004l[?2004h> </body>
+[?2004l[?2004h> </html>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f1ab57b2984f:/app# cp /tmp/evil.html /tmp/evil2.html
+[?2004l[?2004hroot@f1ab57b2984f:/app# python3 /app/filter.py /tmp/evil.html && echo === && cat /tmp/evil.html
+[?2004l===
+<!DOCTYPE html>
+
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta http-equiv="refresh"/>
+<title>Test Page</title>
+<style>
+body { color: blue; }
+.a { background: url((1)); }
+.b { width: ; }
+.c { font-family: sans-serif; }
+</style>
+
+</head>
+<body>
+<h1 class="main" id="header">Hello World</h1>
+<p style="margin: 0 auto">A normal paragraph. &amp; entities preserved.</p>
+<a href="https://example.com/">Safe link</a>
+<a>bad link</a>
+<a>bad link 2</a>
+<a href="filter.py" javascript:alert(3)"="" style="color:red">bad link 3</a>
+<a>bad vbscript link</a>
+<a>bad data link</a>
+<img alt="broken" src="x"/>
+<img alt="ok gif" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="/>
+<svg height="10" width="10"><circle r="5"></circle></svg>
+<iframe></iframe>
+<iframe></iframe>
+<iframe src="https://example.com/"></iframe>
+<form method="post"><input name="q" type="text" value="v"/><button>Go</button></form>
+<!-- a normal comment -->
+<table border="1">
+<tr><th>Head</th></tr>
+<tr><td>Cell content</td></tr>
+</table>
+<button class="btn">Click me</button>
+<div title="keep me">div text</div>
+</body>
+</html>
+[?2004hroot@f1ab57b2984f:/app# printf '%s\n' '<html><body>' '<a id=t1 href="jav\tascript:alert(1)">literal tab</a>' '<a id=t2 href="jav&#x09;ascript:alert(2)">tab entity</a>' '<a id=t3 href="javascript&#58;alert(3)">colon entity</a>' '<a id=t4 href="&#106;avascript:alert(4)">j entity</a>' '<SCRIPT>alert(5)</SCRIPT>' '<ScRiPt>var x=1;</ScRiPt>' '<INPUT onFocus=alert(6) onFOUR=alert(7) type="text" value="keep">' '<p data-custom="safe: info" title="fine">text stays</p>' '<a id=t8 href="data:text/html,<b>hi</b>">inline html</a>' '<p style="color: green; margin: 0">ok style</p>' '</body></html>' > /tmp/evil3.html
+[?2004l[?2004hroot@f1ab57b2984f:/app# cat /tmp/evil3.html | od -c | head -5
+[?2004l0000000   <   h   t   m   l   >   <   b   o   d   y   >  \n   <   a    
+0000020   i   d   =   t   1       h   r   e   f   =   "   j   a   v   \
+0000040   t   a   s   c   r   i   p   t   :   a   l   e   r   t   (   1
+0000060   )   "   >   l   i   t   e   r   a   l       t   a   b   <   /
+0000100   a   >  \n   <   a       i   d   =   t   2       h   r   e   f
+[?2004hroot@f1ab57b2984f:/app# python3 /app/filter.py /tmp/evil3.html && echo === && cat /tmp/evil3.html
+[?2004l===
+<html><body>
+<a href="jav\tascript:alert(1)" id="t1">literal tab</a>
+<a id="t2">tab entity</a>
+<a id="t3">colon entity</a>
+<a id="t4">j entity</a>
+
+
+<input type="text" value="keep"/>
+<p data-custom="safe: info" title="fine">text stays</p>
+<a id="t8">inline html</a>
+<p style="color: green; margin: 0">ok style</p>
+</body></html>
+[?2004hroot@f1ab57b2984f:/app# cp /tmp/evil2.html /tmp/once.html && python3 /app/filter.py /tmp/once.html && python3 /app/filter.py /tmp/once.html && python3 /app/filter.py /tmp/evil2.html && diff /tmp/once.html /tmp/evil2.html && echo IDEMPOTENT-OK
+[?2004l13a14
+> 
+[?2004hroot@f1ab57b2984f:/app# printf '<!DOCTYPE html>\n<html><head>\n<style>.x{color:blue}\n</style>\n<script>bad()</script>\n</head><body></body></html>' > /tmp/t1.html; cp /tmp/t1.html /tmp/t2.html; python3 /app/filter.py /tmp/t1.html; python3 /app/filter.py /tmp/t2.html; python3 /app/filter.py /tmp/t2.html; echo '--- once:'; cat -A /tmp/t1.html; echo '--- twice:'; cat -A /tmp/t2.html
+[?2004l--- once:
+<!DOCTYPE html>$
+$
+<html><head>$
+<style>.x{color:blue}$
+</style>$
+$
+</head><body></body></html>--- twice:
+<!DOCTYPE html>$
+$
+<html><head>$
+<style>.x{color:blue}$
+</style>$
+</head><body></body></html>[?2004hroot@f1ab57b2984f:/app# echo -e '<html><a id=realtab href="jav\tascript:alert(1)">real tab</a></html>' > /tmp/t3.html; od -c /tmp/t3.html; python3 /app/filter.py /tmp/t3.html; cat /tmp/t3.html
+[?2004l0000000   <   h   t   m   l   >   <   a       i   d   =   r   e   a   l
+0000020   t   a   b       h   r   e   f   =   "   j   a   v  \t   a   s
+0000040   c   r   i   p   t   :   a   l   e   r   t   (   1   )   "   >
+0000060   r   e   a   l       t   a   b   <   /   a   >   <   /   h   t
+0000100   m   l   >  \n
+0000104
+<html><a id="realtab">real tab</a></html>
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> for s in ['<style>a</style>\\n\\nB', '<style>a\\n</style>\\n\\nB', '<x>a</x>\\n\\nB', '<script>a</script>\\n\\nB']:
+[?2004l[?2004h>     print(repr(s), '->', repr(str(BeautifulSoup(s, 'html.parser'))))
+[?2004l[?2004h> "
+[?2004l'<style>a</style>\n\nB' -> '<style>a</style>\n\nB'
+'<style>a\n</style>\n\nB' -> '<style>a\n</style>\n\nB'
+'<x>a</x>\n\nB' -> '<x>a</x>\n\nB'
+'<script>a</script>\n\nB' -> '<script>a</script>\n\nB'
+[?2004hroot@f1ab57b2984f:/app# printf '<html><head><style>.a{color:red}</style>\n\n<link rel="x" href="y"></head>\n\n<body><p>one</p>\n\n<p>two</p></body></html>' > /tmp/clean.html; cp /tmp/clean.html /tmp/clean.orig; python3 /app/filter.py /tmp/clean.html; diff /tmp/clean.orig /tmp/clean.html && echo NO-CHANGE-OK
+[?2004l2,4c2
+< 
+< <link rel="x" href="y"></head>
+< 
+---
+> <link href="y" rel="x"/></head>
+6d3
+< 
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> data = open('/tmp/clean.orig').read()
+[?2004l[?2004h> s = BeautifulSoup(data, 'html.parser')
+[?2004l[?2004h> out = str(s)
+[?2004l[?2004h> print('SAME' if out == data else 'DIFF')
+[?2004l[?2004h> print(repr(out))
+[?2004l[?2004h> "
+[?2004lDIFF
+'<html><head><style>.a{color:red}</style>\n<link href="y" rel="x"/></head>\n<body><p>one</p>\n<p>two</p></body></html>'
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> T = ['<html><head><style>.a{color:red}</style>\n\n<link rel=\"x\" href=\"y\">', '<html>\n\n<body>x', '<html><body><p>a</p>\n\n<p>b</p></body></html>', '<a>x</a>\n\n<b>y</b>', '<p>a</p>\n\n<p>b</p>']
+[?2004l[?2004h> for s in T:
+[?2004l[?2004h>     o = str(BeautifulSoup(s, 'html.parser'))
+[?2004l[?2004h>     print(repr(s), '->', 'SAME' if o == s else 'DIFF: ' + repr(o))
+[?2004l[?2004h> "
+[?2004l'<html><head><style>.a{color:red}</style>\n\n<link rel="x" href="y">' -> DIFF: '<html><head><style>.a{color:red}</style>\n<link href="y" rel="x"/></head></html>'
+'<html>\n\n<body>x' -> DIFF: '<html>\n<body>x</body></html>'
+'<html><body><p>a</p>\n\n<p>b</p></body></html>' -> DIFF: '<html><body><p>a</p>\n<p>b</p></body></html>'
+'<a>x</a>\n\n<b>y</b>' -> DIFF: '<a>x</a>\n<b>y</b>'
+'<p>a</p>\n\n<p>b</p>' -> DIFF: '<p>a</p>\n<p>b</p>'
+[?2004hroot@f1ab57b2984f:/app# python3 -c "import bs4.builder._htmlparser as m; print(m.__file__)" && grep -n -i 'whitespace\|handle_data\|interesting' $(python3 -c "import bs4.builder._htmlparser as m; print(m.__file__)") | head -30
+[?2004l/usr/local/lib/python3.13/site-packages/bs4/builder/_htmlparser.py
+222:    def handle_data(self, data: str) -> None:
+224:        self.soup.handle_data(data)
+264:        self.handle_data(data)
+283:        self.handle_data(data)
+291:        self.soup.handle_data(data)
+301:        self.soup.handle_data(data)
+316:        self.soup.handle_data(data)
+325:        self.soup.handle_data(data)
+[?2004hroot@f1ab57b2984f:/app# sed -n '195,340p' /usr/local/lib/python3.13/site-packages/bs4/builder/_htmlparser.py
+[?2004l            self.handle_endtag(name, check_already_closed=False)
+
+            # But we might encounter an explicit closing tag for this tag
+            # later on. If so, we want to ignore it.
+            self.already_closed_empty_element.append(name)
+
+        if self._root_tag_name is None:
+            self._root_tag_encountered(name)
+
+    def handle_endtag(self, name: str, check_already_closed: bool = True) -> None:
+        """Handle a closing tag, e.g. '</tag>'
+
+        :param name: A tag name.
+        :param check_already_closed: True if this tag is expected to
+           be the closing portion of an empty-element tag,
+           e.g. '<tag></tag>'.
+        """
+        # print("END", name)
+        if check_already_closed and name in self.already_closed_empty_element:
+            # This is a redundant end tag for an empty-element tag.
+            # We've already called handle_endtag() for it, so just
+            # check it off the list.
+            # print("ALREADY CLOSED", name)
+            self.already_closed_empty_element.remove(name)
+        else:
+            self.soup.handle_endtag(name)
+
+    def handle_data(self, data: str) -> None:
+        """Handle some textual data that shows up between tags."""
+        self.soup.handle_data(data)
+
+    def handle_charref(self, name: str) -> None:
+        """Handle a numeric character reference by converting it to the
+        corresponding Unicode character and treating it as textual
+        data.
+
+        :param name: Character number, possibly in hexadecimal.
+        """
+        # TODO: This was originally a workaround for a bug in
+        # HTMLParser. (http://bugs.python.org/issue13633) The bug has
+        # been fixed, but removing this code still makes some
+        # Beautiful Soup tests fail. This needs investigation.
+        if name.startswith("x"):
+            real_name = int(name.lstrip("x"), 16)
+        elif name.startswith("X"):
+            real_name = int(name.lstrip("X"), 16)
+        else:
+            real_name = int(name)
+
+        data = None
+        if real_name < 256:
+            # HTML numeric entities are supposed to reference Unicode
+            # code points, but sometimes they reference code points in
+            # some other encoding (ahem, Windows-1252). E.g. &#147;
+            # instead of &#201; for LEFT DOUBLE QUOTATION MARK. This
+            # code tries to detect this situation and compensate.
+            for encoding in (self.soup.original_encoding, "windows-1252"):
+                if not encoding:
+                    continue
+                try:
+                    data = bytearray([real_name]).decode(encoding)
+                except UnicodeDecodeError:
+                    pass
+        if not data:
+            try:
+                data = chr(real_name)
+            except (ValueError, OverflowError):
+                pass
+        data = data or "\N{REPLACEMENT CHARACTER}"
+        self.handle_data(data)
+
+    def handle_entityref(self, name: str) -> None:
+        """Handle a named entity reference by converting it to the
+        corresponding Unicode character(s) and treating it as textual
+        data.
+
+        :param name: Name of the entity reference.
+        """
+        character = EntitySubstitution.HTML_ENTITY_TO_CHARACTER.get(name)
+        if character is not None:
+            data = character
+        else:
+            # If this were XML, it would be ambiguous whether "&foo"
+            # was an character entity reference with a missing
+            # semicolon or the literal string "&foo". Since this is
+            # HTML, we have a complete list of all character entity references,
+            # and this one wasn't found, so assume it's the literal string "&foo".
+            data = "&%s" % name
+        self.handle_data(data)
+
+    def handle_comment(self, data: str) -> None:
+        """Handle an HTML comment.
+
+        :param data: The text of the comment.
+        """
+        self.soup.endData()
+        self.soup.handle_data(data)
+        self.soup.endData(Comment)
+
+    def handle_decl(self, data: str) -> None:
+        """Handle a DOCTYPE declaration.
+
+        :param data: The text of the declaration.
+        """
+        self.soup.endData()
+        data = data[len("DOCTYPE ") :]
+        self.soup.handle_data(data)
+        self.soup.endData(Doctype)
+
+    def unknown_decl(self, data: str) -> None:
+        """Handle a declaration of unknown type -- probably a CDATA block.
+
+        :param data: The text of the declaration.
+        """
+        cls: Type[NavigableString]
+        if data.upper().startswith("CDATA["):
+            cls = CData
+            data = data[len("CDATA[") :]
+        else:
+            cls = Declaration
+        self.soup.endData()
+        self.soup.handle_data(data)
+        self.soup.endData(cls)
+
+    def handle_pi(self, data: str) -> None:
+        """Handle a processing instruction.
+
+        :param data: The text of the instruction.
+        """
+        self.soup.endData()
+        self.soup.handle_data(data)
+        self._document_might_be_xml(data)
+        self.soup.endData(ProcessingInstruction)
+
+
+class HTMLParserTreeBuilder(HTMLTreeBuilder):
+    """A Beautiful soup `bs4.builder.TreeBuilder` that uses the
+    :py:class:`html.parser.HTMLParser` parser, found in the Python
+    standard library.
+
+    """
+
+    is_xml: bool = False
+    picklable: bool = True
+    NAME: str = HTMLPARSER
+    features: Iterable[str] = [NAME, HTML, STRICT]
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> for s in ['<p>a</p>\n\nB', '<p>a</p> \nB', '<p>a</p>\n B', '<div>a</div>\n\n<div>b</div>', '<div>a</div>  \n<div>b</div>']:
+[?2004l[?2004h>     o = str(BeautifulSoup(s, 'html.parser'))
+[?2004l[?2004h>     print(repr(s), '->', 'SAME' if o == s else 'DIFF: ' + repr(o))
+[?2004l[?2004h> "
+[?2004l'<p>a</p>\n\nB' -> SAME
+'<p>a</p> \nB' -> SAME
+'<p>a</p>\n B' -> SAME
+'<div>a</div>\n\n<div>b</div>' -> DIFF: '<div>a</div>\n<div>b</div>'
+'<div>a</div>  \n<div>b</div>' -> DIFF: '<div>a</div>\n<div>b</div>'
+[?2004hroot@f1ab57b2984f:/app# grep -n 'def handle_data' /usr/local/lib/python3.13/site-packages/bs4/element.py /usr/local/lib/python3.13/site-packages/bs4/__init__.py M[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Ky
+[?2004l/usr/local/lib/python3.13/site-packages/bs4/__init__.py:1065:    def handle_data(self, data: str) -> None:
+[?2004hroot@f1ab57b2984f:/app# awk '/def handle_data/,/^    def [a-z]/' /usr/local/lib/python3.13/site-packages/bs4/__init__.py | head -40
+[?2004l    def handle_data(self, data: str) -> None:
+[?2004hroot@f1ab57b2984f:/app# sed -n '1050,1110p' /usr/local/lib/python3.13/site-packages/bs4/__init__.py
+[?2004l        self.pushTag(tag)
+        return tag
+
+    def handle_endtag(self, name: str, nsprefix: Optional[str] = None) -> None:
+        """Called by the tree builder when an ending tag is encountered.
+
+        :param name: Name of the tag.
+        :param nsprefix: Namespace prefix for the tag.
+
+        :meta private:
+        """
+        # print("End tag: " + name)
+        self.endData()
+        self._popToTag(name, nsprefix)
+
+    def handle_data(self, data: str) -> None:
+        """Called by the tree builder when a chunk of textual data is
+        encountered.
+
+        :meta private:
+        """
+        self.current_data.append(data)
+
+    def decode(
+        self,
+        indent_level: Optional[int] = None,
+        eventual_encoding: _Encoding = DEFAULT_OUTPUT_ENCODING,
+        formatter: Union[Formatter, str] = "minimal",
+        iterator: Optional[Iterator[PageElement]] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Returns a string representation of the parse tree
+            as a full HTML or XML document.
+
+        :param indent_level: Each line of the rendering will be
+           indented this many levels. (The ``formatter`` decides what a
+           'level' means, in terms of spaces or other characters
+           output.) This is used internally in recursive calls while
+           pretty-printing.
+        :param eventual_encoding: The encoding of the final document.
+            If this is None, the document will be a Unicode string.
+        :param formatter: Either a `Formatter` object, or a string naming one of
+            the standard formatters.
+        :param iterator: The iterator to use when navigating over the
+            parse tree. This is only used by `Tag.decode_contents` and
+            you probably won't need to use it.
+        """
+        if self.is_xml:
+            # Print the XML declaration
+            encoding_part = ""
+            declared_encoding: Optional[str] = eventual_encoding
+            if eventual_encoding in PYTHON_SPECIFIC_ENCODINGS:
+                # This is a special Python encoding; it can't actually
+                # go into an XML document because it means nothing
+                # outside of Python.
+                declared_encoding = None
+            if declared_encoding is not None:
+                encoding_part = ' encoding="%s"' % declared_encoding
+            prefix = '<?xml version="1.0"%s?>\n' % encoding_part
+        else:
+            prefix = ""
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> import html.parser
+[?2004l[?2004h> class P(html.parser.HTMLParser):
+[?2004l[?2004h>     def handle_data(self, d): print('  DATA', repr(d))
+[?2004l[?2004h>     def handle_starttag(self, t, a): print('  START', t)
+[?2004l[?2004h>     def handle_endtag(self, t): print('  END', t)
+[?2004l[?2004h> for s in ['<div>a</div>\n\n<div>b</div>', '<div>a</div>\n\nB']:
+[?2004l[?2004h>     print(repr(s))
+[?2004l[?2004h>     P().feed(s); P().close()
+[?2004l[?2004h> " 2>/dev/null | head -20
+[?2004l'<div>a</div>\n\n<div>b</div>'
+  START div
+  DATA 'a'
+  END div
+  DATA '\n\n'
+  START div
+  DATA 'b'
+  END div
+'<div>a</div>\n\nB'
+  START div
+  DATA 'a'
+  END div
+  DATA '\n\nB'
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> s = BeautifulSoup('<div>a</div>\n\n<div>b</div>', 'html.parser')
+[?2004l[?2004h> for e in s.descendants:
+[?2004l[?2004h>     print(type(e).__name__, repr(str(e)))
+[?2004l[?2004h> "
+[?2004lTag '<div>a</div>'
+NavigableString 'a'
+NavigableString '\n'
+Tag '<div>b</div>'
+NavigableString 'b'
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup as BS
+[?2004l[?2004h> from bs4.element import Tag
+[?2004l[?2004h> orig_insert = Tag.insert
+[?2004l[?2004h> def insert(self, position, *args, **kwargs):
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         print('INSERT into', self.name, [repr(a)[:60] for a in args][:3])
+[?2004l[?2004h>     except Exception: pass
+[?2004l[?2004h>     return orig_insert(self, position, *args, **kwargs)
+[?2004l[?2004h> Tag.insert = insert
+[?2004l[?2004h> s = BS('<div>a</div>\n\n<div>b</div>', 'html.parser')
+[?2004l[?2004h> print('OUT', repr(str(s)))
+[?2004l[?2004h> " 2>&1 | head -40
+[?2004lOUT '<div>a</div>\n<div>b</div>'
+[?2004hroot@f1ab57b2984f:/app# grep -n 'def endData\|def _enddata\|current_data' /usr/local/lib/python3.13/site-packages/bs4/__init__.py
+[?2004l186:    current_data: List[str]  #: :meta private:
+673:        self.current_data = []
+826:    def endData(self, containerClass: Optional[Type[NavigableString]] = None) -> None:
+835:        if self.current_data:
+836:            current_data = "".join(self.current_data)
+842:                for i in current_data:
+847:                    if "\n" in current_data:
+848:                        current_data = "\n"
+850:                        current_data = " "
+853:            self.current_data = []
+859:                and (not self.parse_only.allow_string_creation(current_data))
+864:            o = containerClass(current_data)
+1071:        self.current_data.append(data)
+[?2004hroot@f1ab57b2984f:/app# sed -n '/def endData/,/^    def [a-z]/p' /usr/local/lib/python3.13/site-packages/bs4/__init__.py | head -60
+[?2004l    def endData(self, containerClass: Optional[Type[NavigableString]] = None) -> None:
+        """Method called by the TreeBuilder when the end of a data segment
+        occurs.
+
+        :param containerClass: The class to use when incorporating the
+        data segment into the parse tree.
+
+        :meta private:
+        """
+        if self.current_data:
+            current_data = "".join(self.current_data)
+            # If whitespace is not preserved, and this string contains
+            # nothing but ASCII spaces, replace it with a single space
+            # or newline.
+            if not self.preserve_whitespace_tag_stack:
+                strippable = True
+                for i in current_data:
+                    if i not in self.ASCII_SPACES:
+                        strippable = False
+                        break
+                if strippable:
+                    if "\n" in current_data:
+                        current_data = "\n"
+                    else:
+                        current_data = " "
+
+            # Reset the data collector.
+            self.current_data = []
+
+            # Should we add this string to the tree at all?
+            if (
+                self.parse_only
+                and len(self.tagStack) <= 1
+                and (not self.parse_only.allow_string_creation(current_data))
+            ):
+                return
+
+            containerClass = self.string_container(containerClass)
+            o = containerClass(current_data)
+            self.object_was_parsed(o)
+
+    def object_was_parsed(
+[?2004hroot@f1ab57b2984f:/app# grep -rn 'attribute' /usr/local/lib/python3.13/site-packages/bs4/builder/__init__.py | head; grep -n 'sorted' /usr/local/lib/python3.13/site-packages/bs4/builder/__init__.py /usr/local/lib/python3.13/site-packages/bs4/element.py | head
+[?2004l102:           `TreeBuilder.features` attribute should list its features.
+165:    :param multi_valued_attributes: If this is set to None, the
+166:     TreeBuilder will not turn any values for attributes like
+171:     Internally, these are called "CDATA list attributes", but that
+173:     is ``multi_valued_attributes``.
+195:    :param attribute_dict_class: The value of a multi-valued attribute
+206:        multi_valued_attributes: Dict[str, Set[str]] = USE_DEFAULT,
+211:        attribute_dict_class: Type[AttributeDict] = AttributeDict,
+212:        attribute_value_list_class: Type[AttributeValueList] = AttributeValueList,
+215:        if multi_valued_attributes is self.USE_DEFAULT:
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> from bs4.builder import HTMLParserTreeBuilder
+[?2004l[?2004h> class WP(HTMLParserTreeBuilder):
+[?2004l[?2004h>     def endData(self, containerClass=None):
+[?2004l[?2004h>         if self.current_data:
+[?2004l[?2004h>             current_data = ''.join(self.current_data)
+[?2004l[?2004h>             self.current_data = []
+[?2004l[?2004h>             if (self.parse_only and len(self.tagStack) <= 1
+[?2004l[?2004h>                     and not self.parse_only.allow_string_creation(current_data)):
+[?2004l[?2004h>                 return
+[?2004l[?2004h>             containerClass = self.string_container(containerClass)
+[?2004l[?2004h>             o = containerClass(current_data)
+[?2004l[?2004h>             self.object_was_parsed(o)
+[?2004l[?2004h> data = open('/tmp/clean.orig').read()
+[?2004l[?2004h> s = BeautifulSoup(data, 'html.parser', builder=WP())
+[?2004l[?2004h> out = str(s)
+[?2004l[?2004h> print('SAME' if out == data else 'DIFF')
+[?2004l[?2004h> if out != data:
+[?2004l[?2004h>     import difflib
+[?2004l[?2004h>     for l in difflib.unified_diff(data.splitlines(), out.splitlines(), lineterm=''):
+[?2004l[?2004h>         print(l)
+[?2004l[?2004h> "
+[?2004lDIFF
+--- 
++++ 
+@@ -1,7 +1,4 @@
+ <html><head><style>.a{color:red}</style>
+-
+-<link rel="x" href="y"></head>
+-
++<link href="y" rel="x"/></head>
+ <body><p>one</p>
+-
+ <p>two</p></body></html>
+[?2004hroot@f1ab57b2984f:/app# sed -n '/def __init__/,/self.builder = /p' /usr/local/lib/python3.13/site-packages/bs4/__init__.py | sed -n '1,80p' | grep -n 'features\|builder' | head -20
+[?2004l4:        features: Optional[Union[str, Sequence[str]]] = None,
+5:        builder: Optional[Union[TreeBuilder, Type[TreeBuilder]]] = None,
+17:        :param features: Desirable features of the parser to be
+25:        :param builder: A TreeBuilder subclass to instantiate (or
+27:         `features`. You only need to use this if you've implemented a
+74:                "BeautifulSoup constructor. The tree builder is responsible "
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> from bs4.builder import HTMLParserTreeBuilder
+[?2004l[?2004h> class WP(HTMLParserTreeBuilder):
+[?2004l[?2004h>     def endData(self, containerClass=None):
+[?2004l[?2004h>         if self.current_data:
+[?2004l[?2004h>             cd = ''.join(self.current_data)
+[?2004l[?2004h>             print('endData:', repr(cd))
+[?2004l[?2004h>             super().endData(containerClass)
+[?2004l[?2004h> s = BeautifulSoup('<div>a</div>\n\n<div>b</div>', 'html.parser', builder=WP())
+[?2004l[?2004h> print('BUILDER:', type(s.builder).__name__)
+[?2004l[?2004h> print(repr(str(s)))
+[?2004l[?2004h> "
+[?2004lBUILDER: WP
+'<div>a</div>\n<div>b</div>'
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> import difflib
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> class WSSoup(BeautifulSoup):
+[?2004l[?2004h>     def endData(self, containerClass=None):
+[?2004l[?2004h>         if self.current_data:
+[?2004l[?2004h>             current_data = ''.join(self.current_data)
+[?2004l[?2004h>             self.current_data = []
+[?2004l[?2004h>             containerClass = self.string_container(containerClass)
+[?2004l[?2004h>             o = containerClass(current_data)
+[?2004l[?2004h>             self.object_was_parsed(o)
+[?2004l[?2004h> s = WSSoup('<div>a</div>\n\n<div>b</div>', 'html.parser')
+[?2004l[?2004h> print('div case:', repr(str(s)))
+[?2004l[?2004h> data = open('/tmp/clean.orig').read()
+[?2004l[?2004h> out = str(WSSoup(data, 'html.parser'))
+[?2004l[?2004h> print('SAME' if out == data else 'DIFF')
+[?2004l[?2004h> if out != data:
+[?2004l[?2004h>     for l in difflib.unified_diff(data.splitlines(), out.splitlines(), lineterm=''):
+[?2004l[?2004h>         print(l)
+[?2004l[?2004h> "
+[?2004ldiv case: '<div>a</div>\n\n<div>b</div>'
+DIFF
+--- 
++++ 
+@@ -1,6 +1,6 @@
+ <html><head><style>.a{color:red}</style>
+ 
+-<link rel="x" href="y"></head>
++<link href="y" rel="x"/></head>
+ 
+ <body><p>one</p>
+ 
+[?2004hroot@f1ab57b2984f:/app# printf '<!DOCTYPE html>\n<html><head><title>t</title></head>\n\n<body>\n\n<p>a</p></body></html>' > /tmp/doc.html; python3 -c "
+[?2004l[?2004h> import difflib
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> class WSSoup(BeautifulSoup):
+[?2004l[?2004h>     def endData(self, containerClass=None):
+[?2004l[?2004h>         if self.current_data:
+[?2004l[?2004h>             current_data = ''.join(self.current_data)
+[?2004l[?2004h>             self.current_data = []
+[?2004l[?2004h>             containerClass = self.string_container(containerClass)
+[?2004l[?2004h>             o = containerClass(current_data)
+[?2004l[?2004h>             self.object_was_parsed(o)
+[?2004l[?2004h> data = open('/tmp/doc.html').read()
+[?2004l[?2004h> out = str(WSSoup(data, 'html.parser'))
+[?2004l[?2004h> print('SAME' if out == data else 'DIFF')
+[?2004l[?2004h> for l in difflib.unified_diff(data.splitlines(), out.splitlines(), lineterm=''):
+[?2004l[?2004h>     print(l)
+[?2004l[?2004h> "
+[?2004lDIFF
+--- 
++++ 
+@@ -1,4 +1,5 @@
+ <!DOCTYPE html>
++
+ <html><head><title>t</title></head>
+ 
+ <body>
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> class WSSoup(BeautifulSoup):
+[?2004l[?2004h>     def endData(self, containerClass=None):
+[?2004l[?2004h>         if self.current_data:
+[?2004l[?2004h>             current_data = ''.join(self.current_data)
+[?2004l[?2004h>             self.current_data = []
+[?2004l[?2004h>             containerClass = self.string_container(containerClass)
+[?2004l[?2004h>             o = containerClass(current_data)
+[?2004l[?2004h>             self.object_was_parsed(o)
+[?2004l[?2004h> print(repr(str(WSSoup('<!DOCTYPE html>\nX', 'html.parser'))))
+[?2004l[?2004h> print(repr(str(WSSoup('<!DOCTYPE html>abc', 'html.parser'))))
+[?2004l[?2004h> "
+[?2004l'<!DOCTYPE html>\n\nX'
+'<!DOCTYPE html>\nabc'
+[?2004hroot@f1ab57b2984f:/app# grep -n 'class Doctype\|class CData\|def decode' /usr/local/lib/python3.13/site-packages/bs4/element.py | head; grep -n 'attrs' /usr/local/lib/python3.13/site-packages/bs4/element.py | grep -n 'items\|sorted\|list(' | head
+[?2004l1459:class CData(PreformattedString):
+1494:class Doctype(PreformattedString):
+2342:    def decode(
+2627:    def decode_contents(
+43:1694:                for k, v in attrs.items():
+[?2004hroot@f1ab57b2984f:/app# sed -n '1494,1545p' /usr/local/lib/python3.13/site-packages/bs4/element.py
+[?2004lclass Doctype(PreformattedString):
+    """A `document type declaration <https://www.w3.org/TR/REC-xml/#dt-doctype>`_."""
+
+    @classmethod
+    def for_name_and_ids(
+        cls, name: str, pub_id: Optional[str], system_id: Optional[str]
+    ) -> Doctype:
+        """Generate an appropriate document type declaration for a given
+        public ID and system ID.
+
+        :param name: The name of the document's root element, e.g. 'html'.
+        :param pub_id: The Formal Public Identifier for this document type,
+            e.g. '-//W3C//DTD XHTML 1.1//EN'
+        :param system_id: The system identifier for this document type,
+            e.g. 'http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd'
+        """
+        return Doctype(cls._string_for_name_and_ids(name, pub_id, system_id))
+
+    @classmethod
+    def _string_for_name_and_ids(
+        self, name: str, pub_id: Optional[str], system_id: Optional[str]
+    ) -> str:
+        """Generate a string to be used as the basis of a Doctype object.
+
+        This is a separate method from for_name_and_ids() because the lxml
+        TreeBuilder needs to call it.
+        """
+        value = name or ""
+        if pub_id is not None:
+            value += ' PUBLIC "%s"' % pub_id
+            if system_id is not None:
+                value += ' "%s"' % system_id
+        elif system_id is not None:
+            value += ' SYSTEM "%s"' % system_id
+        return value
+
+    PREFIX: str = "<!DOCTYPE "
+    SUFFIX: str = ">\n"
+
+
+class Stylesheet(NavigableString):
+    """A `NavigableString` representing the contents of a `<style> HTML
+    tag <https://dev.w3.org/html5/spec-LC/Overview.html#the-style-element>`_
+    (probably CSS).
+
+    Used to distinguish embedded stylesheets from textual content.
+    """
+
+
+class Script(NavigableString):
+    """A `NavigableString` representing the contents of a `<script>
+    HTML tag
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> print(repr(str(BeautifulSoup('<link rel=\"x\" href=\"y\">', 'html.parser'))))
+[?2004l[?2004h> print(repr(str(BeautifulSoup('<link href=\"y\" rel=\"x\">', 'html.parser'))))
+[?2004l[?2004h> print(repr(str(BeautifulSoup('<z b=\"1\" a=\"2\" c=\"3\">t</z>', 'html.parser'))))
+[?2004l[?2004h> "
+[?2004l'<link href="y" rel="x"/>'
+'<link href="y" rel="x"/>'
+'<z a="2" b="1" c="3">t</z>'
+[?2004hroot@f1ab57b2984f:/app# grep -n 'class AttributeDict' /usr/local/lib/python3.13/site-packages/bs4/element.py && sed -n '/^class AttributeDict/,/^class /p' /usr/local/lib/python3.13/site-packages/bs4/element.py | head -40
+[?2004l226:class AttributeDict(Dict[Any,Any]):
+class AttributeDict(Dict[Any,Any]):
+    """Superclass for the dictionary used to hold a tag's
+    attributes. You can use this, but it's just a regular dict with no
+    special logic.
+    """
+
+
+class XMLAttributeDict(AttributeDict):
+[?2004hroot@f1ab57b2984f:/app# sed -n '1680,1700p' /usr/local/lib/python3.13/site-packages/bs4/element.py
+[?2004l        self.attribute_value_list_class = attribute_value_list_class
+
+        if attrs is None:
+            self.attrs = attr_dict_class()
+        else:
+            if builder is not None and builder.cdata_list_attributes:
+                self.attrs = builder._replace_cdata_list_attribute_values(
+                    self.name, attrs
+                )
+            else:
+                self.attrs = attr_dict_class()
+                # Make sure that the values of any multi-valued
+                # attributes (e.g. when a Tag is copied) are stored in
+                # new lists.
+                for k, v in attrs.items():
+                    if isinstance(v, list):
+                        v = v.__class__(v)
+                    self.attrs[k] = v
+
+        # If possible, determine ahead of time whether this tag is an
+        # XML tag.
+[?2004hroot@f1ab57b2984f:/app# sed -n '/def _replace_cdata_list_attribute_values/,/^    def /p' /usr/local/lib/python3.13/site-packages/bs4/builder/__init__.py | head -45
+[?2004l    def _replace_cdata_list_attribute_values(
+        self, tag_name: str, attrs: _RawOrProcessedAttributeValues
+    ) -> _AttributeValues:
+        """When an attribute value is associated with a tag that can
+        have multiple values for that attribute, convert the string
+        value to a list of strings.
+
+        Basically, replaces class="foo bar" with class=["foo", "bar"]
+
+        NOTE: This method modifies its input in place.
+
+        :param tag_name: The name of a tag.
+        :param attrs: A dictionary containing the tag's attributes.
+           Any appropriate attribute values will be modified in place.
+        :return: The modified dictionary that was originally passed in.
+        """
+
+        # First, cast the attrs dict to _AttributeValues. This might
+        # not be accurate yet, but it will be by the time this method
+        # returns.
+        modified_attrs = cast(_AttributeValues, attrs)
+        if not modified_attrs or not self.cdata_list_attributes:
+            # Nothing to do.
+            return modified_attrs
+
+        # There is at least a possibility that we need to modify one of
+        # the attribute values.
+        universal: Set[str] = self.cdata_list_attributes.get("*", set())
+        tag_specific = self.cdata_list_attributes.get(tag_name.lower(), None)
+        for attr in list(modified_attrs.keys()):
+            modified_value: _AttributeValue
+            if attr in universal or (tag_specific and attr in tag_specific):
+                # We have a "class"-type attribute whose string
+                # value is a whitespace-separated list of
+                # values. Split it into a list.
+                original_value: _AttributeValue = modified_attrs[attr]
+                if isinstance(original_value, _RawAttributeValue):
+                    # This is a _RawAttributeValue (a string) that
+                    # needs to be split and converted to a
+                    # AttributeValueList so it can be an
+                    # _AttributeValue.
+                    modified_value = self.attribute_value_list_class(
+                        nonwhitespace_re.findall(original_value)
+                    )
+                else:
+[?2004hroot@f1ab57b2984f:/app# sed -n '2342,2460p' /usr/local/lib/python3.13/site-packages/bs4/element.py | grep -n 'attr\|sorted\|for ' | head -20
+[?2004l17:           responsible for performing that encoding. This information
+45:        for event, element in self._event_stream(iterator):
+117:    # Stand-ins for the different events yielded by _event_stream
+[?2004hroot@f1ab57b2984f:/app# python3 -c "
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> s = BeautifulSoup('<z b=\"1\" a=\"2\" c=\"3\">t</z>', 'html.parser')
+[?2004l[?2004h> z = s.find('z')
+[?2004l[?2004h> print(list(z.attrs.items()))
+[?2004l[?2004h> print(list(z.attrs.keys()))
+[?2004l[?2004h> "
+[?2004l[('b', '1'), ('a', '2'), ('c', '3')]
+['b', 'a', 'c']
+[?2004hroot@f1ab57b2984f:/app# grep -n 'for attr' /usr/local/lib/python3.13/site-packages/bs4/element.py; grep -rn 'sort' /usr/local/lib/python3.13/site-packages/bs4/ | grep -v '.pyc' | head
+[?2004l1816:        for attr in ("can_be_empty_element", "hidden"):
+grep: /usr/local/lib/python3.13/site-packages/bs4/__pycache__/dammit.cpython-313.pyc: binary file matches
+grep: /usr/local/lib/python3.13/site-packages/bs4/__pycache__/diagnose.cpython-313.pyc: binary file matches
+grep: /usr/local/lib/python3.13/site-packages/bs4/__pycache__/formatter.cpython-313.pyc: binary file matches
+grep: /usr/local/lib/python3.13/site-packages/bs4/tests/__pycache__/test_css.cpython-313.pyc: binary file matches
+grep: /usr/local/lib/python3.13/site-packages/bs4/tests/__pycache__/test_formatter.cpython-313.pyc: binary file matches
+/usr/local/lib/python3.13/site-packages/bs4/builder/__init__.py:831:# want to use HTMLParser as a last resort.
+/usr/local/lib/python3.13/site-packages/bs4/dammit.py:158:        for name_with_semicolon, character in sorted(html5.items()):
+/usr/local/lib/python3.13/site-packages/bs4/dammit.py:818:            # None of the encodings worked. As an absolute last resort,
+/usr/local/lib/python3.13/site-packages/bs4/diagnose.py:262:    stats.sort_stats("cumulative")
+/usr/local/lib/python3.13/site-packages/bs4/element.py:1740:                # This sort of tag uses a special string container
+/usr/local/lib/python3.13/site-packages/bs4/filter.py:582:                #     [f"{k}={v}" for k, v in sorted(tag.attrs.items())]
+/usr/local/lib/python3.13/site-packages/bs4/formatter.py:175:        By default, attributes are sorted alphabetically. This makes
+/usr/local/lib/python3.13/site-packages/bs4/formatter.py:187:        return sorted(
+/usr/local/lib/python3.13/site-packages/bs4/tests/test_css.py:103:        el_ids.sort()
+/usr/local/lib/python3.13/site-packages/bs4/tests/test_css.py:104:        expected_ids.sort()
+[?2004hroot@f1ab57b2984f:/app# sed -n '150,200p' /usr/local/lib/python3.13/site-packages/bs4/formatter.py; grep -n 'class PreformattedString' -A 25 /usr/local/lib/python3.13/site-packages/bs4/element.py | head -30
+[?2004l
+        if (
+            isinstance(ns, NavigableString)
+            and ns.parent is not None
+            and ns.parent.name in self.cdata_containing_tags
+        ):
+            # Do nothing.
+            return ns
+        # Substitute.
+        return self.entity_substitution(ns)
+
+    def attribute_value(self, value: str) -> str:
+        """Process the value of an attribute.
+
+        :param ns: A string.
+        :return: A string with certain characters replaced by named
+           or numeric entities.
+        """
+        return self.substitute(value)
+
+    def attributes(
+        self, tag: bs4.element.Tag
+    ) -> Iterable[Tuple[str, Optional[_AttributeValue]]]:
+        """Reorder a tag's attributes however you want.
+
+        By default, attributes are sorted alphabetically. This makes
+        behavior consistent between Python 2 and Python 3, and preserves
+        backwards compatibility with older versions of Beautiful Soup.
+
+        If `empty_attributes_are_booleans` is True, then
+        attributes whose values are set to the empty string will be
+        treated as boolean attributes.
+        """
+        if tag.attrs is None:
+            return []
+
+        items: Iterable[Tuple[str, _AttributeValue]] = list(tag.attrs.items())
+        return sorted(
+            (k, (None if self.empty_attributes_are_booleans and v == "" else v))
+            for k, v in items
+        )
+
+
+class HTMLFormatter(Formatter):
+    """A generic Formatter for HTML."""
+
+    REGISTRY: Dict[Optional[str], HTMLFormatter] = {}
+
+    def __init__(
+        self,
+        entity_substitution: Optional[_EntitySubstitutionFunction] = None,
+1432:class PreformattedString(NavigableString):
+1433-    """A `NavigableString` not subject to the normal formatting rules.
+1434-
+1435-    This is an abstract class used for special kinds of strings such
+1436-    as comments (`Comment`) and CDATA blocks (`CData`).
+1437-    """
+1438-
+1439-    PREFIX: str = ""
+1440-    SUFFIX: str = ""
+1441-
+1442-    def output_ready(self, formatter: Optional[_FormatterOrName] = None) -> str:
+1443-        """Make this string ready for output by adding any subclass-specific
+1444-            prefix or suffix.
+1445-
+1446-        :param formatter: A `Formatter` object, or a string naming one
+1447-            of the standard formatters. The string will be passed into the
+1448-            `Formatter`, but only to trigger any side effects: the return
+1449-            value is ignored.
+1450-
+1451-        :return: The string, with any subclass-specific prefix and
+1452-           suffix added on.
+1453-        """
+1454-        if formatter is not None:
+1455-            self.format_string(self, formatter)
+1456-        return self.PREFIX + self + self.SUFFIX
+1457-
+[?2004hroot@f1ab57b2984f:/app# cat > /app/filter.py << 'PYEOF'
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> """filter.py - Remove JavaScript from an HTML file to mitigate XSS attacks.
+[?2004l[?2004h> 
+[?2004l[?2004h> Usage:
+[?2004l[?2004h>     python3 filter.py <path-to-html-file>
+[?2004l[?2004h> 
+[?2004l [?2004h> The file is modified in-place.  Legitimate HTML structure, formatting and
+[?2004l[?2004h> non-dangerous attributes are preserved; only potentially executable content
+[?2004l[?2004h> is removed:
+[?2004l[?2004h> 
+[?2004l [?2004h>   * <script> elements (anywhere, e.g. inside <svg>)
+[?2004l[?2004h>   * HTML event-handler attributes (onclick, onerror, onload, ...)
+[?2004l[?2004h>   * URLs using active content schemes (javascript:, vbscript:,
+[?2004lt[?2004h>     data:text/html, and data: URLs on frame-like elements)
+[?2004l[?2004h>   * active CSS constructs (expression(), -moz-binding, javascript: urls)
+[?2004lva[?2004h>   * <meta http-equiv=refresh> redirects pointing at active schemes
+[?2004l[?2004h>   * <iframe srcdoc> attributes (untrusted inline HTML)
+[?2004l[?2004h>   * comments that contain <script> markup
+[?2004l[?2004h> """
+[?2004l[?2004h> 
+[?2004l [?2004h> import re
+[?2004l[?2004h> import sys
+[?2004l [?2004h> 
+[?2004l#[?2004h> from bs4 import BeautifulSoup
+[?2004l [?2004h> from bs4.element import Comment, Doctype
+[?2004l[?2004h> from bs4.formatter import HTMLFormatter
+[?2004l[?2004h> 
+[?2004l [?2004h> # Render doctypes without the trailing newline BS4 normally appends.
+[?2004l[?2004h> Doctype.SUFFIX = ">"
+[?2004l[?2004h> 
+[?2004ls[?2004h> 
+[?2004ls[?2004h> class WSSoup(BeautifulSoup):
+[?2004l[?2004h>     """BeautifulSoup that keeps whitespace-only text nodes verbatim.
+[?2004l[?2004h> 
+[?2004l[?2004h>     BS4 normally collapses whitespace-only text between elements down to
+[?2004l[?2004h>     a single space/newline; we preserve the original text exactly.
+[?2004l[?2004h>     """
+[?2004l   [?2004h> 
+[?2004l [?2004h>     def endData(self, containerClass=None):
+[?2004l[?2004h>         if self.current_data:
+[?2004lg[?2004h>             current_data = "".join(self.current_data)
+[?2004l[?2004h>             self.current_data = []
+[?2004l[?2004h>             if (
+[?2004lx[?2004h>                 self.parse_only
+[?2004l[?2004h>                 and len(self.tagStack) <= 1
+[?2004l[?2004h>                 and not self.parse_only.allow_string_creation(current_data)
+[?2004l[?2004h>             ):
+[?2004l[?2004h>                 return
+[?2004lou[?2004h>             containerClass = self.string_container(containerClass)
+[?2004l[?2004h>             o = containerClass(current_data)
+[?2004l[?2004h>             self.object_was_parsed(o)
+[?2004lt[?2004h> 
+[?2004le[?2004h> 
+[?2004lr[?2004h> class KeepOrderFormatter(HTMLFormatter):
+[?2004l[?2004h>     """Formatter that keeps attributes in document order (no sorting)."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     def attributes(self, tag):
+[?2004l[?2004h>         if tag.attrs is None:
+[?2004l[?2004h>             return []
+[?2004l[?2004h>         return [
+[?2004l[?2004h>             (k, (None if self.empty_attributes_are_booleans and v == "" else v))
+[?2004l[?2004h>             for k, v in tag.attrs.items()
+[?2004l([?2004h>         ]
+[?2004l [?2004h> 
+[?2004l [?2004h> 
+[?2004l [?2004h> # Attributes that carry URLs
+[?2004l P[?2004h> URL_ATTRS = {
+[?2004lS[?2004h>     "href", "src", "action", "formaction", "data", "poster", "background",
+[?2004l[?2004h>     "xlink:href", "cite", "longdesc", "usemap", "profile", "codebase",
+[?2004l[?2004h>     "classid", "lowsrc", "dynsrc",
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l [?2004h> # Elements where *any* data: URL is an XSS vector
+[?2004lg[?2004h> FRAME_LIKE = {"iframe", "frame", "object", "embed", "applet"}
+[?2004lv[?2004h> 
+[?2004l[?2004h> # Whitespace / control characters used to obfuscate scheme prefixes
+[?2004l[?2004h> SCHEME_JUNK = re.compile(r"[\x00-\x20\x7f\u2028\u2029\ufeff]+")
+[?2004l[?2004h> 
+[?2004l [?2004h> ACTIVE_SCHEMES = ("javascript:", "vbscript:", "livescript:", "mocha:")
+[?2004l[?2004h> 
+[?2004lr[?2004h> # Dangerous CSS constructs
+[?2004l
+[?2004h> CSS_BAD = re.compile(
+[?2004li[?2004h>     r"expression\s*\(|"
+[?2004l[?2004h>     r"(javascript|vbscript|livescript|mocha)\s*[:)]|"
+[?2004lpe[?2004h>     r"-moz-binding",
+[?2004lr[?2004h>     re.IGNORECASE,
+[?2004l[?2004h> )
+[?2004lax[?2004h> 
+[?2004l [?2004h> # Replaces a dangerous substring inside <style> text with an empty string
+[?2004l[?2004h> CSS_REMOVE = re.compile(
+[?2004l[?2004h>     r"expression\s*\([^)]*\)\)?"
+[?2004l[?2004h>     r"|(javascript|vbscript|livescript|mocha)\s*:[^\"'()<>\s]*"
+[?2004l[?2004h>     r"|-moz-binding\s*:[^;}>\"]*",
+[?2004l[?2004h>     re.IGNORECASE,
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def scheme_clean(value):
+[?2004l[?2004h>     """Lowercase a URL value with whitespace/control chars stripped out."""
+[?2004l[?2004h>     return SCHEME_JUNK.sub("", str(value)).lower()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def is_dangerous_url(value, tag_name=""):
+[?2004l[?2004h>     if value is None:
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     v = scheme_clean(value)
+[?2004l[?2004h>     for scheme in ACTIVE_SCHEMES:
+[?2004l[?2004h>         if v.startswith(scheme):
+[?2004l[?2004h>             return True
+[?2004l[?2004h>     if v.startswith("data:"):
+[?2004l[?2004h>         if "text/html" in v:
+[?2004l[?2004h>             return True
+[?2004l[?2004h>         if tag_name in FRAME_LIKE:
+[?2004l[?2004h>             return True
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def dangerous_css(value):
+[?2004l[?2004h>     return bool(CSS_BAD.search(str(value)))
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_url_attr(tag, attr, value, tag_name):
+[?2004l[?2004h>     if attr == "srcset" or attr == "imagesrcset":
+[?2004l[?2004h>         urls = []
+[?2004l[?2004h>         for entry in str(value).split(","):
+[?2004l[?2004h>             entry = entry.strip()
+[?2004l[?2004h>             if entry:
+[?2004l[?2004h>                 urls.append(entry.split()[0])
+[?2004l[?2004h>         return any(is_dangerous_url(u, tag_name) for u in urls)
+[?2004l[?2004h>     return is_dangerous_url(value, tag_name)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_meta_refresh(tag):
+[?2004l[?2004h>     """Drop the content attr of <meta http-equiv=refresh> active redirects."""
+[?2004l[?2004h>     if str(tag.get("http-equiv", "")).lower() != "refresh":
+[?2004l[?2004h>         return
+[?2004l[?2004h>     content = tag.get("content")
+[?2004l[?2004h>     if not content:
+[?2004l[?2004h>         return
+[?2004l[?2004h>     for part in re.findall(r"url\s*=\s*([^;\s]+)", str(content), re.IGNORECASE):
+[?2004l[?2004h>         if is_dangerous_url(part, "meta"):
+[?2004l[?2004h>             del tag["content"]
+[?2004l[?2004h>             return
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_tag(tag):
+[?2004l[?2004h>     tag_name = (tag.name or "").lower()
+[?2004l[?2004h>     for attr in list(tag.attrs.keys()):
+[?2004l[?2004h>         lname = attr.lower().strip()
+[?2004l[?2004h>         value = tag.attrs[attr]
+[?2004l[?2004h>         if isinstance(value, list):
+[?2004l[?2004h>             value = " ".join(str(v) for v in value)
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Event handler attributes
+[?2004l[?2004h>         if lname.startswith("on") and len(lname) > 2:
+[?2004l[?2004h>             del tag.attrs[attr]
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Untrusted inline HTML
+[?2004l[?2004h>         if lname == "srcdoc":
+[?2004l[?2004h>             del tag.attrs[attr]
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Inline styles with active CSS
+[?2004l[?2004h>         if lname == "style":
+[?2004l[?2004h>             if dangerous_css(value):
+[?2004l[?2004h>                 del tag.attrs[attr]
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # URLs with active content schemes
+[?2004l[?2004h>         if lname in URL_ATTRS:
+[?2004l[?2004h>             if clean_url_attr(tag, lname, value, tag_name):
+[?2004l[?2004h>                 del tag.attrs[attr]
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>     clean_meta_refresh(tag)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_style_element(style_tag):
+[?2004l[?2004h>     text = style_tag.string if style_tag.string is not None else style_tag.decode_contents()
+[?2004l[?2004h>     if text and CSS_BAD.search(text):
+[?2004l[?2004h>         style_tag.clear()
+[?2004l[?2004h>         style_tag.append(style_tag.string_container(CSS_REMOVE.sub("", text)))
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def clean_script_comments(soup):
+[?2004l[?2004h>     for comment in soup.find_all(string=lambda s: isinstance(s, Comment)):
+[?2004l[?2004h>         if re.search(r"(?is)\<\s*script", str(comment)):
+[?2004l[?2004h>             comment.extract()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def filter_html(html):
+[?2004l[?2004h>     soup = WSSoup(html, "html.parser")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 1. Remove all <script> elements (including <svg><script>)
+[?2004l[?2004h>     for el in soup.find_all("script"):
+[?2004l[?2004h>         el.decompose()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 2. Neutralize comments that smuggle <script> markup
+[?2004l[?2004h>     clean_script_comments(soup)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 3. Clean every remaining element
+[?2004l[?2004h>     for tag in soup.find_all(True):
+[?2004l[?2004h>         clean_tag(tag)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 4. Purge active CSS inside <style> blocks
+[?2004l[?2004h>     for style_tag in soup.find_all("style"):
+[?2004l[?2004h>         clean_style_element(style_tag)
+[?2004l[?2004h> 
+[?2004l[?2004h>     return soup.decode(formatter=KeepOrderFormatter())
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def main(argv):
+[?2004l[?2004h>     if len(argv) < 2:
+[?2004l[?2004h>         sys.stderr.write("usage: filter.py <html-file>\n")
+[?2004l[?2004h>         return 1
+[?2004l[?2004h> 
+[?2004l[?2004h>     path = argv[1]
+[?2004l[?2004h>     with open(path, "r", encoding="utf-8", errors="replace") as fh:
+[?2004l[?2004h>         html = fh.read()
+[?2004l[?2004h> 
+[?2004l[?2004h>     cleaned = filter_html(html)
+[?2004l[?2004h> 
+[?2004l[?2004h>     with open(path, "w", encoding="utf-8", newline="") as fh:
+[?2004l[?2004h>         fh.write(cleaned)
+[?2004l[?2004h>     return 0
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == "__main__":
+[?2004l[?2004h>     sys.exit(main(sys.argv))
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@f1ab57b2984f:/app# python3 -c "import ast; ast.parse(open('/app/filter.py').read()); print('syntax OK')"
+[?2004lsyntax OK
+[?2004hroot@f1ab57b2984f:/app# cp /tmp/clean.orig /tmp/clean2.html && python3 /app/filter.py /tmp/clean2.html && diff /tmp/clean.orig /tmp/clean2.html; echo "exit=$?"
+[?2004l3c3
+< <link rel="x" href="y"></head>
+---
+> <link rel="x" href="y"/></head>
+exit=1
+[?2004hroot@f1ab57b2984f:/app# printf '%s\n' '<!DOCTYPE html>' '<html>' '<head>' '<meta charset="utf-8">' '<meta http-equiv="refresh" content="0; url=javascript:alert(1)">' '<title>Test Page</title>' '<style>' 'body { color: blue; }' '.a { background: url(javascript:alert(1)); }' '.b { width: expression(alert(2)); }' '.c { font-family: sans-serif; }' '</style>' "<script>alert('top script')</script>" '</head>' '<body onload="alert(1)">' '<h1 id="header" class="main">Hello World</h1>' '<p style="margin: 0 auto">A normal paragraph. &amp; entities preserved.</p>' '<a href="https://example.com/">Safe link</a>' '<a href="javascript:alert(1)">bad link</a>' '<a href="JaVaScRiPt:alert(2)">bad link 2</a>' '<a href="vbscript:msgbox(1)">bad vbscript link</a>' '<a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">bad data link</a>' '<img src="x" onerror="alert(1)" alt="broken">' '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="ok gif">' '<svg width="10" height="10"><script>alert(3)</script><circle r="5"/></svg>' '<iframe src="javascript:alert(4)"></iframe>' '<iframe srcdoc="&lt;script&gt;alert(5)&lt;/script&gt;"></iframe>' '<iframe src="https://example.com/"></iframe>' '<form action="javascript:alert(6)" method="post"><input type="text" name="q" value="v" onfocus="alert(7)"><button formaction="javascript:alert(8)">Go</button></form>' '<!-- a normal comment -->' '<table border="1">' '<tr><th>Head</th></tr>' '<tr><td>Cell content</td></tr>' '</table>' '<button onclick="alert(9)" class="btn">Click me</button>' '<div onmouseover=alert(10) title="keep me">div text</div>' '</body>' '</html>' > /tmp/evil.html
+[?2004l[?2004hroot@f1ab57b2984f:/app# echo -e '<a id=realtab href="jav\tascript:alert(11)">real tab</a>' > /tmp/eviltab.html
+[?2004l[?2004hroot@f1ab57b2984f:/app# cp /tmp/eviltab.html /tmp/eviltab1.html
+[?2004l[?2004hroot@f1ab57b2984f:/app# python3 /app/filter.py /tmp/evil.html; python3 /app/filter.py /tmp/eviltab.html; echo === EVIL ===; cat /tmp/evil.html; echo === TAB ===; cat /tmp/eviltab.html
+[?2004lTraceback (most recent call last):
+  File [35m"/app/filter.py"[0m, line [35m230[0m, in [35m<module>[0m
+    sys.exit([31mmain[0m[1;31m(sys.argv)[0m)
+             [31m~~~~[0m[1;31m^^^^^^^^^^[0m
+  File [35m"/app/filter.py"[0m, line [35m222[0m, in [35mmain[0m
+    cleaned = filter_html(html)
+  File [35m"/app/filter.py"[0m, line [35m208[0m, in [35mfilter_html[0m
+    [31mclean_style_element[0m[1;31m(style_tag)[0m
+    [31m~~~~~~~~~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^[0m
+  File [35m"/app/filter.py"[0m, line [35m183[0m, in [35mclean_style_element[0m
+    style_tag.append([31mstyle_tag.string_container[0m[1;31m(CSS_REMOVE.sub("", text))[0m)
+                     [31m~~~~~~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mTypeError[0m: [35m'NoneType' object is not callable[0m
+=== EVIL ===
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url=javascript:alert(1)">
+<title>Test Page</title>
+<style>
+body { color: blue; }
+.a { background: url(javascript:alert(1)); }
+.b { width: expression(alert(2)); }
+.c { font-family: sans-serif; }
+</style>
+<script>alert('top script')</script>
+</head>
+<body onload="alert(1)">
+<h1 id="header" class="main">Hello World</h1>
+<p style="margin: 0 auto">A normal paragraph. &amp; entities preserved.</p>
+<a href="https://example.com/">Safe link</a>
+<a href="javascript:alert(1)">bad link</a>
+<a href="JaVaScRiPt:alert(2)">bad link 2</a>
+<a href="vbscript:msgbox(1)">bad vbscript link</a>
+<a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">bad data link</a>
+<img src="x" onerror="alert(1)" alt="broken">
+<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="ok gif">
+<svg width="10" height="10"><script>alert(3)</script><circle r="5"/></svg>
+<iframe src="javascript:alert(4)"></iframe>
+<iframe srcdoc="&lt;script&gt;alert(5)&lt;/script&gt;"></iframe>
+<iframe src="https://example.com/"></iframe>
+<form action="javascript:alert(6)" method="post"><input type="text" name="q" value="v" onfocus="alert(7)"><button formaction="javascript:alert(8)">Go</button></form>
+<!-- a normal comment -->
+<table border="1">
+<tr><th>Head</th></tr>
+<tr><td>Cell content</td></tr>
+</table>
+<button onclick="alert(9)" class="btn">Click me</button>
+<div onmouseover=alert(10) title="keep me">div text</div>
+</body>
+</html>
+=== TAB ===
+<a id="realtab">real tab</a>
+[?2004hroot@f1ab57b2984f:/app# python3 - << 'EOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> src = open('/app/filter.py').read()
+[?2004l[?2004h> old = '''    if text and CSS_BAD.search(text):
+[?2004l[?2004h>         style_tag.clear()
+[?2004l[?2004h>         style_tag.append(style_tag.string_container(CSS_REMOVE.sub("", text)))
+[?2004l[?2004h> '''
+[?2004l[?2004h> new = '''    if text and CSS_BAD.search(text):
+[?2004l[?2004h>         if style_tag.string is not None:
+[?2004l[?2004h>             style_tag.string = CSS_REMOVE.sub("", text)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Multiple child nodes; safest to drop the block outright.
+[?2004l[?2004h>             style_tag.clear()
+[?2004l[?2004h> '''
+[?2004l[?2004h> assert old in src, 'pattern not found'
+[?2004l[?2004h> open('/app/filter.py','w').write(src.replace(old, new))
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> EOF
+[?2004lpatched
+[?2004hroot@f1ab57b2984f:/app# printf '%s\n' '<!DOCTYPE html>' '<html>' '<head>' '<meta charset="utf-8">' '<meta http-equiv="refresh" content="0; url=javascript:alert(1)">' '<title>Test Page</title>' '<style>' 'body { color: blue; }' '.a { background: url(javascript:alert(1)); }' '.b { width: expression(alert(2)); }' '.c { font-family: sans-serif; }' '</style>' "<script>alert('top script')</script>" '</head>' '<body onload="alert(1)">' '<h1 id="header" class="main">Hello World</h1>' '<p style="margin: 0 auto">A normal paragraph. &amp; entities preserved.</p>' '<a href="https://example.com/">Safe link</a>' '<a href="javascript:alert(1)">bad link</a>' '<a href="JaVaScRiPt:alert(2)">bad link 2</a>' '<a href="vbscript:msgbox(1)">bad vbscript link</a>' '<a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">bad data link</a>' '<img src="x" onerror="alert(1)" alt="broken">' '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="ok gif">' '<svg width="10" height="10"><script>alert(3)</script><circle r="5"/></svg>' '<iframe src="javascript:alert(4)"></iframe>' '<iframe srcdoc="&lt;script&gt;alert(5)&lt;/script&gt;"></iframe>' '<iframe src="https://example.com/"></iframe>' '<form action="javascript:alert(6)" method="post"><input type="text" name="q" value="v" onfocus="alert(7)"><button formaction="javascript:alert(8)">Go</button></form>' '<!-- a normal comment -->' '<table border="1">' '<tr><th>Head</th></tr>' '<tr><td>Cell content</td></tr>' '</table>' '<button onclick="alert(9)" class="btn">Click me</button>' '<div onmouseover=alert(10) title="keep me">div text</div>' '</body>' '</html>' > /tmp/evil.html
+[?2004l[?2004hroot@f1ab57b2984f:/app# python3 /app/filter.py /tmp/evil.html; echo === EVIL ===; cat /tmp/evil.html
+[?2004l=== EVIL ===
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta http-equiv="refresh"/>
+<title>Test Page</title>
+<style>
+body { color: blue; }
+.a { background: url((1)); }
+.b { width: ; }
+.c { font-family: sans-serif; }
+</style>
+
+</head>
+<body>
+<h1 id="header" class="main">Hello World</h1>
+<p style="margin: 0 auto">A normal paragraph. & entities preserved.</p>
+<a href="https://example.com/">Safe link</a>
+<a>bad link</a>
+<a>bad link 2</a>
+<a>bad vbscript link</a>
+<a>bad data link</a>
+<img src="x" alt="broken"/>
+<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="ok gif"/>
+<svg width="10" height="10"><circle r="5"></circle></svg>
+<iframe></iframe>
+<iframe></iframe>
+<iframe src="https://example.com/"></iframe>
+<form method="post"><input type="text" name="q" value="v"/><button>Go</button></form>
+<!-- a normal comment -->
+<table border="1">
+<tr><th>Head</th></tr>
+<tr><td>Cell content</td></tr>
+</table>
+<button class="btn">Click me</button>
+<div title="keep me">div text</div>
+</body>
+</html>
+[?2004hroot@f1ab57b2984f:/app# sed -n '1,150p' /usr/local/lib/python3.13/site-packages/bs4/formatter.py
+[?2004lfrom __future__ import annotations
+from typing import Callable, Dict, Iterable, Optional, Set, Tuple, TYPE_CHECKING, Union
+from typing_extensions import TypeAlias
+from bs4.dammit import EntitySubstitution
+
+if TYPE_CHECKING:
+    from bs4._typing import _AttributeValue
+
+
+class Formatter(EntitySubstitution):
+    """Describes a strategy to use when outputting a parse tree to a string.
+
+    Some parts of this strategy come from the distinction between
+    HTML4, HTML5, and XML. Others are configurable by the user.
+
+    Formatters are passed in as the `formatter` argument to methods
+    like `bs4.element.Tag.encode`. Most people won't need to
+    think about formatters, and most people who need to think about
+    them can pass in one of these predefined strings as `formatter`
+    rather than making a new Formatter object:
+
+    For HTML documents:
+     * 'html' - HTML entity substitution for generic HTML documents. (default)
+     * 'html5' - HTML entity substitution for HTML5 documents, as
+                 well as some optimizations in the way tags are rendered.
+     * 'html5-4.12.0' - The version of the 'html5' formatter used prior to
+                        Beautiful Soup 4.13.0.
+     * 'minimal' - Only make the substitutions necessary to guarantee
+                   valid HTML.
+     * None - Do not perform any substitution. This will be faster
+              but may result in invalid markup.
+
+    For XML documents:
+     * 'html' - Entity substitution for XHTML documents.
+     * 'minimal' - Only make the substitutions necessary to guarantee
+                   valid XML. (default)
+     * None - Do not perform any substitution. This will be faster
+              but may result in invalid markup.
+
+    """
+
+    #: Constant name denoting HTML markup
+    HTML: str = "html"
+
+    #: Constant name denoting XML markup
+    XML: str = "xml"
+
+    #: Default values for the various constructor options when the
+    #: markup language is HTML.
+    HTML_DEFAULTS: Dict[str, Set[str]] = dict(
+        cdata_containing_tags=set(["script", "style"]),
+    )
+
+    language: Optional[str]  #: :meta private:
+    entity_substitution: Optional[_EntitySubstitutionFunction]  #: :meta private:
+    void_element_close_prefix: str  #: :meta private:
+    cdata_containing_tags: Set[str]  #: :meta private:
+    indent: str  #: :meta private:
+
+    #: If this is set to true by the constructor, then attributes whose
+    #: values are sent to the empty string will be treated as HTML
+    #: boolean attributes. (Attributes whose value is None are always
+    #: rendered this way.)
+    empty_attributes_are_booleans: bool
+
+    def _default(
+        self, language: str, value: Optional[Set[str]], kwarg: str
+    ) -> Set[str]:
+        if value is not None:
+            return value
+        if language == self.XML:
+            # When XML is the markup language in use, all of the
+            # defaults are the empty list.
+            return set()
+
+        # Otherwise, it depends on what's in HTML_DEFAULTS.
+        return self.HTML_DEFAULTS[kwarg]
+
+    def __init__(
+        self,
+        language: Optional[str] = None,
+        entity_substitution: Optional[_EntitySubstitutionFunction] = None,
+        void_element_close_prefix: str = "/",
+        cdata_containing_tags: Optional[Set[str]] = None,
+        empty_attributes_are_booleans: bool = False,
+        indent: Union[int,str] = 1,
+    ):
+        r"""Constructor.
+
+        :param language: This should be `Formatter.XML` if you are formatting
+           XML markup and `Formatter.HTML` if you are formatting HTML markup.
+
+        :param entity_substitution: A function to call to replace special
+           characters with XML/HTML entities. For examples, see
+           bs4.dammit.EntitySubstitution.substitute_html and substitute_xml.
+        :param void_element_close_prefix: By default, void elements
+           are represented as <tag/> (XML rules) rather than <tag>
+           (HTML rules). To get <tag>, pass in the empty string.
+        :param cdata_containing_tags: The set of tags that are defined
+           as containing CDATA in this dialect. For example, in HTML,
+           <script> and <style> tags are defined as containing CDATA,
+           and their contents should not be formatted.
+        :param empty_attributes_are_booleans: If this is set to true,
+          then attributes whose values are sent to the empty string
+          will be treated as `HTML boolean
+          attributes<https://dev.w3.org/html5/spec-LC/common-microsyntaxes.html#boolean-attributes>`_. (Attributes
+          whose value is None are always rendered this way.)
+        :param indent: If indent is a non-negative integer or string,
+            then the contents of elements will be indented
+            appropriately when pretty-printing. An indent level of 0,
+            negative, or "" will only insert newlines. Using a
+            positive integer indent indents that many spaces per
+            level. If indent is a string (such as "\t"), that string
+            is used to indent each level. The default behavior is to
+            indent one space per level.
+
+        """
+        self.language = language or self.HTML
+        self.entity_substitution = entity_substitution
+        self.void_element_close_prefix = void_element_close_prefix
+        self.cdata_containing_tags = self._default(
+            self.language, cdata_containing_tags, "cdata_containing_tags"
+        )
+        self.empty_attributes_are_booleans = empty_attributes_are_booleans
+        if indent is None:
+            indent = 0
+        indent_str: str
+        if isinstance(indent, int):
+            if indent < 0:
+                indent = 0
+            indent_str = " " * indent
+        elif isinstance(indent, str):
+            indent_str = indent
+        else:
+            indent_str = " "
+        self.indent = indent_str
+
+    def substitute(self, ns: str) -> str:
+        """Process a string that needs to undergo entity substitution.
+        This may be a string encountered in an attribute value or as
+        text.
+
+        :param ns: A string.
+        :return: The same string but with certain characters replaced by named
+           or numeric entities.
+        """
+        if not self.entity_substitution:
+            return ns
+        from .element import NavigableString
+
+[?2004hroot@f1ab57b2984f:/app# sed -n '196,260p' /usr/local/lib/python3.13/site-packages/bs4/formatter.py
+[?2004l    REGISTRY: Dict[Optional[str], HTMLFormatter] = {}
+
+    def __init__(
+        self,
+        entity_substitution: Optional[_EntitySubstitutionFunction] = None,
+        void_element_close_prefix: str = "/",
+        cdata_containing_tags: Optional[Set[str]] = None,
+        empty_attributes_are_booleans: bool = False,
+        indent: Union[int,str] = 1,
+    ):
+        super(HTMLFormatter, self).__init__(
+            self.HTML,
+            entity_substitution,
+            void_element_close_prefix,
+            cdata_containing_tags,
+            empty_attributes_are_booleans,
+            indent=indent
+        )
+
+
+class XMLFormatter(Formatter):
+    """A generic Formatter for XML."""
+
+    REGISTRY: Dict[Optional[str], XMLFormatter] = {}
+
+    def __init__(
+        self,
+        entity_substitution: Optional[_EntitySubstitutionFunction] = None,
+        void_element_close_prefix: str = "/",
+        cdata_containing_tags: Optional[Set[str]] = None,
+        empty_attributes_are_booleans: bool = False,
+        indent: Union[int,str] = 1,
+    ):
+        super(XMLFormatter, self).__init__(
+            self.XML,
+            entity_substitution,
+            void_element_close_prefix,
+            cdata_containing_tags,
+            empty_attributes_are_booleans,
+            indent=indent,
+        )
+
+
+# Set up aliases for the default formatters.
+HTMLFormatter.REGISTRY["html"] = HTMLFormatter(
+    entity_substitution=EntitySubstitution.substitute_html
+)
+
+HTMLFormatter.REGISTRY["html5"] = HTMLFormatter(
+    entity_substitution=EntitySubstitution.substitute_html5,
+    void_element_close_prefix="",
+    empty_attributes_are_booleans=True,
+)
+HTMLFormatter.REGISTRY["html5-4.12"] = HTMLFormatter(
+    entity_substitution=EntitySubstitution.substitute_html,
+    void_element_close_prefix="",
+    empty_attributes_are_booleans=True,
+)
+HTMLFormatter.REGISTRY["minimal"] = HTMLFormatter(
+    entity_substitution=EntitySubstitution.substitute_xml
+)
+HTMLFormatter.REGISTRY[None] = HTMLFormatter(entity_substitution=None)
+XMLFormatter.REGISTRY["html"] = XMLFormatter(
+    entity_substitution=EntitySubstitution.substitute_html
+)
+[?2004hroot@f1ab57b2984f:/app# python3 - << 'EOF'
+[?2004l[?2004h> src = open('/app/filter.py').read()
+[?2004l[?2004h> old = '''from bs4.formatter import HTMLFormatter
+[?2004l[?2004h> '''
+[?2004l[?2004h> new = '''from bs4.dammit import EntitySubstitution
+[?2004l[?2004h> from bs4.formatter import HTMLFormatter
+[?2004l[?2004h> '''
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> old2 = '''class KeepOrderFormatter(HTMLFormatter):
+[?2004l[?2004h>     """Formatter that keeps attributes in document order (no sorting)."""
+[?2004l[?2004h> '''
+[?2004l[?2004h> new2 = '''class KeepOrderFormatter(HTMLFormatter):
+[?2004l[?2004h>     """Formatter that keeps attributes in document order (no sorting).
+[?2004l[?2004h> 
+[?2004l[?2004h>     Uses the same entity substitution as the built-in 'minimal' formatter
+[?2004l[?2004h>     (which is what str(soup) uses by default).
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self):
+[?2004l[?2004h>         super().__init__(entity_substitution=EntitySubstitution.substitute_xml)
+[?2004l[?2004h> 
+[?2004l[?2004h> '''
+[?2004l[?2004h> assert old2 in src
+[?2004l[?2004h> src = src.replace(old2, new2)
+[?2004l[?2004h> old3 = 'return soup.decode(formatter=KeepOrderFormatter())'
+[?2004l[?2004h> assert old3 in src
+[?2004l[?2004h> open('/app/filter.py','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> EOF
+[?2004lpatched
+[?2004hroot@f1ab57b2984f:/app# printf '%s\n' '<!DOCTYPE html>' '<html>' '<head>' '<meta charset="utf-8">' '<meta http-equiv="refresh" content="0; url=javascript:alert(1)">' '<title>Test Page</title>' '<style>' 'body { color: blue; }' '.a { background: url(javascript:alert(1)); }' '.b { width: expression(alert(2)); }' '.c { font-family: sans-serif; }' '</style>' "<script>alert('top script')</script>" '</head>' '<body onload="alert(1)">' '<h1 id="header" class="main">Hello World</h1>' '<p style="margin: 0 auto">A normal paragraph. &amp; entities preserved. 3 &lt; 5 &gt; 2</p>' '<a href="https://example.com/">Safe link</a>' '<a href="javascript:alert(1)">bad link</a>' '<a href="JaVaScRiPt:alert(2)">bad link 2</a>' '<a href="vbscript:msgbox(1)">bad vbscript link</a>' '<a href="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">bad data link</a>' '<img src="x" onerror="alert(1)" alt="broken">' '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="ok gif">' '<svg width="10" height="10"><script>alert(3)</script><circle r="5"/></svg>' '<iframe src="javascript:alert(4)"></iframe>' '<iframe srcdoc="&lt;script&gt;alert(5)&lt;/script&gt;"></iframe>' '<iframe src="https://example.com/"></iframe>' '<form action="javascript:alert(6)" method="post"><input type="text" name="q" value="v" onfocus="alert(7)"><button formaction="javascript:alert(8)">Go</button></form>' '<!-- a normal comment -->' '<table border="1">' '<tr><th>Head</th></tr>' '<tr><td>Cell content</td></tr>' '</table>' '<button onclick="alert(9)" class="btn">Click me</button>' '<div onmouseover=alert(10) title="keep me">div text</div>' '</body>' '</html>' > /tmp/evil.html
+[?2004l[?2004hroot@f1ab57b2984f:/app# python3 /app/filter.py /tmp/evil.html; echo === EVIL ===; cat /tmp/evil.html
+[?2004l=== EVIL ===
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta http-equiv="refresh"/>
+<title>Test Page</title>
+<style>
+body { color: blue; }
+.a { background: url((1)); }
+.b { width: ; }
+.c { font-family: sans-serif; }
+</style>
+
+</head>
+<body>
+<h1 id="header" class="main">Hello World</h1>
+<p style="margin: 0 auto">A normal paragraph. &amp; entities preserved. 3 &lt; 5 &gt; 2</p>
+<a href="https://example.com/">Safe link</a>
+<a>bad link</a>
+<a>bad link 2</a>
+<a>bad vbscript link</a>
+<a>bad data link</a>
+<img src="x" alt="broken"/>
+<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" alt="ok gif"/>
+<svg width="10" height="10"><circle r="5"></circle></svg>
+<iframe></iframe>
+<iframe></iframe>
+<iframe src="https://example.com/"></iframe>
+<form method="post"><input type="text" name="q" value="v"/><button>Go</button></form>
+<!-- a normal comment -->
+<table border="1">
+<tr><th>Head</th></tr>
+<tr><td>Cell content</td></tr>
+</table>
+<button class="btn">Click me</button>
+<div title="keep me">div text</div>
+</body>
+</html>
+[?2004hroot@f1ab57b2984f:/app# cat > /tmp/audit.py << 'EOF'
+[?2004l[?2004h> import re, sys
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> 
+[?2004l[?2004h> def audit(path):
+[?2004l[?2004h>     data = open(path, encoding='utf-8').read()
+[?2004l[?2004h>     s = BeautifulSoup(data, 'html.parser')
+[?2004l[?2004h>     errs = []
+[?2004l[?2004h>     for el in s.find_all('script'):
+[?2004l[?2004h>         errs.append('script tag remains: %r' % el)
+[?2004l[?2004h>     for tag in s.find_all(True):
+[?2004l[?2004h>         for a, v in tag.attrs.items():
+[?2004l[?2004h>             if a.lower().startswith('on') and len(a) > 2:
+[?2004l[?2004h>                 errs.append('event handler %s on <%s>' % (a, tag.name))
+[?2004l[?2004h>             if a.lower() == 'srcdoc':
+[?2004l[?2004h>                 errs.append('srcdoc on <%s>' % tag.name)
+[?2004l[?2004h>             if a.lower() in {'href','src','action','formaction','data','poster':
+[?2004l[?2004h>                 lv = re.sub(r'[\x00-\x20]+', '', str(v)).lower()
+[?2004l[?2004h>                 if lv.startswith(('javascript:','vbscript:')) or (lv.startswith('data:') and 'text/html' in lv):
+[?2004l[?2004h>                     errs.append('dangerous url on <%s %s>: %r' % (tag.name, a, v))
+[?2004l[?2004h>     return errs
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     bad = False
+[?2004l[?2004h>     for p in sys.argv[1:]:
+[?2004l[?2004h>         errs = audit(p)
+[?2004l[?2004h>         if errs:
+[?2004l[?2004h>             bad = True
+[?2004l[?2004h>             print('AUDIT FAIL', p)
+[?2004l[?2004h>             for e in errs: print('  ', e)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             print('audit ok:', p)
+[?2004l[?2004h>     sys.exit(1 if bad else 0)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f1ab57b2984f:/app# python3 -c "print('audit script ready')"
+[?2004laudit script ready
+[?2004hroot@f1ab57b2984f:/app# cat > /tmp/battery.py << 'EOF'
+[?2004l[?2004h> import subprocess, os, shutil, sys, difflib
+[?2004l[?2004h> 
+[?2004l[?2004h> F = '/app/filter.py'
+[?2004l[?2004h> def run(path):
+[?2004l[?2004h>     r = subprocess.run(['python3', F, path], capture_output=True, text=True)
+[?2004l[?2004h>     assert r.returncode == 0, (path, r.stderr)
+[?2004l[?2004h> 
+[?2004l[?2004h> def write(name, content):
+[?2004l[?2004h>     p = '/tmp/bat_%s.html' % name
+[?2004l[?2004h>     open(p, 'w', newline='').write(content)
+[?2004l[?2004h>     return p
+[?2004l[?2004h> 
+[?2004l[?2004h> results = []
+[?2004l[?2004h> def check(name, cond, extra=''):
+[?2004l[?2004h>     results.append((name, cond, extra))
+[?2004l[?2004h>     print(('PASS' if cond else 'FAIL'), name, extra if not cond else '')
+[?2004l[?2004h> 
+[?2004l[?2004h> # 1. idempotency on evil
+[?2004l[?2004h> run('/tmp/evil.html')
+[?2004l[?2004h> first = open('/tmp/evil.html').read()
+[?2004l[?2004h> run('/tmp/evil.html')
+[?2004l[?2004h> second = open('/tmp/evil.html').read()
+[?2004l[?2004h> check('idempotent-evil', first == second)
+[?2004l[?2004h> 
+[?2004l[?2004h> # 2. clean file byte-preservation except >/>
+[?2004l[?2004h> clean = '<html><head><style>.a{color:red}</style>\n\n<link rel="x" href="y"></head>\n\n<body><p>one</p>\n\n<p>two</p></body></html>'
+[?2004l[?2004h> p = write('clean', clean); run(p); out = open(p).read()
+[?2004l[?2004h> check('clean-format', out == clean.replace('<link rel="x" href="y">', '<link rel="x" href="y"/>'), repr(out))
+[?2004l[?2004h> 
+[?2004l[?2004h> # 3. comments with script, unquoted attrs, unclosed script, newline in scheme
+[?2004l[?2004h> p = write('edge1', '<html><head><title>t</title></head><body>'
+[?2004l[?2004h>     '<!--[if IE]><script>vuln()</script><![endif]-->'
+[?2004l[?2004h>     '<!-- normal --><h2 onclick =alert (1) >H</h2>'
+[?2004l[?2004h>     '<a href="java\nscript:alert(1)">nl scheme</a>'
+[?2004l[?2004h>     '<a href="javasCriPt:alert(2)">case</a>'
+[?2004l[?2004h>     '</body></html>')
+[?2004l[?2004h> run(p); out = open(p).read()
+[?2004l[?2004h> check('edge1-nocript', v'x' if False else ('vuln()' not in out and '<h2 onclick' not in out and 'nl scheme</a>'.replace('nl scheme</a>','nl scheme') in out and '<a id' not in out), repr(out))
+[?2004l[?2004h> check('edge1-comment', '<!-- normal -->' in out, repr(out))
+[?2004l[?2004h> 
+[?2004l[?2004h> # 4. unclosed script at EOF
+[?2004l[?2004h> p = write('edge2', '<html><body><p>keep</p><script>alert(1)')
+[?2004l[?2004h> run(p); out = open(p).read()
+[?2004l[?2004h> check('edge2', 'keep' in out and 'alert(1)' not in out and '</p>' in out, repr(out))
+[?2004l[?2004h> 
+[?2004l[?2004h> # 5. empty file and whitespace-only
+[?2004l[?2004h> p = write('empty', ''); run(p); check('empty', open(p).read() == '', repr(open(p).read()))
+[?2004l[?2004h> p = write('ws', '   \n  '); run(p); check('ws-only', open(p).read() == '   \n  ', repr(open(p).read()))
+[?2004l[?2004h> 
+[?2004l[?2004h> # 6. fragment (no html) with table, pre, textarea with fake script text
+[?2004l[?2004h> frag = '<table><tr><td>a</td></tr></table>\n<pre>  code  </pre>\n<textarea><script>not real</script></textarea>'
+[?2004l[?2004h> p = write('frag', frag); run(p); out = open(p).read()
+[?2004l[?2004h> check('frag-table', '<td>a</td>' in out, repr(out))
+[?2004l[?2004h> check('frag-pre', '<pre>  code  </pre>' in out, repr(out))
+[?2004l[?2004h> 
+[?2004l[?2004h> # 7. no trailing newline preserved
+[?2004l[?2004h> p = write('notrail', '<p>no trailing newline</p>'); run(p)
+[?2004l[?2004h> check('notrail', open(p).read() == '<p>no trailing newline</p>', repr(open(p).read()))
+[?2004l[?2004h> 
+[?2004l[?2004h> fails = [r for r in results if not r[1]]
+[?2004l[?2004h> print('TOTAL', len(results), 'FAILS', len(fails))
+[?2004l[?2004h> sys.exit(1 if fails else 0)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f1ab57b2984f:/app# echo ready
+[?2004lready
+[?2004hroot@f1ab57b2984f:/app# python3 - << 'EOF'
+[?2004l[?2004h> src = open('/tmp/battery.py').read()
+[?2004l[?2004h> old = "check('edge1-nocript', v'x' if False else ('vuln()' not in out and '<h2 onclick' not in out and 'nl scheme</a>'.replace('nl scheme</a>','nl scheme') in out and '<a id' not in out), repr(out))"
+[?2004l[?2004h> new = "check('edge1-nocript', 'vuln()' not in out and '<h2 onclick' not in out and '>nl scheme</a>' in out, repr(out))"
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> open('/tmp/battery.py','w').write(src.replace(old, new))
+[?2004l[?2004h> print('fixed')
+[?2004l[?2004h> EOF
+[?2004lfixed
+[?2004hroot@f1ab57b2984f:/app# python3 /tmp/battery.py
+[?2004lPASS idempotent-evil 
+PASS clean-format 
+PASS edge1-nocript 
+PASS edge1-comment 
+PASS edge2 
+PASS empty 
+PASS ws-only 
+PASS frag-table 
+PASS frag-pre 
+PASS notrail 
+TOTAL 10 FAILS 0
+[?2004hroot@f1ab57b2984f:/app# python3 /tmp/audit.py /tmp/evil.html /tmp/bat_edge1.html /tmp/bat_edge2.html /tmp/bat_frag.html /tmp/bat_clean.html /tmp/eviltab.html /tmp/bat_notrail.html /tmp/bat_empty.html
+[?2004l  File [35m"/tmp/audit.py"[0m, line [35m16[0m
+    if a.lower() in {'href','src','action','formaction','data','poster'[1;31m:[0m
+                                                                       [1;31m^[0m
+[1;35mSyntaxError[0m: [35minvalid syntax[0m
+[?2004hroot@f1ab57b2984f:/app# cat /tmp/bat_frag.html; echo; cat /tmp/bat_edge1.html; echo; wc -l /app/filter.py
+[?2004l<table><tr><td>a</td></tr></table>
+<pre>  code  </pre>
+<textarea>&lt;script&gt;not real&lt;/script&gt;</textarea>
+<html><head><title>t</title></head><body><!-- normal --><h2 (1)="">H</h2><a>nl scheme</a><a>case</a></body></html>
+242 /app/filter.py
+[?2004hroot@f1ab57b2984f:/app# sed -i "s/'data','poster':/'data','poster'}/" /tmp/audit.py && python3 /tmp/audit.py /tmp/evil.html /tmp/bat_edge1.html /tmp/bat_edge2.html /tmp/bat_frag.html /tmp/bat_clean.html /tmp/eviltab.html /tmp/bat_notrail.html /tmp/bat_empty.html
+[?2004l  File [35m"/tmp/audit.py"[0m, line [35m16[0m
+    if a.lower() in {'href','src','action','formaction','data','poster'}[1;31m[0m
+                                                                        [1;31m^[0m
+[1;35mSyntaxError[0m: [35mexpected ':'[0m
+[?2004hroot@f1ab57b2984f:/app# python3 - << 'EOF'
+[?2004l[?2004h> lines = open('/tmp/audit.py').read().splitlines(keepends=True)
+[?2004l[?2004h> for i, l in enumerate(lines):
+[?2004l[?2004h>     if l.strip().startswith('if a.lower() in {'):
+[?2004l[?2004h>         lines[i] = "            if a.lower() in {'href','src','action','formaction','data','poster'}:\n"
+[?2004l[?2004h> open('/tmp/audit.py','w').writelines(lines)
+[?2004l[?2004h> print('line fixed')
+[?2004l[?2004h> EOF
+[?2004lline fixed
+[?2004hroot@f1ab57b2984f:/app# python3 /tmp/audit.py /tmp/evil.html /tmp/bat_edge1.html /tmp/bat_edge2.html /tmp/bat_frag.html /tmp/bat_clean.html /tmp/eviltab.html /tmp/bat_notrail.html /tmp/bat_empty.html
+[?2004laudit ok: /tmp/evil.html
+audit ok: /tmp/bat_edge1.html
+audit ok: /tmp/bat_edge2.html
+audit ok: /tmp/bat_frag.html
+audit ok: /tmp/bat_clean.html
+audit ok: /tmp/eviltab.html
+audit ok: /tmp/bat_notrail.html
+audit ok: /tmp/bat_empty.html
+[?2004hroot@f1ab57b2984f:/app# printf '<html><head><meta http-equiv="refresh" content="5; url=https://example.com/next"><title>js: javascript: fun fact</title></head><body><p title="javascript: the language">ok</p><p data-x="javascript:safe">d</p></body></html>' > /tmp/benign.html; python3 /app/filter.py /tmp/benign.html; cat /tmp/benign.html
+[?2004l<html><head><meta http-equiv="refresh" content="5; url=https://example.com/next"/><title>js: javascript: fun fact</title></head><body><p title="javascript: the language">ok</p><p data-x="javascript:safe">d</p></body></html>[?2004hroot@f1ab57b2984f:/app# python3 /app/filter.py; echo "rc=$?"; ls -la /app/
+[?2004lusage: filter.py <html-file>
+rc=1
+total 8
+drwxr-xr-x 1 root root   31 Sep  7 00:39 .
+drwxr-xr-x 1 root root  117 Sep  7 00:33 ..
+-rw-r--r-- 1 root root 7248 Sep  7 02:11 filter.py
+[?2004hroot@f1ab57b2984f:/app# cat /app/filter.py
+[?2004l#!/usr/bin/env python3
+"""filter.py - Remove JavaScript from an HTML file to mitigate XSS attacks.
+
+Usage:
+    python3 filter.py <path-to-html-file>
+
+The file is modified in-place.  Legitimate HTML structure, formatting and
+non-dangerous attributes are preserved; only potentially executable content
+is removed:
+
+  * <script> elements (anywhere, e.g. inside <svg>)
+  * HTML event-handler attributes (onclick, onerror, onload, ...)
+  * URLs using active content schemes (javascript:, vbscript:,
+    data:text/html, and data: URLs on frame-like elements)
+  * active CSS constructs (expression(), -moz-binding, javascript: urls)
+  * <meta http-equiv=refresh> redirects pointing at active schemes
+  * <iframe srcdoc> attributes (untrusted inline HTML)
+  * comments that contain <script> markup
+"""
+
+import re
+import sys
+
+from bs4 import BeautifulSoup
+from bs4.element import Comment, Doctype
+from bs4.dammit import EntitySubstitution
+from bs4.formatter import HTMLFormatter
+
+# Render doctypes without the trailing newline BS4 normally appends.
+Doctype.SUFFIX = ">"
+
+
+class WSSoup(BeautifulSoup):
+    """BeautifulSoup that keeps whitespace-only text nodes verbatim.
+
+    BS4 normally collapses whitespace-only text between elements down to
+    a single space/newline; we preserve the original text exactly.
+    """
+
+    def endData(self, containerClass=None):
+        if self.current_data:
+            current_data = "".join(self.current_data)
+            self.current_data = []
+            if (
+                self.parse_only
+                and len(self.tagStack) <= 1
+                and not self.parse_only.allow_string_creation(current_data)
+            ):
+                return
+            containerClass = self.string_container(containerClass)
+            o = containerClass(current_data)
+            self.object_was_parsed(o)
+
+
+class KeepOrderFormatter(HTMLFormatter):
+    """Formatter that keeps attributes in document order (no sorting).
+
+    Uses the same entity substitution as the built-in 'minimal' formatter
+    (which is what str(soup) uses by default).
+    """
+
+    def __init__(self):
+        super().__init__(entity_substitution=EntitySubstitution.substitute_xml)
+
+
+    def attributes(self, tag):
+        if tag.attrs is None:
+            return []
+        return [
+            (k, (None if self.empty_attributes_are_booleans and v == "" else v))
+            for k, v in tag.attrs.items()
+        ]
+
+
+# Attributes that carry URLs
+URL_ATTRS = {
+    "href", "src", "action", "formaction", "data", "poster", "background",
+    "xlink:href", "cite", "longdesc", "usemap", "profile", "codebase",
+    "classid", "lowsrc", "dynsrc",
+}
+
+# Elements where *any* data: URL is an XSS vector
+FRAME_LIKE = {"iframe", "frame", "object", "embed", "applet"}
+
+# Whitespace / control characters used to obfuscate scheme prefixes
+SCHEME_JUNK = re.compile(r"[\x00-\x20\x7f\u2028\u2029\ufeff]+")
+
+ACTIVE_SCHEMES = ("javascript:", "vbscript:", "livescript:", "mocha:")
+
+# Dangerous CSS constructs
+CSS_BAD = re.compile(
+    r"expression\s*\(|"
+    r"(javascript|vbscript|livescript|mocha)\s*[:)]|"
+    r"-moz-binding",
+    re.IGNORECASE,
+)
+
+# Replaces a dangerous substring inside <style> text with an empty string
+CSS_REMOVE = re.compile(
+    r"expression\s*\([^)]*\)\)?"
+    r"|(javascript|vbscript|livescript|mocha)\s*:[^\"'()<>\s]*"
+    r"|-moz-binding\s*:[^;}>\"]*",
+    re.IGNORECASE,
+)
+
+
+def scheme_clean(value):
+    """Lowercase a URL value with whitespace/control chars stripped out."""
+    return SCHEME_JUNK.sub("", str(value)).lower()
+
+
+def is_dangerous_url(value, tag_name=""):
+    if value is None:
+        return False
+    v = scheme_clean(value)
+    for scheme in ACTIVE_SCHEMES:
+        if v.startswith(scheme):
+            return True
+    if v.startswith("data:"):
+        if "text/html" in v:
+            return True
+        if tag_name in FRAME_LIKE:
+            return True
+    return False
+
+
+def dangerous_css(value):
+    return bool(CSS_BAD.search(str(value)))
+
+
+def clean_url_attr(tag, attr, value, tag_name):
+    if attr == "srcset" or attr == "imagesrcset":
+        urls = []
+        for entry in str(value).split(","):
+            entry = entry.strip()
+            if entry:
+                urls.append(entry.split()[0])
+        return any(is_dangerous_url(u, tag_name) for u in urls)
+    return is_dangerous_url(value, tag_name)
+
+
+def clean_meta_refresh(tag):
+    """Drop the content attr of <meta http-equiv=refresh> active redirects."""
+    if str(tag.get("http-equiv", "")).lower() != "refresh":
+        return
+    content = tag.get("content")
+    if not content:
+        return
+    for part in re.findall(r"url\s*=\s*([^;\s]+)", str(content), re.IGNORECASE):
+        if is_dangerous_url(part, "meta"):
+            del tag["content"]
+            return
+
+
+def clean_tag(tag):
+    tag_name = (tag.name or "").lower()
+    for attr in list(tag.attrs.keys()):
+        lname = attr.lower().strip()
+        value = tag.attrs[attr]
+        if isinstance(value, list):
+            value = " ".join(str(v) for v in value)
+
+        # Event handler attributes
+        if lname.startswith("on") and len(lname) > 2:
+            del tag.attrs[attr]
+            continue
+
+        # Untrusted inline HTML
+        if lname == "srcdoc":
+            del tag.attrs[attr]
+            continue
+
+        # Inline styles with active CSS
+        if lname == "style":
+            if dangerous_css(value):
+                del tag.attrs[attr]
+            continue
+
+        # URLs with active content schemes
+        if lname in URL_ATTRS:
+            if clean_url_attr(tag, lname, value, tag_name):
+                del tag.attrs[attr]
+            continue
+
+    clean_meta_refresh(tag)
+
+
+def clean_style_element(style_tag):
+    text = style_tag.string if style_tag.string is not None else style_tag.decode_contents()
+    if text and CSS_BAD.search(text):
+        if style_tag.string is not None:
+            style_tag.string = CSS_REMOVE.sub("", text)
+        else:
+            # Multiple child nodes; safest to drop the block outright.
+            style_tag.clear()
+
+
+def clean_script_comments(soup):
+    for comment in soup.find_all(string=lambda s: isinstance(s, Comment)):
+        if re.search(r"(?is)\<\s*script", str(comment)):
+            comment.extract()
+
+
+def filter_html(html):
+    soup = WSSoup(html, "html.parser")
+
+    # 1. Remove all <script> elements (including <svg><script>)
+    for el in soup.find_all("script"):
+        el.decompose()
+
+    # 2. Neutralize comments that smuggle <script> markup
+    clean_script_comments(soup)
+
+    # 3. Clean every remaining element
+    for tag in soup.find_all(True):
+        clean_tag(tag)
+
+    # 4. Purge active CSS inside <style> blocks
+    for style_tag in soup.find_all("style"):
+        clean_style_element(style_tag)
+
+    return soup.decode(formatter=KeepOrderFormatter())
+
+
+def main(argv):
+    if len(argv) < 2:
+        sys.stderr.write("usage: filter.py <html-file>\n")
+        return 1
+
+    path = argv[1]
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        html = fh.read()
+
+    cleaned = filter_html(html)
+
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(cleaned)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+[?2004hroot@f1ab57b2984f:/app# 

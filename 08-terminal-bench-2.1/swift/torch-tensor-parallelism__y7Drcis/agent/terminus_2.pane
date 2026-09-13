@@ -1,0 +1,977 @@
+[?2004hroot@250db61ab30a:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@250db61ab30a:/app# clear
+[?2004l[H[J[3J[?2004hroot@250db61ab30a:/app# cat > /app/parallel_linear.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l
+[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _GatherFromModelParallelRegion(torch.autograd.Function):
+[?2004l[?2004h>     """All-gather in forward, slice in backward."""
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, input):
+[?2004l[?2004h>         ctx.rank = dist.get_rank()
+[?2004l[?2004h>         ctx.world_size = dist.get_world_size()
+[?2004l[?2004h>         if ctx.world_size > 1:
+[?2004l[?2004h>             tensor_list = [torch.zeros_like(input) for _ in range(ctx.world_size)]
+[?2004l[?2004h>             dist.all_gather(tensor_list, input.contiguous())
+[?2004l[?2004h>             output = torch.cat(tensor_list, dim=-1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             output = input
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         world_size = ctx.world_size
+[?2004l[?2004h>         rank = ctx.rank
+[?2004l[?2004h>         last_dim = grad_output.shape[-1]
+[?2004l[?2004h>         shard_size = last_dim // world_size
+[?2004l[?2004h>         start = rank * shard_size
+[?2004l[?2004h>         end = start + shard_size
+[?2004l[?2004h>         return grad_output[..., start:end].contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _ReduceFromModelParallelRegion(torch.autograd.Function):
+[?2004l[?2004h>     """All-reduce in forward, identity in backward."""
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, input):
+[?2004l[?2004h>         if dist.is_initialized() and dist.get_world_size() > 1:
+[?2004l[?2004h>             input = input.clone().contiguous()
+[?2004l[?2004h>             dist.all_reduce(input, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>         return input
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         return grad_output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with column parallelism.
+[?2004l[?2004h>     
+[?2004l[?2004h>     Splits the weight matrix by columns (output dimension).
+[?2004l[?2004h>     Weight shard shape: (out_features // world_size, in_features)
+[?2004l[?2004h>     Bias shard shape: (out_features // world_size,)
+[?2004l[?2004h>     Output is gathered along the last dimension.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         rank = dist.get_rank()
+[?2004l[?2004h>         
+[?2004l[?2004h>         out_shard = out_features // world_size
+[?2004l[?2004h>         
+[?2004l[?2004h>         start = rank * out_shard
+[?2004l[?2004h>         end = start + out_shard
+[?2004l[?2004h>         weight_shard = master_weight[start:end, :].clone()
+[?2004l[?2004h>         
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_shard)
+[?2004l[?2004h>         
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(torch.zeros(out_shard))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h>     
+[?2004l[?2004h>     def forward(self, input):
+[?2004l[?2004h>         # input: (..., in_features) - full input, same on all ranks
+[?2004l[?2004h>         output = F.linear(input, self.weight, self.bias)
+[?2004l[?2004h>         # output: (..., out_features // world_size)
+[?2004l[?2004h>         output = _GatherFromModelParallelRegion.apply(output)
+[?2004l[?2004h>         # output: (..., out_features)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with row parallelism.
+[?2004l[?2004h>     
+[?2004l[?2004h>     Splits the weight matrix by rows (input dimension).
+[?2004l[?2004h>     Weight shard shape: (out_features, in_features // world_size)
+[?2004l[?2004h>     Bias shape: (out_features,) - full on each rank
+[?2004l[?2004h>     Input is pre-partitioned along the last dimension.
+[?2004l[?2004h>     Output is all-reduced (summed) across ranks.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         world_size = dist.get_world_size()
+[?2004l[?2004h>         rank = dist.get_rank()
+[?2004l[?2004h>         
+[?2004l[?2004h>         in_shard = in_features // world_size
+[?2004l[?2004h>         
+[?2004l[?2004h>         start = rank * in_shard
+[?2004l[?2004h>         end = start + in_shard
+[?2004l[?2004h>         weight_shard = master_weight[:, start:end].clone()
+[?2004l[?2004h>         
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_shard)
+[?2004l[?2004h>         
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(torch.zeros(out_features))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h>     
+[?2004l[?2004h>     def forward(self, input):
+[?2004l[?2004h>         # input: (..., in_features // world_size) - already partitioned
+[?2004l[?2004h>         output = F.linear(input, self.weight)
+[?2004l[?2004h>         # output: (..., out_features) - partial result, no bias yet
+[?2004l[?2004h>         output = _ReduceFromModelParallelRegion.apply(output)
+[?2004l[?2004h>         # output: (..., out_features) - fully reduced
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             output = output + self.bias
+[?2004l[?2004h>         return output
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@250db61ab30a:/app# cat /app/parallel_linear.py
+[?2004limport torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+class _GatherFromModelParallelRegion(torch.autograd.Function):
+    """All-gather in forward, slice in backward."""
+    @staticmethod
+    def forward(ctx, input):
+        ctx.rank = dist.get_rank()
+        ctx.world_size = dist.get_world_size()
+        if ctx.world_size > 1:
+            tensor_list = [torch.zeros_like(input) for _ in range(ctx.world_size)]
+            dist.all_gather(tensor_list, input.contiguous())
+            output = torch.cat(tensor_list, dim=-1)
+        else:
+            output = input
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        world_size = ctx.world_size
+        rank = ctx.rank
+        last_dim = grad_output.shape[-1]
+        shard_size = last_dim // world_size
+        start = rank * shard_size
+        end = start + shard_size
+        return grad_output[..., start:end].contiguous()
+
+
+class _ReduceFromModelParallelRegion(torch.autograd.Function):
+    """All-reduce in forward, identity in backward."""
+    @staticmethod
+    def forward(ctx, input):
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            input = input.clone().contiguous()
+            dist.all_reduce(input, op=dist.ReduceOp.SUM)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
+class ColumnParallelLinear(nn.Module):
+    """Linear layer with column parallelism.
+    
+    Splits the weight matrix by columns (output dimension).
+    Weight shard shape: (out_features // world_size, in_features)
+    Bias shard shape: (out_features // world_size,)
+    Output is gathered along the last dimension.
+    """
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        
+        out_shard = out_features // world_size
+        
+        start = rank * out_shard
+        end = start + out_shard
+        weight_shard = master_weight[start:end, :].clone()
+        
+        self.weight = nn.Parameter(weight_shard)
+        
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_shard))
+        else:
+            self.register_parameter('bias', None)
+    
+    def forward(self, input):
+        # input: (..., in_features) - full input, same on all ranks
+        output = F.linear(input, self.weight, self.bias)
+        # output: (..., out_features // world_size)
+        output = _GatherFromModelParallelRegion.apply(output)
+        # output: (..., out_features)
+        return output
+
+
+class RowParallelLinear(nn.Module):
+    """Linear layer with row parallelism.
+    
+    Splits the weight matrix by rows (input dimension).
+    Weight shard shape: (out_features, in_features // world_size)
+    Bias shape: (out_features,) - full on each rank
+    Input is pre-partitioned along the last dimension.
+    Output is all-reduced (summed) across ranks.
+    """
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        
+        in_shard = in_features // world_size
+        
+        start = rank * in_shard
+        end = start + in_shard
+        weight_shard = master_weight[:, start:end].clone()
+        
+        self.weight = nn.Parameter(weight_shard)
+        
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+    
+    def forward(self, input):
+        # input: (..., in_features // world_size) - already partitioned
+        output = F.linear(input, self.weight)
+        # output: (..., out_features) - partial result, no bias yet
+        output = _ReduceFromModelParallelRegion.apply(output)
+        # output: (..., out_features) - fully reduced
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+[?2004hroot@250db61ab30a:/app# python3 -c "import ast; ast.parse(open('/app/parallel_linear.py').read()); print('Syntax OK')"
+[?2004lSyntax OK
+[?2004hroot@250db61ab30a:/app# cat > /app/test_parallel.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sys
+[?2004l[?2004h> 
+[?2004lh[?2004h> def test_world_size(world_size):
+[?2004l[?2004h>     dist.init_process_group(backend='gloo', rank=0, world_size=world_size, init_method='tcp://127.0.0.1:12355')
+[?2004l[?2004h>     
+[?2004l[?2004h>     from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h>     
+[?2004l[?2004h>     torch.manual_seed(42)
+[?2004l[?2004h>     in_features = 8
+[?2004l[?2004h>     out_features = 6
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Create master weight
+[?2004l[?2004h>     master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Test ColumnParallelLinear
+[?2004l[?2004h>     col_layer = ColumnParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h>     
+[?2004lb[?2004h>     # Check weight shape
+[?2004l[?2004h>     expected_weight_shape = (out_features // world_size, in_features)
+[?2004l[?2004h>     assert col_layer.weight.shape == expected_weight_shape, f"ColumnParallel weight shape mismatch: {col_layer.weight.shape} vs {expected_weight_shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check bias shape
+[?2004l[?2004h>     expected_bias_shape = (out_features // world_size,)
+[?2004l[?2004h>     assert col_layer.bias.shape == expected_bias_shape, f"ColumnParallel bias shape mismatch: {col_layer.bias.shape} vs {expected_bias_shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check weight values
+[?2004l[?2004h>     start = 0 * out_shard if (out_shard := out_features // world_size) else 0
+[?2004l[?2004h>     end = start + out_shard
+[?2004l[?2004h>     assert torch.allclose(col_layer.weight, master_weight[start:end, :]), "ColumnParallel weight values mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Test forward pass
+[?2004l[?2004h>     x = torch.randn(2, in_features, requires_grad=True)
+[?2004l[?2004h>     output = col_layer(x)
+[?2004l
+[?2004h>     expected_output_shape = (2, out_features)
+[?2004l[?2004h>     assert output.shape == expected_output_shape, f"ColumnParallel output shape mismatch: {output.shape} vs {expected_output_shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Compare with reference
+[?2004l[?2004h>     ref_layer = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h>     ref_layer.weight.data = master_weight.clone()
+[?2004l[?2004h>     with torch.no_grad():
+[?2004l[?2004h>         ref_output = ref_layer(x)
+[?2004l[?2004h>     # Bias is zero, so output should match
+[?2004l[?2004h>     assert torch.allclose(output, ref_output, atol=1e-5), f"ColumnParallel output mismatch: max diff = {(output - ref_output).abs().max()}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Test gradients
+[?2004l[?2004h>     output.sum().backward()
+[?2004l[?2004h>     assert col_layer.weight.grad is not None, "ColumnParallel weight grad is None"
+[?2004l[?2004h>     assert col_layer.bias.grad is not None, "ColumnParallel bias grad is None"
+[?2004l[?2004h>     assert col_layer.weight.grad.shape == expected_weight_shape
+[?2004l[?2004h>     assert col_layer.bias.grad.shape == expected_bias_shape
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Reference gradient
+[?2004l[?2004h>     ref_layer_bias_free = nn.Linear(in_features, out_features, bias=True)
+[?2004l[?2004h>     ref_layer_bias_free.weight.data = master_weight.clone()
+[?2004l[?2004h>     ref_layer_bias_free.bias.data = torch.zeros(out_features)
+[?2004l[?2004h>     x_ref = x.detach().clone().requires_grad_(True)
+[?2004l[?2004h>     ref_out = ref_layer_bias_free(x_ref)
+[?2004l[?2004h>     ref_out.sum().backward()
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check weight gradient
+[?2004l[?2004h>     ref_w_grad = ref_layer_bias_free.weight.grad[start:end, :]
+[?2004l[?2004h>     assert torch.allclose(col_layer.weight.grad, ref_w_grad, atol=1e-5), f"ColumnParallel weight grad mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check bias gradient
+[?2004l[?2004h>     ref_b_grad = ref_layer_bias_free.bias.grad[start:end]
+[?2004l[?2004h>     assert torch.allclose(col_layer.bias.grad, ref_b_grad, atol=1e-5), f"ColumnParallel bias grad mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     print(f"[world_size={world_size}] ColumnParallelLinear tests PASSED")
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Test RowParallelLinear
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Re-init for RowParallel
+[?2004l[?2004h>     dist.init_process_group(backend='gloo', rank=0, world_size=world_size, init_method='tcp://127.0.0.1:12356')
+[?2004l[?2004h>     
+[?2004l[?2004h>     row_layer = RowParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check weight shape
+[?2004l[?2004h>     expected_row_weight_shape = (out_features, in_features // world_size)
+[?2004l[?2004h>     assert row_layer.weight.shape == expected_row_weight_shape, f"RowParallel weight shape mismatch: {row_layer.weight.shape} vs {expected_row_weight_shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check bias shape (full)
+[?2004l[?2004h>     expected_row_bias_shape = (out_features,)
+[?2004l[?2004h>     assert row_layer.bias.shape == expected_row_bias_shape, f"RowParallel bias shape mismatch: {row_layer.bias.shape} vs {expected_row_bias_shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check weight values
+[?2004l[?2004h>     in_shard = in_features // world_size
+[?2004l[?2004h>     rs = 0 * in_shard
+[?2004l[?2004h>     re = rs + in_shard
+[?2004l[?2004h>     assert torch.allclose(row_layer.weight, master_weight[:, rs:re]), "RowParallel weight values mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Test forward pass - input is pre-partitioned
+[?2004l[?2004h>     x_full = torch.randn(2, in_features)
+[?2004l[?2004h>     in_shard = in_features // world_size
+[?2004l[?2004h>     x_shard = x_full[:, 0*in_shard : 1*in_shard]  # rank 0's shard
+[?2004l[?2004h>     
+[?2004l[?2004h>     output = row_layer(x_shard)
+[?2004l[?2004h>     expected_output_shape = (2, out_features)
+[?2004l[?2004h>     assert output.shape == expected_output_shape, f"RowParallel output shape mismatch: {output.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Compare with reference
+[?2004l[?2004h>     ref_layer2 = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h>     ref_layer2.weight.data = master_weight.clone()
+[?2004l[?2004h>     with torch.no_grad():
+[?2004l[?2004h>         ref_output2 = ref_layer2(x_full)
+[?2004l[?2004h>     assert torch.allclose(output, ref_output2, atol=1e-5), f"RowParallel output mismatch: max diff = {(output - ref_output2).abs().max()}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Test gradients
+[?2004l[?2004h>     x_shard_req = x_shard.detach().clone().requires_grad_(True)
+[?2004l[?2004h>     output2 = row_layer(x_shard_req)
+[?2004l[?2004h>     output2.sum().backward()
+[?2004l[?2004h>     assert row_layer.weight.grad is not None, "RowParallel weight grad is None"
+[?2004l[?2004h>     assert row_layer.bias.grad is not None, "RowParallel bias grad is None"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Reference gradient
+[?2004l[?2004h>     ref_layer3 = nn.Linear(in_features, out_features, bias=True)
+[?2004l[?2004h>     ref_layer3.weight.data = master_weight.clone()
+[?2004l[?2004h>     ref_layer3.bias.data = torch.zeros(out_features)
+[?2004l[?2004h>     x_ref2 = x_full.detach().clone().requires_grad_(True)
+[?2004l[?2004h>     ref_out3 = ref_layer3(x_ref2)
+[?2004l[?2004h>     ref_out3.sum().backward()
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check weight gradient
+[?2004l[?2004h>     ref_rw_grad = ref_layer3.weight.grad[:, rs:re]
+[?2004l[?2004h>     assert torch.allclose(row_layer.weight.grad, ref_rw_grad, atol=1e-5), f"RowParallel weight grad mismatch: max diff = {(row_layer.weight.grad - ref_rw_grad).abs().max()}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Check bias gradient
+[?2004l[?2004h>     assert torch.allclose(row_layer.bias.grad, ref_layer3.bias.grad, atol=1e-5), f"RowParallel bias grad mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     print(f"[world_size={world_size}] RowParallelLinear tests PASSED")
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     import torch.multiprocessing as mp
+[?2004l[?2004h>     
+[?2004l[?2004h>     for ws in [1, 2, 4]:
+[?2004l[?2004h>         # For world_size > 1, we need to run in separate processes
+[?2004l[?2004h>         # For simplicity, test world_size=1 directly here
+[?2004l[?2004h>         if ws == 1:
+[?2004l[?2004h>             test_world_size(1)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Test using spawned processes
+[?2004l[?2004h>             os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>             os.environ['MASTER_PORT'] = f'{12400 + ws}'
+[?2004l[?2004h>             mp.spawn(test_worker, args=(ws,), nprocs=ws, join=True)
+[?2004l[?2004h>             print(f"[world_size={ws}] Multi-process tests PASSED")
+[?2004l[?2004h>     
+[?2004l[?2004h>     print("\nAll tests passed!")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@250db61ab30a:/app# cd /app && python3 -c "
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> dist.init_process_group(backend='gloo', rank=0, world_size=1, init_method='tcp://127.0.0.1:12350')
+[?2004l[?2004h> 
+[?2004l[?2004h> from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h> 
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> in_features, out_features = 8, 6
+[?2004l[?2004h> master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h> 
+[?2004l[?2004h> # ColumnParallel
+[?2004l[?2004h> col = ColumnParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h> print('Column weight shape:', col.weight.shape)
+[?2004l[?2004h> print('Column bias shape:', col.bias.shape)
+[?2004l[?2004h> x = torch.randn(2, in_features)
+[?2004l[?2004h> out = col(x)
+[?2004l[?2004h> print('Column output shape:', out.shape)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Compare with reference
+[?2004l[?2004h> ref = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h> ref.weight.data = master_weight
+[?2004l[?2004h> ref_out = ref(x)
+[?2004l[?2004h> print('Column output matches ref:', torch.allclose(out, ref_out, atol=1e-5))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Gradient test
+[?2004l[?2004h> out.sum().backward()
+[?2004l[?2004h> print('Column weight grad shape:', col.weight.grad.shape)
+[?2004l[?2004h> print('Column bias grad shape:', col.bias.grad.shape)
+[?2004l[?2004h> 
+[?2004l[?2004h> # RowParallel
+[?2004l[?2004h> row = RowParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h> print('\nRow weight shape:', row.weight.shape)
+[?2004l[?2004h> print('Row bias shape:', row.bias.shape)
+[?2004l[?2004h> x_shard = torch.randn(2, 8)  # full input for ws=1
+[?2004l[?2004h> out2 = row(x_shard)
+[?2004l[?2004h> print('Row output shape:', out2.shape)
+[?2004l[?2004h> print('Row output matches ref:', torch.allclose(out2, ref_out, atol=1e-5))
+[?2004l[?2004h> 
+[?2004l[?2004h> out2.sum().backward()
+[?2004l[?2004h> print('Row weight grad shape:', row.weight.grad.shape)
+[?2004l[?2004h> print('Row bias grad shape:', row.bias.grad.shape)
+[?2004l[?2004h> 
+[?2004l[?2004h> dist.destroy_process_group()
+[?2004l[?2004h> print('\nSingle-process test PASSED')
+[?2004l[?2004h> "
+[?2004lTraceback (most recent call last):
+  File "<string>", line 2, in <module>
+ModuleNotFoundError: No module named 'torch'
+[?2004hroot@250db61ab30a:/app# which python3 && python3 --version
+[?2004l/usr/bin/python3
+Python 3.12.3
+[?2004hroot@250db61ab30a:/app# find / -name 'torch' -type d 2>/dev/null | head -10
+[?2004l[?2004hroot@250db61ab30a:/app# ls /opt/ 2>/dev/null; ls /venv* 2>/dev/null; ls /venv/bin/python* 2>/dev/null
+[?2004l[?2004hroot@250db61ab30a:/app# pip list 2>/dev/null | grep torch; pip3 list 2>/dev/null | grep torch
+[?2004l[?2004hroot@250db61ab30a:/app# pip3 install torch --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -5
+[?2004lbash: pip3: command not found
+[?2004hroot@250db61ab30a:/app# python3 -m pip --version 2>&1
+[?2004l/usr/bin/python3: No module named pip
+[?2004hroot@250db61ab30a:/app# apt-get update -qq && apt-get install -y -qq python3-pip 2>&1 | tail -3
+[?2004lSetting up libheif-plugin-aomdec:amd64 (1.17.6-1ubuntu4.8) ...
+Setting up libheif-plugin-aomenc:amd64 (1.17.6-1ubuntu4.8) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.8) ...
+[?2004hroot@250db61ab30a:/app# python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -5
+[?2004l    
+    See /usr/share/doc/python3.12/README.venv for more information.
+
+note: If you believe this is a mistake, please contact your Python installation or OS distribution provider. You can override this, at the risk of breaking your Python installation or OS, by passing --break-system-packages.
+hint: See PEP 668 for the detailed specification.
+[?2004hroot@250db61ab30a:/app# python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu --break-system-packages 2>&1 | tail -5
+[?2004l    Found existing installation: setuptools 68.1.2
+    Uninstalling setuptools-68.1.2:
+      Successfully uninstalled setuptools-68.1.2
+Successfully installed MarkupSafe-3.0.3 filelock-3.32.3 fsspec-2026.7.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 setuptools-78.1.0 sympy-1.14.0 torch-2.14.0+cpu typing-extensions-4.16.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+[?2004hroot@250db61ab30a:/app# cd /app && python3 -c "
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> dist.init_process_group(backend='gloo', rank=0, world_size=1, init_method='tcp://127.0.0.1:12350')
+[?2004l[?2004h> 
+[?2004l[?2004h> from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h> 
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> in_features, out_features = 8, 6
+[?2004l[?2004h> master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h> 
+[?2004l[?2004h> # ColumnParallel
+[?2004l[?2004h> col = ColumnParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h> print('Column weight shape:', col.weight.shape)
+[?2004l[?2004h> print('Column bias shape:', col.bias.shape)
+[?2004l[?2004h> x = torch.randn(2, in_features)
+[?2004l[?2004h> out = col(x)
+[?2004l[?2004h> print('Column output shape:', out.shape)
+[?2004l[?2004h> 
+[?2004l[?2004h> ref = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h> ref.weight.data = master_weight
+[?2004l[?2004h> ref_out = ref(x)
+[?2004l[?2004h> print('Column output matches ref:', torch.allclose(out, ref_out, atol=1e-5))
+[?2004l[?2004h> 
+[?2004l[?2004h> out.sum().backward()
+[?2004l[?2004h> print('Column weight grad shape:', col.weight.grad.shape)
+[?2004l[?2004h> print('Column bias grad shape:', col.bias.grad.shape)
+[?2004l[?2004h> 
+[?2004l[?2004h> # RowParallel
+[?2004l[?2004h> row = RowParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h> print('\nRow weight shape:', row.weight.shape)
+[?2004l[?2004h> print('Row bias shape:', row.bias.shape)
+[?2004l[?2004h> x_full = torch.randn(2, 8)
+[?2004l[?2004h> out2 = row(x_full)
+[?2004l[?2004h> print('Row output shape:', out2.shape)
+[?2004l[?2004h> print('Row output matches ref:', torch.allclose(out2, ref_out, atol=1e-5))
+[?2004l[?2004h> 
+[?2004l[?2004h> out2.sum().backward()
+[?2004l[?2004h> print('Row weight grad shape:', row.weight.grad.shape)
+[?2004l[?2004h> print('Row bias grad shape:', row.bias.grad.shape)
+[?2004l[?2004h> 
+[?2004l[?2004h> dist.destroy_process_group()
+[?2004l[?2004h> print('\nSingle-process test PASSED')
+[?2004l[?2004h> "
+[?2004l/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+Column weight shape: torch.Size([6, 8])
+Column bias shape: torch.Size([6])
+Column output shape: torch.Size([2, 6])
+Column output matches ref: True
+Column weight grad shape: torch.Size([6, 8])
+Column bias grad shape: torch.Size([6])
+
+Row weight shape: torch.Size([6, 8])
+Row bias shape: torch.Size([6])
+Row output shape: torch.Size([2, 6])
+Row output matches ref: False
+Row weight grad shape: torch.Size([6, 8])
+Row bias grad shape: torch.Size([6])
+
+Single-process test PASSED
+[?2004hroot@250db61ab30a:/app# cd /app && python3 -c "
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l[?2004h> dist.init_process_group(backend='gloo', rank=0, world_size=1, init_method='tcp://127.0.0.1:12351')
+[?2004l[?2004h> 
+[?2004l[?2004h> from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h> 
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> in_features, out_features = 8, 6
+[?2004l[?2004h> master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h> 
+[?2004l[?2004h> # RowParallel - fix: compare with correct reference
+[?2004l[?2004h> row = RowParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h> x_full = torch.randn(2, 8)
+[?2004l[?2004h> out2 = row(x_full)
+[?2004l[?2004h> 
+[?2004l[?2004h> ref = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h> ref.weight.data = master_weight
+[?2004l[?2004h> ref_out = ref(x_full)
+[?2004l[?2004h> print('Row output matches ref (correct comparison):', torch.allclose(out2, ref_out, atol=1e-5))
+[?2004l[?2004h> print('Max diff:', (out2 - ref_out).abs().max().item())
+[?2004l[?2004h> 
+[?2004l[?2004h> # Gradient check for Row
+[?2004l[?2004h> torch.manual_seed(42)
+[?2004l[?2004h> master_weight2 = torch.randn(out_features, in_features)
+[?2004l[?2004h> row2 = RowParallelLinear(in_features, out_features, bias=True, master_weight=master_weight2)
+[?2004l[?2004h> x2 = torch.randn(2, 8)
+[?2004l[?2004h> out3 = row2(x2)
+[?2004l[?2004h> out3.sum().backward()
+[?2004l[?2004h> 
+[?2004l[?2004h> ref2 = nn.Linear(in_features, out_features, bias=True)
+[?2004l[?2004h> ref2.weight.data = master_weight2
+[?2004l[?2004h> ref2.bias.data = torch.zeros(out_features)
+[?2004l[?2004h> x2_ref = x2.clone().requires_grad_(True)
+[?2004l[?2004h> out_ref = ref2(x2_ref)
+[?2004l[?2004h> out_ref.sum().backward()
+[?2004l[?2004h> 
+[?2004l[?2004h> print('Row weight grad matches:', torch.allclose(row2.weight.grad, ref2.weight.grad, atol=1e-5))
+[?2004l[?2004h> print('Row bias grad matches:', torch.allclose(row2.bias.grad, ref2.bias.grad, atol=1e-5))
+[?2004l[?2004h> 
+[?2004l[?2004h> dist.destroy_process_group()
+[?2004l[?2004h> print('Row parallel test PASSED')
+[?2004l[?2004h> "
+[?2004l/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+Row output matches ref (correct comparison): True
+Max diff: 0.0
+Row weight grad matches: True
+Row bias grad matches: True
+Row parallel test PASSED
+[?2004hroot@250db61ab30a:/app# cat > /app/test_multi.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l[?2004h> import os, sys
+[?2004l[?2004h> 
+[?2004ld[?2004h> def worker(rank, world_size, port):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = str(port)
+[?2004l[?2004h>     dist.init_process_group(backend='gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     
+[?2004l[?2004h>     from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h>     
+[?2004l[?2004h>     torch.manual_seed(42)
+[?2004l[?2004h>     in_features, out_features = 8, 6
+[?2004l[?2004h>     master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== ColumnParallelLinear =====
+[?2004l[?2004h>     col = ColumnParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h>     
+[?2004l[?2004h>     out_shard = out_features // world_size
+[?2004l[?2004h>     assert col.weight.shape == (out_shard, in_features), f"Rank {rank}: col weight {col.weight.shape}"
+[?2004l[?2004h>     assert col.bias.shape == (out_shard,), f"Rank {rank}: col bias {col.bias.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Verify shard values
+[?2004l[?2004h>     start = rank * out_shard
+[?2004l[?2004h>     end = start + out_shard
+[?2004l[?2004h>     assert torch.allclose(col.weight.data, master_weight[start:end, :]), f"Rank {rank}: weight shard mismatch"
+[?2004l[?2004h>     assert torch.allclose(col.bias.data, torch.zeros(out_shard)), f"Rank {rank}: bias not zero"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Forward
+[?2004l[?2004h>     x = torch.randn(2, in_features)
+[?2004l[?2004h>     out_col = col(x)
+[?2004l[?2004h>     assert out_col.shape == (2, out_features), f"Rank {rank}: col output shape {out_col.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Reference
+[?2004l[?2004h>     ref = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h>     ref.weight.data = master_weight
+[?2004l[?2004h>     ref_out = ref(x)
+[?2004l[?2004h>     assert torch.allclose(out_col, ref_out, atol=1e-5), f"Rank {rank}: col output mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Gradients
+[?2004l[?2004h>     out_col.sum().backward()
+[?2004l[?2004h>     assert col.weight.grad is not None
+[?2004l[?2004h>     assert col.bias.grad is not None
+[?2004l[?2004h>     assert col.weight.grad.shape == (out_shard, in_features)
+[?2004l[?2004h>     assert col.bias.grad.shape == (out_shard,)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Ref grads
+[?2004l[?2004h>     ref_b = nn.Linear(in_features, out_features, bias=True)
+[?2004l[?2004h>     ref_b.weight.data = master_weight
+[?2004l[?2004h>     ref_b.bias.data = torch.zeros(out_features)
+[?2004l[?2004h>     x_ref = x.clone().requires_grad_(True)
+[?2004l[?2004h>     ref_b(x_ref).sum().backward()
+[?2004l[?2004h>     
+[?2004l[?2004h>     assert torch.allclose(col.weight.grad, ref_b.weight.grad[start:end, :], atol=1e-5), f"Rank {rank}: col w grad mismatch"
+[?2004l[?2004h>     assert torch.allclose(col.bias.grad, ref_b.bias.grad[start:end], atol=1e-5), f"Rank {rank}: col b grad mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== RowParallelLinear =====
+[?2004l[?2004h>     row = RowParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h>     
+[?2004l[?2004h>     in_shard = in_features // world_size
+[?2004l[?2004h>     assert row.weight.shape == (out_features, in_shard), f"Rank {rank}: row weight {row.weight.shape}"
+[?2004l[?2004h>     assert row.bias.shape == (out_features,), f"Rank {rank}: row bias {row.bias.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Verify shard values
+[?2004l[?2004h>     rs = rank * in_shard
+[?2004l[?2004h>     re = rs + in_shard
+[?2004l[?2004h>     assert torch.allclose(row.weight.data, master_weight[:, rs:re]), f"Rank {rank}: row weight shard mismatch"
+[?2004l[?2004h>     assert torch.allclose(row.bias.data, torch.zeros(out_features)), f"Rank {rank}: row bias not zero"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Forward - input pre-partitioned
+[?2004l[?2004h>     x_full = torch.randn(2, in_features)
+[?2004l[?2004h>     x_shard = x_full[:, rs:re]
+[?2004l[?2004h>     out_row = row(x_shard)
+[?2004l[?2004h>     assert out_row.shape == (2, out_features), f"Rank {rank}: row output shape {out_row.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     ref2 = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h>     ref2.weight.data = master_weight
+[?2004l[?2004h>     ref_out2 = ref2(x_full)
+[?2004l[?2004h>     assert torch.allclose(out_row, ref_out2, atol=1e-5), f"Rank {rank}: row output mismatch, max={ (out_row-ref_out2).abs().max().item()}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Gradients
+[?2004l[?2004h>     x_shard_grad = x_shard.clone().requires_grad_(True)
+[?2004l[?2004h>     out_row2 = row(x_shard_grad)
+[?2004l[?2004h>     out_row2.sum().backward()
+[?2004l[?2004h>     assert row.weight.grad is not None
+[?2004l[?2004h>     assert row.bias.grad is not None
+[?2004l[?2004h>     
+[?2004l[?2004h>     ref3 = nn.Linear(in_features, out_features, bias=True)
+[?2004l[?2004h>     ref3.weight.data = master_weight
+[?2004l[?2004h>     ref3.bias.data = torch.zeros(out_features)
+[?2004l[?2004h>     x_ref2 = x_full.clone().requires_grad_(True)
+[?2004l[?2004h>     ref3(x_ref2).sum().backward()
+[?2004l[?2004h>     
+[?2004l[?2004h>     assert torch.allclose(row.weight.grad, ref3.weight.grad[:, rs:re], atol=1e-5), f"Rank {rank}: row w grad mismatch"
+[?2004l[?2004h>     assert torch.allclose(row.bias.grad, ref3.bias.grad, atol=1e-5), f"Rank {rank}: row b grad mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     if rank == 0:
+[?2004l[?2004h>         print(f"world_size={world_size}: ALL TESTS PASSED")
+[?2004l[?2004h>     
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     for ws in [2, 4]:
+[?2004l[?2004h>         mp.spawn(worker, args=(ws, 12500 + ws), nprocs=ws, join=True)
+[?2004l[?2004h>     print("Multi-process tests complete!")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@250db61ab30a:/app# python3 /app/test_multi.py
+[?2004l/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+world_size=2: ALL TESTS PASSED
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+W0907 02:33:17.412000 4900 torch/multiprocessing/spawn.py:165] Terminating process 4911 via signal SIGTERM
+W0907 02:33:17.413000 4900 torch/multiprocessing/spawn.py:165] Terminating process 4912 via signal SIGTERM
+W0907 02:33:17.413000 4900 torch/multiprocessing/spawn.py:165] Terminating process 4914 via signal SIGTERM
+Traceback (most recent call last):
+  File "/app/test_multi.py", line 106, in <module>
+    mp.spawn(worker, args=(ws, 12500 + ws), nprocs=ws, join=True)
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 340, in spawn
+    return start_processes(fn, args, nprocs, join, daemon, start_method="spawn")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 296, in start_processes
+    while not context.join():
+              ^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 211, in join
+    raise ProcessRaisedException(msg, error_index, failed_process.pid)
+torch.multiprocessing.spawn.ProcessRaisedException: 
+
+-- Process 2 terminated with the following error:
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 87, in _wrap
+    fn(i, *args)
+  File "/app/test_multi.py", line 34, in worker
+    assert out_col.shape == (2, out_features), f"Rank {rank}: col output shape {out_col.shape}"
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Rank 2: col output shape torch.Size([2, 4])
+
+[?2004hroot@250db61ab30a:/app# cat > /app/test_multi.py << 'EOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l[?2004h> import os, sys
+[?2004ln([?2004h> 
+[?2004lw[?2004h> def worker(rank, world_size, port):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = str(port)
+[?2004li[?2004h>     dist.init_process_group(backend='gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     
+[?2004l[?2004h>     from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h>     
+[?2004l[?2004h>     torch.manual_seed(42)
+[?2004l[?2004h>     in_features, out_features = 8, 8  # divisible by 1, 2, 4
+[?2004l[?2004h>     master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== ColumnParallelLinear =====
+[?2004l[?2004h>     col = ColumnParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h>     
+[?2004l[?2004h>     out_shard = out_features // world_size
+[?2004l[?2004h>     assert col.weight.shape == (out_shard, in_features), f"Rank {rank}: col weight {col.weight.shape}"
+[?2004l[?2004h>     assert col.bias.shape == (out_shard,), f"Rank {rank}: col bias {col.bias.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     start = rank * out_shard
+[?2004l[?2004h>     end = start + out_shard
+[?2004l[?2004h>     assert torch.allclose(col.weight.data, master_weight[start:end, :]), f"Rank {rank}: weight shard mismatch"
+[?2004l[?2004h>     assert torch.allclose(col.bias.data, torch.zeros(out_shard)), f"Rank {rank}: bias not zero"
+[?2004l[?2004h>     
+[?2004l[?2004h>     x = torch.randn(2, in_features)
+[?2004l[?2004h>     out_col = col(x)
+[?2004l[?2004h>     assert out_col.shape == (2, out_features), f"Rank {rank}: col output shape {out_col.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     ref = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h>     ref.weight.data = master_weight
+[?2004l[?2004h>     ref_out = ref(x)
+[?2004l[?2004h>     assert torch.allclose(out_col, ref_out, atol=1e-5), f"Rank {rank}: col output mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     out_col.sum().backward()
+[?2004l[?2004h>     assert col.weight.grad is not None
+[?2004l[?2004h>     assert col.bias.grad is not None
+[?2004l[?2004h>     assert col.weight.grad.shape == (out_shard, in_features)
+[?2004l[?2004h>     assert col.bias.grad.shape == (out_shard,)
+[?2004l[?2004h>     
+[?2004l[?2004h>     ref_b = nn.Linear(in_features, out_features, bias=True)
+[?2004l[?2004h>     ref_b.weight.data = master_weight
+[?2004l[?2004h>     ref_b.bias.data = torch.zeros(out_features)
+[?2004l[?2004h>     x_ref = x.clone().requires_grad_(True)
+[?2004l[?2004h>     ref_b(x_ref).sum().backward()
+[?2004l[?2004h>     
+[?2004l[?2004h>     assert torch.allclose(col.weight.grad, ref_b.weight.grad[start:end, :], atol=1e-5), f"Rank {rank}: col w grad mismatch"
+[?2004l[?2004h>     assert torch.allclose(col.bias.grad, ref_b.bias.grad[start:end], atol=1e-5), f"Rank {rank}: col b grad mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     # ===== RowParallelLinear =====
+[?2004l[?2004h>     row = RowParallelLinear(in_features, out_features, bias=True, master_weight=master_weight)
+[?2004l[?2004h>     
+[?2004l[?2004h>     in_shard = in_features // world_size
+[?2004l[?2004h>     assert row.weight.shape == (out_features, in_shard), f"Rank {rank}: row weight {row.weight.shape}"
+[?2004l[?2004h>     assert row.bias.shape == (out_features,), f"Rank {rank}: row bias {row.bias.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     rs = rank * in_shard
+[?2004l[?2004h>     re = rs + in_shard
+[?2004l[?2004h>     assert torch.allclose(row.weight.data, master_weight[:, rs:re]), f"Rank {rank}: row weight shard mismatch"
+[?2004l[?2004h>     assert torch.allclose(row.bias.data, torch.zeros(out_features)), f"Rank {rank}: row bias not zero"
+[?2004l[?2004h>     
+[?2004l[?2004h>     x_full = torch.randn(2, in_features)
+[?2004l[?2004h>     x_shard = x_full[:, rs:re]
+[?2004l[?2004h>     out_row = row(x_shard)
+[?2004l[?2004h>     assert out_row.shape == (2, out_features), f"Rank {rank}: row output shape {out_row.shape}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     ref2 = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h>     ref2.weight.data = master_weight
+[?2004l[?2004h>     ref_out2 = ref2(x_full)
+[?2004l[?2004h>     assert torch.allclose(out_row, ref_out2, atol=1e-5), f"Rank {rank}: row output mismatch, max={(out_row-ref_out2).abs().max().item()}"
+[?2004l[?2004h>     
+[?2004l[?2004h>     x_shard_grad = x_shard.clone().requires_grad_(True)
+[?2004l[?2004h>     out_row2 = row(x_shard_grad)
+[?2004l[?2004h>     out_row2.sum().backward()
+[?2004l[?2004h>     assert row.weight.grad is not None
+[?2004l[?2004h>     assert row.bias.grad is not None
+[?2004l[?2004h>     
+[?2004l[?2004h>     ref3 = nn.Linear(in_features, out_features, bias=True)
+[?2004l[?2004h>     ref3.weight.data = master_weight
+[?2004l[?2004h>     ref3.bias.data = torch.zeros(out_features)
+[?2004l[?2004h>     x_ref2 = x_full.clone().requires_grad_(True)
+[?2004l[?2004h>     ref3(x_ref2).sum().backward()
+[?2004l[?2004h>     
+[?2004l[?2004h>     assert torch.allclose(row.weight.grad, ref3.weight.grad[:, rs:re], atol=1e-5), f"Rank {rank}: row w grad mismatch"
+[?2004l[?2004h>     assert torch.allclose(row.bias.grad, ref3.bias.grad, atol=1e-5), f"Rank {rank}: row b grad mismatch"
+[?2004l[?2004h>     
+[?2004l[?2004h>     if rank == 0:
+[?2004l[?2004h>         print(f"world_size={world_size}: ALL TESTS PASSED")
+[?2004l[?2004h>     
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     for ws in [2, 4]:
+[?2004l[?2004h>         mp.spawn(worker, args=(ws, 12600 + ws), nprocs=ws, join=True)
+[?2004l[?2004h>     print("Multi-process tests complete!")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@250db61ab30a:/app# python3 /app/test_multi.py 2>&1 | grep -v UserWarning | grep -v "cpu = _conversion"
+[?2004lworld_size=2: ALL TESTS PASSED
+world_size=4: ALL TESTS PASSED
+Multi-process tests complete!
+[?2004hroot@250db61ab30a:/app# rm -f /app/test_parallel.py /app/test_multi.py
+[?2004l[?2004hroot@250db61ab30a:/app# echo '=== Final implementation ===' && cat /app/parallel_linear.py
+[?2004l=== Final implementation ===
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+class _GatherFromModelParallelRegion(torch.autograd.Function):
+    """All-gather in forward, slice in backward."""
+    @staticmethod
+    def forward(ctx, input):
+        ctx.rank = dist.get_rank()
+        ctx.world_size = dist.get_world_size()
+        if ctx.world_size > 1:
+            tensor_list = [torch.zeros_like(input) for _ in range(ctx.world_size)]
+            dist.all_gather(tensor_list, input.contiguous())
+            output = torch.cat(tensor_list, dim=-1)
+        else:
+            output = input
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        world_size = ctx.world_size
+        rank = ctx.rank
+        last_dim = grad_output.shape[-1]
+        shard_size = last_dim // world_size
+        start = rank * shard_size
+        end = start + shard_size
+        return grad_output[..., start:end].contiguous()
+
+
+class _ReduceFromModelParallelRegion(torch.autograd.Function):
+    """All-reduce in forward, identity in backward."""
+    @staticmethod
+    def forward(ctx, input):
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            input = input.clone().contiguous()
+            dist.all_reduce(input, op=dist.ReduceOp.SUM)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
+class ColumnParallelLinear(nn.Module):
+    """Linear layer with column parallelism.
+    
+    Splits the weight matrix by columns (output dimension).
+    Weight shard shape: (out_features // world_size, in_features)
+    Bias shard shape: (out_features // world_size,)
+    Output is gathered along the last dimension.
+    """
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        
+        out_shard = out_features // world_size
+        
+        start = rank * out_shard
+        end = start + out_shard
+        weight_shard = master_weight[start:end, :].clone()
+        
+        self.weight = nn.Parameter(weight_shard)
+        
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_shard))
+        else:
+            self.register_parameter('bias', None)
+    
+    def forward(self, input):
+        # input: (..., in_features) - full input, same on all ranks
+        output = F.linear(input, self.weight, self.bias)
+        # output: (..., out_features // world_size)
+        output = _GatherFromModelParallelRegion.apply(output)
+        # output: (..., out_features)
+        return output
+
+
+class RowParallelLinear(nn.Module):
+    """Linear layer with row parallelism.
+    
+    Splits the weight matrix by rows (input dimension).
+    Weight shard shape: (out_features, in_features // world_size)
+    Bias shape: (out_features,) - full on each rank
+    Input is pre-partitioned along the last dimension.
+    Output is all-reduced (summed) across ranks.
+    """
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        
+        in_shard = in_features // world_size
+        
+        start = rank * in_shard
+        end = start + in_shard
+        weight_shard = master_weight[:, start:end].clone()
+        
+        self.weight = nn.Parameter(weight_shard)
+        
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+    
+    def forward(self, input):
+        # input: (..., in_features // world_size) - already partitioned
+        output = F.linear(input, self.weight)
+        # output: (..., out_features) - partial result, no bias yet
+        output = _ReduceFromModelParallelRegion.apply(output)
+        # output: (..., out_features) - fully reduced
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+[?2004hroot@250db61ab30a:/app# 

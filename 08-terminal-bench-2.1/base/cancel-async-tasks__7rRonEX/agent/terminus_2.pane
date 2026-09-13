@@ -1,0 +1,329 @@
+[?2004hroot@2ee967cd1df6:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@2ee967cd1df6:/app# clear
+[?2004l[H[J[3J[?2004hroot@2ee967cd1df6:/app# python3 --version
+[?2004lPython 3.13.7
+[?2004hroot@2ee967cd1df6:/app# cat > /app/run.py << 'EOF'
+[?2004l[?2004h> """Run async tasks with bounded concurrency."""
+[?2004l[?2004h> 
+[?2004l[?2004h> import asyncio
+[?2004l[?2004h> from typing import Callable, Awaitable
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> async def run_tasks(tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int) -> None:
+[?2004l[?2004h>     """Run *tasks* concurrently, at most *max_concurrent* at a time.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Each element of *tasks* is a zero-argument callable that returns an
+[?2004l[?2004h>     ``Awaitable[None]`` (typically an async function).
+[?2004l[?2004h> 
+[?2004l[?2004h>     If the surrounding task is cancelled (e.g. via KeyboardInterrupt / SIGINT),
+[?2004l[?2004h>     every in-flight child task is cancelled and awaited so that its ``finally``
+[?2004l[?2004h>     / cleanup code can execute before the ``CancelledError`` is re-raised.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     if max_concurrent < 1:
+[?2004l[?2004h>         raise ValueError("max_concurrent must be >= 1")
+[?2004l[?2004h> 
+[?2004l[?2004h>     sem = asyncio.Semaphore(max_concurrent)
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def _run(fn: Callable[[], Awaitable[None]]) -> None:
+[?2004l[?2004h>         async with sem:
+[?2004l[?2004h>             await fn()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Convert each callable into a concrete asyncio.Task so we can cancel
+[?2004l[?2004h>     # them explicitly during shutdown.
+[?2004l[?2004h>     children: list[asyncio.Task] = [
+[?2004l[?2004h>         asyncio.ensure_future(_run(fn)) for fn in tasks
+[?2004l[?2004h>     ]
+[?2004l[?2004h> 
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await asyncio.gather(*children)
+[?2004l[?2004h>     except asyncio.CancelledError:
+[?2004l[?2004h>         # Cancel every child that hasn't finished yet.
+[?2004l[?2004h>         for c in children:
+[?2004l[?2004h>             if not c.done():
+[?2004l[?2004h>                 c.cancel()
+[?2004l[?2004h>         # Wait for all children to finish their cleanup; suppress their
+[?2004l[?2004h>         # exceptions (cancellation is expected) so we re-raise our own.
+[?2004l[?2004h>         await asyncio.gather(*children, return_exceptions=True)
+[?2004l[?2004h>         raise
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@2ee967cd1df6:/app# cat /app/run.py
+[?2004l"""Run async tasks with bounded concurrency."""
+
+import asyncio
+from typing import Callable, Awaitable
+
+
+async def run_tasks(tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int) -> None:
+    """Run *tasks* concurrently, at most *max_concurrent* at a time.
+
+    Each element of *tasks* is a zero-argument callable that returns an
+    ``Awaitable[None]`` (typically an async function).
+
+    If the surrounding task is cancelled (e.g. via KeyboardInterrupt / SIGINT),
+    every in-flight child task is cancelled and awaited so that its ``finally``
+    / cleanup code can execute before the ``CancelledError`` is re-raised.
+    """
+    if max_concurrent < 1:
+        raise ValueError("max_concurrent must be >= 1")
+
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _run(fn: Callable[[], Awaitable[None]]) -> None:
+        async with sem:
+            await fn()
+
+    # Convert each callable into a concrete asyncio.Task so we can cancel
+    # them explicitly during shutdown.
+    children: list[asyncio.Task] = [
+        asyncio.ensure_future(_run(fn)) for fn in tasks
+    ]
+
+    try:
+        await asyncio.gather(*children)
+    except asyncio.CancelledError:
+        # Cancel every child that hasn't finished yet.
+        for c in children:
+            if not c.done():
+                c.cancel()
+        # Wait for all children to finish their cleanup; suppress their
+        # exceptions (cancellation is expected) so we re-raise our own.
+        await asyncio.gather(*children, return_exceptions=True)
+        raise
+[?2004hroot@2ee967cd1df6:/app# cat > /app/test_run.py << 'EOF'
+[?2004l[?2004h> import asyncio
+[?2004lation")
+
+# ── Test 3: Tasks can complete normally, one cancelled ──────────────────
+async def test_mixed():
+    results = []
+    cleaned_up = []
+
+    async def fast(i):
+        try:
+            await asyncio.sleep(0.05)
+            results.append(i)
+        finally:
+            cleaned_up.append(i)
+
+    async def slow(i):
+        try:
+            await asyncio.sleep(100)
+            results.append(i)
+        finally:
+            cleaned_up.append(i)
+
+    tasks = [lambda i=i: fast(i) for i in range(3)] + \
+            [lambda i=i: slow(i) for i in range(3, 5)]
+
+    async def main():
+        t = asyncio.create_task(run_tasks(tasks, max_concurrent=10))
+        await asyncio.sleep(0.2)  # fast tasks should be done, slow ones still running
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
+    await main()
+    print(f"Test 3: results={sorted(results)}, cleaned_up={sorted(cleaned_up)}")
+    assert 0 in results and 1 in results and 2 in results, "fast tasks should have completed"
+    assert 3 in cleaned_up and 4 in cleaned_up, "slow tasks should have been cancelled with cleanup"
+    assert 3 not in results and 4 not in results, "slow tasks should not have completed"
+    print("Test 3 PASSED: fast tasks completed, slow tasks cancelled with cleanup")
+
+async def main():
+    await test_concurrency_limit()
+    await test_cancellation_cleanup()
+    await test_mixed()
+    print("\nAll tests passed!")
+
+asyncio.run(main())
+EOF
+[?2004h> import sys
+[?2004l[?2004h> from run import run_tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> # ── Test 1: Basic concurrency limiting ──────────────────────────────────
+[?2004l[?2004h> async def test_concurrency_limit():
+[?2004l[?2004h>     running = 0
+[?2004l[?2004h>     max_seen = 0
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def task():
+[?2004l[?2004h>         nonlocal running, max_seen
+[?2004l[?2004h>         running += 1
+[?2004l[?2004h>         max_seen = max(max_seen, running)
+[?2004l[?2004h>         await asyncio.sleep(0.05)
+[?2004l[?2004h>         running -= 1
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda: task() for _ in range(20)]
+[?2004l[?2004h>     await run_tasks(tasks, max_concurrent=3)
+[?2004l[?2004h>     assert max_seen <= 3, f"Exceeded max_concurrent: saw {max_seen}" 
+[?2004l[?2004h>     print(f"Test 1 PASSED: max concurrent seen was {max_seen} (limit was 3)")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ── Test 2: Cancellation runs cleanup ───────────────────────────────────
+[?2004l[?2004h> async def test_cancellation_cleanup():
+[?2004l[?2004h>     cleaned_up = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def long_task(i):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await asyncio.sleep(100)  # very long
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             cleaned_up.append(i)
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda i=i: long_task(i) for i in range(5)]
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def main():
+[?2004l[?2004h>         # Run run_tasks and cancel it after a short delay
+[?2004l[?2004h>         t = asyncio.create_task(run_tasks(tasks, max_concurrent=2))
+[?2004l[?2004h>         await asyncio.sleep(0.1)  # let tasks start
+[?2004l[?2004h>         t.cancel()
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await t
+[?2004l[?2004h>         except asyncio.CancelledError:
+[?2004l[?2004h>             pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     await main()
+[?2004l[?2004h>     # All 5 tasks should have run their finally blocks (at least the ones
+[?2004l[?2004h>     # that started; with concurrency=2, tasks 0,1 run and 2,3,4 are queued
+[?2004l[?2004h>     # but their coroutines start the semaphore wait so they're also cancelled
+[?2004l[?2004h>     # before they reach the long_task body… actually they won't reach the
+[?2004l[?2004h>     # try block, so their finally won't run. Only 2 tasks should have cleaned up.
+[?2004l[?2004h>     print(f"Test 2: cleaned_up = {sorted(cleaned_up)} (expected subset of [0-4])")
+[?2004l[?2004h>     assert len(cleaned_up) >= 1, "Expected at least one cleanup to run"
+[?2004l[?2004h>     print("Test 2 PASSED: cleanup code ran on cancellation")
+[?2004l[?2004h> 
+[?2004l[?2004h> # ── Test 3: Tasks can complete normally, one cancelled ──────────────────
+[?2004l[?2004h> async def test_mixed():
+[?2004l[?2004h>     results = []
+[?2004l[?2004h>     cleaned_up = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def fast(i):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await asyncio.sleep(0.05)
+[?2004l[?2004h>             results.append(i)
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             cleaned_up.append(i)
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def slow(i):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await asyncio.sleep(100)
+[?2004l[?2004h>             results.append(i)
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             cleaned_up.append(i)
+[?2004l[?2004h> 
+[?2004l[?2004h>     tasks = [lambda i=i: fast(i) for i in range(3)] + \
+[?2004l[?2004h>             [lambda i=i: slow(i) for i in range(3, 5)]
+[?2004l[?2004h> 
+[?2004l[?2004h>     async def main():
+[?2004l[?2004h>         t = asyncio.create_task(run_tasks(tasks, max_concurrent=10))
+[?2004l[?2004h>         await asyncio.sleep(0.2)  # fast tasks should be done, slow ones still running
+[?2004l[?2004h>         t.cancel()
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await t
+[?2004l[?2004h>         except asyncio.CancelledError:
+[?2004l[?2004h>             pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     await main()
+[?2004l[?2004h>     print(f"Test 3: results={sorted(results)}, cleaned_up={sorted(cleaned_up)}")
+[?2004l[?2004h>     assert 0 in results and 1 in results and 2 in results, "fast tasks should have completed"
+[?2004l[?2004h>     assert 3 in cleaned_up and 4 in cleaned_up, "slow tasks should have been cancelled with cleanup"
+[?2004l[?2004h>     assert 3 not in results and 4 not in results, "slow tasks should not have completed"
+[?2004l[?2004h>     print("Test 3 PASSED: fast tasks completed, slow tasks cancelled with cleanup")
+[?2004l[?2004h> 
+[?2004l[?2004h> async def main():
+[?2004l[?2004h>     await test_concurrency_limit()
+[?2004l[?2004h>     await test_cancellation_cleanup()
+[?2004l[?2004h>     await test_mixed()
+[?2004l[?2004h>     print("\nAll tests passed!")
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(main())
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@2ee967cd1df6:/app# cd /app && python3 test_run.py
+[?2004lTest 1 PASSED: max concurrent seen was 3 (limit was 3)
+Test 2: cleaned_up = [0, 1] (expected subset of [0-4])
+Test 2 PASSED: cleanup code ran on cancellation
+Test 3: results=[0, 1, 2], cleaned_up=[0, 1, 2, 3, 4]
+Test 3 PASSED: fast tasks completed, slow tasks cancelled with cleanup
+
+All tests passed!
+[?2004hroot@2ee967cd1df6:/app# cd /app && python3 -c "from run import run_tasks; print('Import OK:', run_tasks)"
+[?2004lImport OK: <function run_tasks at 0x76078aa97f60>
+[?2004hroot@2ee967cd1df6:/app# cat > /app/test_sigint.py << 'EOF'
+[?2004l[?2004h> import asyncio, os, signal, sys
+[?2004l[?2004h> from run import run_tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> cleaned = []
+[?2004l[?2004h> 
+[?2004l[?2004h> async def job(i):
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await asyncio.sleep(30)
+[?2004l[?2004h>     except asyncio.CancelledError:
+[?2004l[?2004h>         raise
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         cleaned.append(i)
+[?2004l[?2004h>         print(f"  job {i} cleanup ran", flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> async def main():
+[?2004l[?2004h>     # Install default SIGINT handler so asyncio.run picks up KeyboardInterrupt
+[?2004l[?2004h>     tasks = [lambda i=i: job(i) for i in range(5)]
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await run_tasks(tasks, max_concurrent=3)
+[?2004l[?2004h>     except (KeyboardInterrupt, asyncio.CancelledError):
+[?2004l[?2004h>         pass
+[?2004l[?2004h>     print(f"Cleaned up: {sorted(cleaned)}", flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(main())
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@2ee967cd1df6:/app# python3 /app/test_sigint.py & sleep 0.5 && kill -INT $! && wait $!
+[?2004l[1] 635
+  job 0 cleanup ran
+  job 1 cleanup ran
+  job 2 cleanup ran
+Cleaned up: [0, 1, 2]
+[1]+  Done                    python3 /app/test_sigint.py
+[?2004hroot@2ee967cd1df6:/app# rm /app/test_run.py /app/test_sigint.py
+[?2004l[?2004hroot@2ee967cd1df6:/app# cat /app/run.py
+[?2004l"""Run async tasks with bounded concurrency."""
+
+import asyncio
+from typing import Callable, Awaitable
+
+
+async def run_tasks(tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int) -> None:
+    """Run *tasks* concurrently, at most *max_concurrent* at a time.
+
+    Each element of *tasks* is a zero-argument callable that returns an
+    ``Awaitable[None]`` (typically an async function).
+
+    If the surrounding task is cancelled (e.g. via KeyboardInterrupt / SIGINT),
+    every in-flight child task is cancelled and awaited so that its ``finally``
+    / cleanup code can execute before the ``CancelledError`` is re-raised.
+    """
+    if max_concurrent < 1:
+        raise ValueError("max_concurrent must be >= 1")
+
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _run(fn: Callable[[], Awaitable[None]]) -> None:
+        async with sem:
+            await fn()
+
+    # Convert each callable into a concrete asyncio.Task so we can cancel
+    # them explicitly during shutdown.
+    children: list[asyncio.Task] = [
+        asyncio.ensure_future(_run(fn)) for fn in tasks
+    ]
+
+    try:
+        await asyncio.gather(*children)
+    except asyncio.CancelledError:
+        # Cancel every child that hasn't finished yet.
+        for c in children:
+            if not c.done():
+                c.cancel()
+        # Wait for all children to finish their cleanup; suppress their
+        # exceptions (cancellation is expected) so we re-raise our own.
+        await asyncio.gather(*children, return_exceptions=True)
+        raise
+[?2004hroot@2ee967cd1df6:/app# 

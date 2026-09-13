@@ -1,0 +1,564 @@
+[?2004hroot@1aabb5fe1671:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@1aabb5fe1671:/app# clear
+[?2004l[H[J[3J[?2004hroot@1aabb5fe1671:/app# cd /app && ls -la && python3 -c "import torch; print(torch.__version__)"
+[?2004ltotal 0
+drwxr-xr-x 2 root root  10 Oct 22  2025 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 102 Sep  7 00:22 [01;34m..[0m
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'torch'
+[?2004hroot@1aabb5fe1671:/app# cat > /app/parallel_linear.py << 'PYEOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> def _get_world_size():
+[?2004lr[?2004h>     try:
+[?2004l[?2004h>         if dist.is_available() and dist.is_initialized():
+[?2004l[?2004h>             return dist.get_world_size()
+[?2004l[?2004h>     except Exception:
+[?2004l no bias here
+        output_[?2004h>         pass
+[?2004l[?2004h>     return 1
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004ls[?2004h> def _get_rank():
+[?2004l   [?2004h>     try:
+[?2004l[?2004h>         if dist.is_available() and dist.is_initialized():
+[?2004l[?2004h>             return dist.get_rank()
+[?2004l[?2004h>     except Exception:
+[?2004l[?2004h>         pass
+[?2004l[?2004h>     return 0
+[?2004l  [?2004h> 
+[?2004l [?2004h> 
+[?2004l [?2004h> class _GatherFromModelParallelRegion(torch.autograd.Function):
+[?2004l[?2004h>     """Differentiable all-gather: concatenate along the last dimension."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, input_):
+[?2004l[?2004h>         world_size = _get_world_size()
+[?2004l[?2004h>         ctx.world_size = world_size
+[?2004l[?2004h>         ctx.rank = _get_rank()
+[?2004l[?2004h>         if world_size == 1:
+[?2004l[?2004h>             return input_
+[?2004l[?2004h>         gathered = [torch.empty_like(input_) for _ in range(world_size)]
+[?2004l[?2004h>         dist.all_gather(gathered, input_.contiguous())
+[?2004l[?2004h>         return torch.cat(gathered, dim=-1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         world_size = ctx.world_size
+[?2004l[?2004h>         if world_size == 1:
+[?2004l[?2004h>             return grad_output
+[?2004l[?2004h>         local = grad_output.shape[-1] // world_size
+[?2004l[?2004h>         return grad_output[..., ctx.rank * local:(ctx.rank + 1) * local].contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _ReduceFromModelParallelRegion(torch.autograd.Function):
+[?2004l[?2004h>     """Differentiable all-reduce (sum)."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, input_):
+[?2004l[?2004h>         if _get_world_size() == 1:
+[?2004l[?2004h>             return input_
+[?2004l[?2004h>         output = input_.clone()
+[?2004l[?2004h>         dist.all_reduce(output, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         # d(sum_r x_r)/dx_r = 1 -> gradient passes through unchanged.
+[?2004l[?2004h>         return grad_output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with column (output-feature) parallelism.
+[?2004l[?2004h> 
+[?2004l[?2004h>     weight shape (out_features, in_features) -> each rank keeps (out_features/TP, in_features)
+[?2004l[?2004h>     bias is sharded like the output dimension -> each rank keeps (out_features/TP)
+[?2004l[?2004h>     forward returns the full (all-gathered) output of shape (..., out_features).
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h> 
+[?2004l[?2004h>         world_size = _get_world_size()
+[?2004l[?2004h>         rank = _get_rank()
+[?2004l[?2004h>         out_per_rank = out_features // world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         start = rank * out_per_rank
+[?2004l[?2004h>         weight_shard = master_weight[start:start + out_per_rank, :].detach().clone()
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_shard)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(out_per_rank, dtype=weight_shard.dtype, device=weight_shard.device))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, input):
+[?2004l[?2004h>         # input: (..., in_features); local output: (..., out_features/TP)
+[?2004l[?2004h>         output = F.linear(input, self.weight, self.bias)
+[?2004l[?2004h>         # all-gather along the last dim -> (..., out_features)
+[?2004l[?2004h>         output = _GatherFromModelParallelRegion.apply(output)
+[?2004l[?2004h>         return output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with row (input-feature) parallelism.
+[?2004l[?2004h> 
+[?2004l[?2004h>     weight shape (out_features, in_features) -> each rank keeps (out_features, in_features/TP)
+[?2004l[?2004h>     bias is full (out_features) on every rank (added after the all-reduce, so only once)
+[?2004l[?2004h>     forward expects an input already scattered along the last dim (..., in_features/TP)
+[?2004l[?2004h>     and returns the full (all-reduced) output of shape (..., out_features).
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias, master_weight):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h> 
+[?2004l[?2004h>         world_size = _get_world_size()
+[?2004l[?2004h>         rank = _get_rank()
+[?2004l[?2004h>         in_per_rank = in_features // world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         start = rank * in_per_rank
+[?2004l[?2004h>         weight_shard = master_weight[:, start:start + in_per_rank].detach().clone()
+[?2004l[?2004h>         self.weight = nn.Parameter(weight_shard)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(out_features, dtype=weight_shard.dtype, device=weight_shard.device))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, input):
+[?2004l[?2004h>         # input: (..., in_features/TP) [pre-scattered], no bias here
+[?2004l[?2004h>         output_parallel = F.linear(input, self.weight)
+[?2004l[?2004h>         # all-reduce (sum) across ranks
+[?2004l[?2004h>         output = _ReduceFromModelParallelRegion.apply(output_parallel)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             output = output + self.bias
+[?2004l[?2004h>         return output
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@1aabb5fe1671:/app# cat > /app/test_pl.py << 'PYEOF'
+[?2004l[?2004h> import os
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l[?2004h> 
+[?2004l[?2004h> import parallel_linear as pl
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def check(name, a, b):
+[?2004l[?2004h>     good = torch.allclose(a, b, atol=1e-5)
+[?2004l[?2004h>     err = (a - b).abs().max().item() if a.shape == b.shape else 'NA'
+[?2004l[?2004h>     print(f'[{os.getenv("RANK", "?")}/{os.getenv("WORLD", "?")}] ' + ('OK  ' if good else 'FAIL') + f' {name}: err={err}')
+[?2004l[?2004h>     return good
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def run(rank, world_size, port):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = str(port)
+[?2004l[?2004h>     os.environ['RANK'] = str(rank)
+[?2004l[?2004h>     os.environ['WORLD'] = str(world_size)
+[?2004l[?2004h>     dist.init_process_group('gloo', init_method='env://', rank=rank, world_size=world_size)
+[?2004l[?2004h> 
+[?2004l[?2004h>     torch.manual_seed(1234)
+[?2004l[?2004h>     in_features = 8
+[?2004l[?2004h>     out_features = 8
+[?2004l[?2004h>     batch = 5
+[?2004l[?2004h> 
+[?2004l[?2004h>     master_weight = torch.randn(out_features, in_features)
+[?2004l[?2004h>     x = torch.randn(batch, in_features)
+[?2004l[?2004h> 
+[?2004l[?2004h>     ref = nn.Linear(in_features, out_features, bias=True)
+[?2004l[?2004h>     ref.weight = nn.Parameter(master_weight.clone())
+[?2004l[?2004h>     ref.bias = nn.Parameter(torch.zeros(out_features))
+[?2004l[?2004h>     y_ref = ref(x)
+[?2004l[?2004h>     y_ref.sum().backward()
+[?2004l[?2004h>     W_grad = ref.weight.grad.detach().clone()
+[?2004l[?2004h>     b_grad = ref.bias.grad.detach().clone()
+[?2004l[?2004h> 
+[?2004l[?2004h>     oks = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     out_per_rank = out_features // world_size
+[?2004l[?2004h>     col = pl.ColumnParallelLinear(in_features, out_features, True, master_weight)
+[?2004l[?2004h>     oks.append(check('col.weight shape', torch.as_tensor(col.weight.shape), torch.tensor([out_per_rank, in_features])))
+[?2004l[?2004h>     oks.append(check('col.bias shape', torch.as_tensor(col.bias.shape), torch.tensor([out_per_rank])))
+[?2004l[?2004h>     y_col = col(x)
+[?2004l[?2004h>     oks.append(check('col.forward', y_col, y_ref))
+[?2004l[?2004h>     y_col.sum().backward()
+[?2004l[?2004h>     s = rank * out_per_rank
+[?2004l[?2004h>     oks.append(check('col.weight.grad', col.weight.grad, W_grad[s:s + out_per_rank, :]))
+[?2004l[?2004h>     oks.append(check('col.bias.grad', col.bias.grad, b_grad[s:s + out_per_rank]))
+[?2004l[?2004h> 
+[?2004l[?2004h>     col_nb = pl.ColumnParallelLinear(in_features, out_features, False, master_weight)
+[?2004l[?2004h>     assert col_nb.bias is None
+[?2004l[?2004h>     ref_nb = nn.Linear(in_features, out_features, bias=False)
+[?2004l[?2004h>     ref_nb.weight = nn.Parameter(master_weight.clone())
+[?2004l[?2004h>     oks.append(check('col.forward_no_bias', col_nb(x), ref_nb(x)))
+[?2004l[?2004h> 
+[?2004l[?2004h>     in_per_rank = in_features // world_size
+[?2004l[?2004h>     row = pl.RowParallelLinear(in_features, out_features, True, master_weight)
+[?2004l[?2004h>     oks.append(check('row.weight shape', torch.as_tensor(row.weight.shape), torch.tensor([out_features, in_per_rank])))
+[?2004l[?2004h>     oks.append(check('row.bias shape', torch.as_tensor(row.bias.shape), torch.tensor([out_features])))
+[?2004l[?2004h>     x_local = x[:, rank * in_per_rank:(rank + 1) * in_per_rank]
+[?2004l[?2004h>     y_row = row(x_local)
+[?2004l[?2004h>     oks.append(check('row.forward', y_row, y_ref))
+[?2004l[?2004h>     y_row.sum().backward()
+[?2004l[?2004h>     s_in = rank * in_per_rank
+[?2004l[?2004h>     oks.append(check('row.weight.grad', row.weight.grad, W_grad[:, s_in:s_in + in_per_rank]))
+[?2004l[?2004h>     oks.append(check('row.bias.grad', row.bias.grad, b_grad))
+[?2004l[?2004h> 
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not all(oks):
+[?2004l[?2004h>         raise RuntimeError(f'FAILED on rank {rank}')
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     for world_size in [1, 2, 4]:
+[?2004l[?2004h>         print(f'===== world_size = {world_size} =====')
+[?2004l[?2004h>         port = 29510 + world_size
+[?2004l[?2004h>         mp.spawn(run, args=(world_size, port), nprocs=world_size, join=True)
+[?2004l[?2004h>         print(f'world_size={world_size}: PASSED')
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@1aabb5fe1671:/app# cd /app && python3 test_pl.py
+[?2004lTraceback (most recent call last):
+  File "/app/test_pl.py", line 2, in <module>
+    import torch
+ModuleNotFoundError: No module named 'torch'
+[?2004hroot@1aabb5fe1671:/app# which -a python python3; echo '---'; ls /opt 2>/dev/null; echo '---'; ls /usr/local/bin 2>/dev/null | head; echo '---'; ls ~ 2>/dev/null M[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[C[Kl
+[?2004l/usr/bin/python3
+/bin/python3
+---
+---
+---
+[?2004hroot@1aabb5fe1671:/app# find / -maxdepth 6 -name 'version.py' -path '*torch*' 2>/dev/null | head; echo '==='; find / -maxdepth 7 -name 'torch' -type d 2>/dev/null | head
+[?2004l===
+[?2004hroot@1aabb5fe1671:/app# for p in python python3 /usr/bin/python /usr/bin/python3 /opt/conda/bin/python /opt/miniconda3/bin/python; do echo "== $p"; $p -c 'import torch,sys;print(torch.__version__)' 2>&1 | head -1; done
+[?2004l== python
+bash: python: command not found
+== python3
+Traceback (most recent call last):
+== /usr/bin/python
+bash: /usr/bin/python: No such file or directory
+== /usr/bin/python3
+Traceback (most recent call last):
+== /opt/conda/bin/python
+bash: /opt/conda/bin/python: No such file or directory
+== /opt/miniconda3/bin/python
+bash: /opt/miniconda3/bin/python: No such file or directory
+[?2004hroot@1aabb5fe1671:/app# pip list 2>/dev/null | grep -i torch; echo '---conda---'; conda env list 2>/dev/null
+[?2004l---conda---
+[?2004hroot@1aabb5fe1671:/app# python3 --version; python3 -m pip --version
+[?2004lPython 3.12.3
+/usr/bin/python3: No module named pip
+[?2004hroot@1aabb5fe1671:/app# cd /app && python3 -m py_compile parallel_linear.py && echo 'SYNTAX OK' && head -5 parallel_linear.py
+[?2004lSYNTAX OK
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+[?2004hroot@1aabb5fe1671:/app# python3 -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -20
+[?2004l/usr/bin/python3: No module named pip
+[?2004hroot@1aabb5fe1671:/app# python3 -m ensurepip --upgrade 2>&1 | tail -5; echo '---'; python3 -m pip --version 2>&1
+[?2004l/usr/bin/python3: No module named ensurepip
+---
+/usr/bin/python3: No module named pip
+[?2004hroot@1aabb5fe1671:/app# cat /etc/os-release 2>/dev/null | head -3; echo '---net---'; timeout 8 bash -c 'cat < /dev/null > /dev/tcp/download.pytorch.org/443' && echo 'NET OK' || echo 'NET FAIL'
+[?2004lPRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+---net---
+NET OK
+[?2004hroot@1aabb5fe1671:/app# curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && python3 /tmp/get-pip.py --break-system-packages 2>&1 | tail -8
+[?2004lbash: curl: command not found
+[?2004hroot@1aabb5fe1671:/app# python3 -m pip --version 2>&1
+[?2004l/usr/bin/python3: No module named pip
+[?2004hroot@1aabb5fe1671:/app# which wget; python3 -c "import urllib.request; urllib.request.urlretrieve('https://bootstrap.pypa.io/get-pip.py','/tmp/get-pip.py'); print('downloaded')"
+[?2004ldownloaded
+[?2004hroot@1aabb5fe1671:/app# python3 /tmp/get-pip.py --break-system-packages 2>&1 | tail -8
+[?2004lCollecting pip
+  Downloading pip-26.2.1-py3-none-any.whl.metadata (4.6 kB)
+Downloading pip-26.2.1-py3-none-any.whl (1.8 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.8/1.8 MB 22.4 MB/s  0:00:00
+Installing collected packages: pip
+Successfully installed pip-26.2.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[?2004hroot@1aabb5fe1671:/app# python3 -m pip --version 2>&1
+[?2004lpip 26.2.1 from /usr/local/lib/python3.12/dist-packages/pip (python 3.12)
+[?2004hroot@1aabb5fe1671:/app# python3 -m pip install --break-system-packages --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu 2>&1 | tail -15
+[?2004l   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 89.1 MB/s  0:00:00
+Downloading setuptools-78.1.0-py3-none-any.whl (1.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.3/1.3 MB 85.5 MB/s  0:00:00
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 222.5 MB/s  0:00:00
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 987.4 MB/s  0:00:00
+Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+Downloading filelock-3.32.3-py3-none-any.whl (98 kB)
+Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
+Installing collected packages: mpmath, typing-extensions, sympy, setuptools, networkx, MarkupSafe, fsspec, filelock, jinja2, torch
+
+Successfully installed MarkupSafe-3.0.3 filelock-3.32.3 fsspec-2026.7.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 setuptools-78.1.0 sympy-1.14.0 torch-2.14.0+cpu typing-extensions-4.16.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+[?2004hroot@1aabb5fe1671:/app# cd /app && python3 test_pl.py 2>&1
+[?2004l/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+===== world_size = 1 =====
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[0/1] OK   col.weight shape: err=0
+[0/1] OK   col.bias shape: err=0
+[0/1] OK   col.forward: err=0.0
+[0/1] OK   col.weight.grad: err=0.0
+[0/1] OK   col.bias.grad: err=0.0
+[0/1] OK   col.forward_no_bias: err=0.0
+[0/1] OK   row.weight shape: err=0
+[0/1] OK   row.bias shape: err=0
+[0/1] OK   row.forward: err=0.0
+[0/1] OK   row.weight.grad: err=0.0
+[0/1] OK   row.bias.grad: err=0.0
+world_size=1: PASSED
+===== world_size = 2 =====
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[0/2] OK   col.weight shape: err=0
+[0/2] OK   col.bias shape: err=0
+[1/2] OK   col.weight shape: err=0
+[1/2] OK   col.bias shape: err=0
+[0/2] OK   col.forward: err=4.76837158203125e-07
+[1/2] OK   col.forward: err=4.76837158203125e-07
+[0/2] OK   col.weight.grad: err=0.0
+[0/2] OK   col.bias.grad: err=0.0
+[1/2] OK   col.weight.grad: err=0.0
+[1/2] OK   col.bias.grad: err=0.0
+[1/2] OK   col.forward_no_bias: err=4.76837158203125e-07
+[0/2] OK   col.forward_no_bias: err=4.76837158203125e-07
+[1/2] OK   row.weight shape: err=0
+[0/2] OK   row.weight shape: err=0
+[0/2] OK   row.bias shape: err=0
+[1/2] OK   row.bias shape: err=0
+[1/2] OK   row.forward: err=4.76837158203125e-07
+[0/2] OK   row.forward: err=4.76837158203125e-07
+[1/2] OK   row.weight.grad: err=0.0
+[0/2] OK   row.weight.grad: err=0.0
+[0/2] OK   row.bias.grad: err=0.0
+[1/2] OK   row.bias.grad: err=0.0
+world_size=2: PASSED
+===== world_size = 4 =====
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[0/4] OK   col.weight shape: err=0
+[1/4] OK   col.weight shape: err=0
+[1/4] OK   col.bias shape: err=0
+[0/4] OK   col.bias shape: err=0
+[3/4] OK   col.weight shape: err=0
+[3/4] OK   col.bias shape: err=0
+[2/4] OK   col.weight shape: err=0
+[2/4] OK   col.bias shape: err=0
+[1/4] OK   col.forward: err=0.0
+[2/4] OK   col.forward: err=0.0
+[0/4] OK   col.forward: err=0.0
+[3/4] OK   col.forward: err=0.0
+[1/4] OK   col.weight.grad: err=0.0
+[0/4] OK   col.weight.grad: err=0.0
+[1/4] OK   col.bias.grad: err=0.0
+[2/4] OK   col.weight.grad: err=0.0
+[3/4] OK   col.weight.grad: err=0.0
+[0/4] OK   col.bias.grad: err=0.0
+[3/4] OK   col.bias.grad: err=0.0
+[2/4] OK   col.bias.grad: err=0.0
+[1/4] OK   col.forward_no_bias: err=0.0
+[0/4] OK   col.forward_no_bias: err=0.0
+[2/4] OK   col.forward_no_bias: err=0.0
+[3/4] OK   col.forward_no_bias: err=0.0
+[1/4] OK   row.weight shape: err=0
+[0/4] OK   row.weight shape: err=0
+[0/4] OK   row.bias shape: err=0
+[1/4] OK   row.bias shape: err=0
+[2/4] OK   row.weight shape: err=0
+[3/4] OK   row.weight shape: err=0
+[3/4] OK   row.bias shape: err=0
+[2/4] OK   row.bias shape: err=0
+[0/4] OK   row.forward: err=4.76837158203125e-07
+[1/4] OK   row.forward: err=4.76837158203125e-07
+[3/4] OK   row.forward: err=4.76837158203125e-07
+[2/4] OK   row.forward: err=4.76837158203125e-07
+[1/4] OK   row.weight.grad: err=0.0
+[0/4] OK   row.weight.grad: err=0.0
+[1/4] OK   row.bias.grad: err=0.0
+[0/4] OK   row.bias.grad: err=0.0
+[2/4] OK   row.weight.grad: err=0.0
+[3/4] OK   row.weight.grad: err=0.0
+[3/4] OK   row.bias.grad: err=0.0
+[2/4] OK   row.bias.grad: err=0.0
+world_size=4: PASSED
+[?2004hroot@1aabb5fe1671:/app# echo '===== /app/parallel_linear.py =====' && cat /app/parallel_linear.py && echo '===== files =====' && ls -la /app
+[?2004l===== /app/parallel_linear.py =====
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed as dist
+
+
+def _get_world_size():
+    try:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_world_size()
+    except Exception:
+        pass
+    return 1
+
+
+def _get_rank():
+    try:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    return 0
+
+
+class _GatherFromModelParallelRegion(torch.autograd.Function):
+    """Differentiable all-gather: concatenate along the last dimension."""
+
+    @staticmethod
+    def forward(ctx, input_):
+        world_size = _get_world_size()
+        ctx.world_size = world_size
+        ctx.rank = _get_rank()
+        if world_size == 1:
+            return input_
+        gathered = [torch.empty_like(input_) for _ in range(world_size)]
+        dist.all_gather(gathered, input_.contiguous())
+        return torch.cat(gathered, dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        world_size = ctx.world_size
+        if world_size == 1:
+            return grad_output
+        local = grad_output.shape[-1] // world_size
+        return grad_output[..., ctx.rank * local:(ctx.rank + 1) * local].contiguous()
+
+
+class _ReduceFromModelParallelRegion(torch.autograd.Function):
+    """Differentiable all-reduce (sum)."""
+
+    @staticmethod
+    def forward(ctx, input_):
+        if _get_world_size() == 1:
+            return input_
+        output = input_.clone()
+        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # d(sum_r x_r)/dx_r = 1 -> gradient passes through unchanged.
+        return grad_output
+
+
+class ColumnParallelLinear(nn.Module):
+    """Linear layer with column (output-feature) parallelism.
+
+    weight shape (out_features, in_features) -> each rank keeps (out_features/TP, in_features)
+    bias is sharded like the output dimension -> each rank keeps (out_features/TP)
+    forward returns the full (all-gathered) output of shape (..., out_features).
+    """
+
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        world_size = _get_world_size()
+        rank = _get_rank()
+        out_per_rank = out_features // world_size
+
+        start = rank * out_per_rank
+        weight_shard = master_weight[start:start + out_per_rank, :].detach().clone()
+        self.weight = nn.Parameter(weight_shard)
+
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(out_per_rank, dtype=weight_shard.dtype, device=weight_shard.device))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, input):
+        # input: (..., in_features); local output: (..., out_features/TP)
+        output = F.linear(input, self.weight, self.bias)
+        # all-gather along the last dim -> (..., out_features)
+        output = _GatherFromModelParallelRegion.apply(output)
+        return output
+
+
+class RowParallelLinear(nn.Module):
+    """Linear layer with row (input-feature) parallelism.
+
+    weight shape (out_features, in_features) -> each rank keeps (out_features, in_features/TP)
+    bias is full (out_features) on every rank (added after the all-reduce, so only once)
+    forward expects an input already scattered along the last dim (..., in_features/TP)
+    and returns the full (all-reduced) output of shape (..., out_features).
+    """
+
+    def __init__(self, in_features, out_features, bias, master_weight):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        world_size = _get_world_size()
+        rank = _get_rank()
+        in_per_rank = in_features // world_size
+
+        start = rank * in_per_rank
+        weight_shard = master_weight[:, start:start + in_per_rank].detach().clone()
+        self.weight = nn.Parameter(weight_shard)
+
+        if bias:
+            self.bias = nn.Parameter(
+                torch.zeros(out_features, dtype=weight_shard.dtype, device=weight_shard.device))
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, input):
+        # input: (..., in_features/TP) [pre-scattered], no bias here
+        output_parallel = F.linear(input, self.weight)
+        # all-reduce (sum) across ranks
+        output = _ReduceFromModelParallelRegion.apply(output_parallel)
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+===== files =====
+total 12
+drwxr-xr-x 1 root root   85 Sep  7 00:38 [0m[01;34m.[0m
+drwxr-xr-x 1 root root  117 Sep  7 00:22 [01;34m..[0m
+drwxr-xr-x 2 root root   53 Sep  7 00:38 [01;34m__pycache__[0m
+-rw-r--r-- 1 root root 4597 Sep  7 00:36 parallel_linear.py
+-rw-r--r-- 1 root root 3274 Sep  7 00:36 test_pl.py
+[?2004hroot@1aabb5fe1671:/app# 

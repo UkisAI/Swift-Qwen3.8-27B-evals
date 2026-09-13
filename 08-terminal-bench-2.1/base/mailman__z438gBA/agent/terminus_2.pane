@@ -1,0 +1,4018 @@
+[?2004hroot@b0bd22362a44:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@b0bd22362a44:/app# clear
+[?2004l[H[J[3J[?2004hroot@b0bd22362a44:/app# ls -la /app/
+[?2004ltotal 8
+drwxr-xr-x 1 root root   29 Oct 28  2025 [0m[01;34m.[0m
+drwxr-xr-x 1 root root  102 Sep  6 13:04 [01;34m..[0m
+-rw-r--r-- 1 root root 6099 Oct 24  2025 eval.py
+[?2004hroot@b0bd22362a44:/app# cat /app/eval.py
+[?2004limport mailbox
+import os
+import smtplib
+import subprocess
+from email.mime.text import MIMEText
+from functools import partial as bind
+from time import sleep
+
+from mailman.core.initialize import initialize
+from mailman.interfaces.listmanager import IListManager
+from zope.component import getUtility
+
+DOMAIN_NAME = "local.edu"
+MAILING_LIST = "reading-group@local.edu"
+JOIN_LIST = "reading-group-join@local.edu"
+LEAVE_LIST = "reading-group-leave@local.edu"
+MAILING_LIST_CONFIG = "/etc/mailman3/mailman.cfg"
+MLIST = None
+
+##### Helpers #####
+
+
+def retry(func, retries=5, delay=2, backoff=2, exceptions=(Exception,)):
+    """
+    Retry utility for a function call.
+
+    Args:
+        func: function to execute
+        retries: number of retries
+        delay: initial delay in seconds
+        backoff: multiplier for delay (e.g., 2 = exponential backoff)
+        exceptions: exceptions to catch
+
+    Returns:
+        function result
+
+    Raises:
+        Last exception if all retries fail
+    """
+    attempt = 0
+    current_delay = delay
+
+    while attempt < retries:
+        try:
+            return func()
+        except exceptions as e:
+            attempt += 1
+            if attempt == retries:
+                raise e
+            print(f"Retrying in {current_delay} seconds...")
+            sleep(current_delay)
+            current_delay *= backoff
+
+
+def add_user(username):
+    """Dynamically add users to the system to prevent hard-coding."""
+    try:
+        subprocess.run(
+            ["useradd", username],
+            check=True,  # raises exception if returncode != 0
+            capture_output=True,
+            text=True,
+        )
+        print(f"{username} added successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to add {username}. Error: {e.stderr.strip()}")
+        raise
+
+
+def get_mlist():
+    """Helper function to get the mailing list."""
+    global MLIST
+    if MLIST is None:
+        initialize(MAILING_LIST_CONFIG)
+        list_manager = getUtility(IListManager)
+        MLIST = list_manager.get(MAILING_LIST)
+    return MLIST
+
+
+def send_email(*, body, subject, from_addr, to_addr):
+    """Helper function to send an email."""
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    with smtplib.SMTP("localhost", 25) as server:
+        server.send_message(msg)
+
+
+def _debug_print_msg(msg):
+    """Helper function to print email message details."""
+    print("Message details:")
+    print(f"  From: {msg.get('From', 'No From')}")
+    print(f"  To: {msg.get('To', 'No To')}")
+    print(f"  Subject: {msg.get('Subject', 'No Subject')}")
+    print(f"  Body: {msg.get_payload()[:500]}...")
+
+
+def confirm_last_reply(user, subject_contains=""):
+    """Mock user confirmation behavior when they join or leave
+    the mailing list."""
+    mbox_path = f"/var/mail/{user}"
+    mbox = mailbox.mbox(mbox_path)
+    print(f"{user} has {len(mbox)} messages in their inbox")
+    print("the subjects are as follows:")
+    print([msg.get("Subject", "") for msg in mbox])
+    candidate_msgs = [
+        msg
+        for msg in mbox
+        if msg.get("From").startswith("reading-group-confirm")
+        and subject_contains in msg.get("Subject", "")
+    ]
+    print(f"Found {len(candidate_msgs)} candidate confirmation messages")
+    assert candidate_msgs, "No 'reading-group-confirm' messages found"
+
+    confirmation_msg = candidate_msgs[-1]  # get the last one
+    _debug_print_msg(confirmation_msg)
+    confirmation_from = confirmation_msg.get("From")
+    send_email(
+        body="",
+        subject="",
+        from_addr=f"{user}@{DOMAIN_NAME}",
+        to_addr=confirmation_from,
+    )
+    print(
+        f"Reply to {confirmation_from} from {user}@{DOMAIN_NAME} for {subject_contains}"
+    )
+
+
+##### Tests #####
+
+
+def test_simple_local_delivery():
+    """Test that postfix can deliver mail to local users
+    and that the email content is accessible in their local mailboxes.
+    """
+    user = os.urandom(8).hex()
+    add_user(user)
+    mbox_path = f"/var/mail/{user}"
+    subject = "Direct Message"
+    send_email(
+        from_addr=f"tester@{DOMAIN_NAME}",
+        to_addr=f"{user}@{DOMAIN_NAME}",
+        subject=subject,
+        body="Direct test message",
+    )
+
+    def _assert_mailbox_exists():
+        assert os.path.exists(mbox_path), f"Mailbox not found: {mbox_path}"
+
+    def _assert_receipt():
+        mbox = mailbox.mbox(mbox_path)
+        found = any(email_msg.get("Subject", "") == subject for email_msg in mbox)
+        assert found, f"Direct email not found in {mbox_path}"
+
+    retry(_assert_mailbox_exists)
+    retry(_assert_receipt)
+    print(f"Direct delivery to {user} works: {subject}")
+
+
+def test_mlist_exists():
+    """Test that the mailman mailing list exists."""
+    mlist = get_mlist()
+    assert mlist, "Mailing list does not exist"
+
+
+def test_join_flow():
+    """Full flow of user joining, announcing, and leaving the mailing list."""
+    user = os.urandom(8).hex()
+    add_user(user)
+    mbox_path = f"/var/mail/{user}"
+
+    def _assert_mailbox_exists():
+        assert os.path.exists(mbox_path), f"Mailbox not found: {mbox_path}"
+
+    def _assert_not_member():
+        mlist = get_mlist()
+        user_member = mlist.members.get_member(f"{user}@{DOMAIN_NAME}")
+        assert user_member is None, f"{user} is a member: {user_member=}"
+
+    def _assert_member():
+        mlist = get_mlist()
+        user_member = mlist.members.get_member(f"{user}@{DOMAIN_NAME}")
+        assert user_member, f"{user} is not a member: {user_member=}"
+
+    send_email(
+        body="",
+        subject="",
+        from_addr=f"{user}@{DOMAIN_NAME}",
+        to_addr=JOIN_LIST,
+    )
+    print(f"{user} sends a join request")
+    retry(_assert_not_member)
+    print(f"{user} has not yet confirmed their subscription")
+
+    retry(_assert_mailbox_exists)
+    retry(bind(confirm_last_reply, user, "join"))
+    retry(_assert_member)
+    print(f"{user} has confirmed their subscription")
+
+
+if __name__ == "__main__":
+    test_simple_local_delivery()
+    test_mlist_exists()
+    test_join_flow()
+[?2004hroot@b0bd22362a44:/app# cat /etc/os-release
+[?2004lPRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+VERSION="24.04.3 LTS (Noble Numbat)"
+VERSION_CODENAME=noble
+ID=ubuntu
+ID_LIKE=debian
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+UBUNTU_CODENAME=noble
+LOGO=ubuntu-logo
+[?2004hroot@b0bd22362a44:/app# which postfix mailman mailman3 postfix 2>/dev/null; ls /usr/lib/mailman3 2>/dev/null; dpkg -l | grep -Ei 'mailman|postfix' 2>/dev/null
+[?2004l/usr/sbin/postfix
+/usr/bin/mailman
+/usr/sbin/postfix
+[0m[01;34mbin[0m
+ii  [01;31m[Kmailman[m[K3                      3.3.8-3.1ubuntu0.1                all          Mailing list management system
+ii  [01;31m[Kpostfix[m[K                       3.8.6-1build2                     amd64        High-performance mail transport agent
+[?2004hroot@b0bd22362a44:/app# ls -la /etc/mailman3/ /usr/lib/mailman3/bin/ /var/lib/mailman/ 2>&1
+[?2004lls: cannot access '/var/lib/mailman/': No such file or directory
+/etc/mailman3/:
+total 12
+drwxr-xr-x 2 root root    33 Oct 28  2025 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   111 Sep  6 13:04 [01;34m..[0m
+-rw-r----- 1 root list 11115 Oct 28  2025 mailman.cfg
+
+/usr/lib/mailman3/bin/:
+total 12
+drwxr-xr-x 2 root root  49 Oct 28  2025 [01;34m.[0m
+drwxr-xr-x 3 root root  25 Oct 28  2025 [01;34m..[0m
+-rwxr-xr-x 1 root root 958 Aug 25  2024 [01;32mmailman[0m
+-rwxr-xr-x 1 root root 956 Aug 25  2024 [01;32mmaster[0m
+-rwxr-xr-x 1 root root 956 Aug 25  2024 [01;32mrunner[0m
+[?2004hroot@b0bd22362a44:/app# grep -v '^#' /etc/postfix/main.cf | grep -v '^$'
+[?2004lsmtpd_banner = $myhostname ESMTP $mail_name (Ubuntu)
+biff = no
+append_dot_mydomain = no
+readme_directory = no
+compatibility_level = 3.6
+smtpd_tls_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+smtpd_tls_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+smtpd_tls_security_level=may
+smtp_tls_CApath=/etc/ssl/certs
+smtp_tls_security_level=may
+smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
+smtpd_relay_restrictions = permit_mynetworks permit_sasl_authenticated defer_unauth_destination
+myhostname = localhost.local
+alias_maps = hash:/etc/aliases
+alias_database = hash:/etc/aliases
+mydestination = $myhostname, localhost, localhost.localdomain, , localhost
+relayhost = 
+mynetworks = 127.0.0.0/8 [::ffff:127.0.0.0]/104 [::1]/128
+mailbox_size_limit = 0
+recipient_delimiter = +
+inet_interfaces = all
+inet_protocols = all
+[?2004hroot@b0bd22362a44:/app# ps aux | grep -E 'postfix|mailman|master' | grep -v grep
+[?2004l[?2004hroot@b0bd22362a44:/app# cat /etc/mailman3/mailman.cfg
+[?2004l# Copyright (C) 2008-2017 by the Free Software Foundation, Inc.
+#
+# This file is part of GNU Mailman.
+#
+# GNU Mailman is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# GNU Mailman is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# GNU Mailman.  If not, see <http://www.gnu.org/licenses/>.
+
+# This file contains the Debian configuration for mailman.  It uses ini-style
+# formats under the lazr.config regime to define all system configuration
+# options.  See <https://launchpad.net/lazr.config> for details.
+
+
+[mailman]
+# This address is the "site owner" address.  Certain messages which must be
+# delivered to a human, but which can't be delivered to a list owner (e.g. a
+# bounce from a list owner), will be sent to this address.  It should point to
+# a human.
+site_owner: changeme@example.com
+
+# This is the local-part of an email address used in the From field whenever a
+# message comes from some entity to which there is no natural reply recipient.
+# Mailman will append '@' and the host name of the list involved.  This
+# address must not bounce and it must not point to a Mailman process.
+noreply_address: noreply
+
+# The default language for this server.
+default_language: en
+
+# Membership tests for posting purposes are usually performed by looking at a
+# set of headers, passing the test if any of their values match a member of
+# the list.  Headers are checked in the order given in this variable.  The
+# value From_ means to use the envelope sender.  Field names are case
+# insensitive.  This is a space separate list of headers.
+sender_headers: from from_ reply-to sender
+
+# Mail command processor will ignore mail command lines after designated max.
+email_commands_max_lines: 10
+
+# Default length of time a pending request is live before it is evicted from
+# the pending database.
+pending_request_life: 3d
+
+# How long should files be saved before they are evicted from the cache?
+cache_life: 7d
+
+# A callable to run with no arguments early in the initialization process.
+# This runs before database initialization.
+pre_hook:
+
+# A callable to run with no arguments late in the initialization process.
+# This runs after adapters are initialized.
+post_hook:
+
+# Which paths.* file system layout to use.
+# You should not change this variable.
+layout: debian
+
+# Can MIME filtered messages be preserved by list owners?
+filtered_messages_are_preservable: no
+
+# How should text/html parts be converted to text/plain when the mailing list
+# is set to convert HTML to plaintext?  This names a command to be called,
+# where the substitution variable $filename is filled in by Mailman, and
+# contains the path to the temporary file that the command should read from.
+# The command should print the converted text to stdout.
+html_to_plain_text_command: /usr/bin/lynx -dump $filename
+
+# Specify what characters are allowed in list names.  Characters outside of
+# the class [-_.+=!$*{}~0-9a-z] matched case insensitively are never allowed,
+# but this specifies a subset as the only allowable characters.  This must be
+# a valid character class regexp or the effect on list creation is
+# unpredictable.
+listname_chars: [-_.0-9a-z]
+
+
+[shell]
+# `mailman shell` (also `withlist`) gives you an interactive prompt that you
+# can use to interact with an initialized and configured Mailman system.  Use
+# --help for more information.  This section allows you to configure certain
+# aspects of this interactive shell.
+
+# Customize the interpreter prompt.
+prompt: >>>
+
+# Banner to show on startup.
+banner: Welcome to the GNU Mailman shell
+
+# Use IPython as the shell, which must be found on the system.  Valid values
+# are `no`, `yes`, and `debug` where the latter is equivalent to `yes` except
+# that any import errors will be displayed to stderr.
+use_ipython: no
+
+# Set this to allow for command line history if readline is available.  This
+# can be as simple as $var_dir/history.py to put the file in the var directory.
+history_file:
+
+
+[paths.debian]
+# Important directories for Mailman operation.  These are defined here so that
+# different layouts can be supported.   For example, a developer layout would
+# be different from a FHS layout.  Most paths are based off the var_dir, and
+# often just setting that will do the right thing for all the other paths.
+# You might also have to set spool_dir though.
+#
+# Substitutions are allowed, but must be of the form $var where 'var' names a
+# configuration variable in the paths.* section.  Substitutions are expanded
+# recursively until no more $-variables are present.  Beware of infinite
+# expansion loops!
+#
+# This is the root of the directory structure that Mailman will use to store
+# its run-time data.
+var_dir: /var/lib/mailman3
+# This is where the Mailman queue files directories will be created.
+queue_dir: $var_dir/queue
+# This is the directory containing the Mailman 'runner' and 'master' commands
+# if set to the string '$argv', it will be taken as the directory containing
+# the 'mailman' command.
+bin_dir: /usr/lib/mailman3/bin
+# All list-specific data.
+list_data_dir: $var_dir/lists
+# Directory where log files go.
+log_dir: /var/log/mailman3
+# Directory for system-wide locks.
+lock_dir: $var_dir/locks
+# Directory for system-wide data.
+data_dir: $var_dir/data
+# Cache files.
+cache_dir: $var_dir/cache
+# Directory for configuration files and such.
+etc_dir: /etc/mailman3
+# Directory containing Mailman plugins.
+ext_dir: $var_dir/ext
+# Directory where the default IMessageStore puts its messages.
+messages_dir: $var_dir/messages
+# Directory for archive backends to store their messages in.  Archivers should
+# create a subdirectory in here to store their files.
+archive_dir: $var_dir/archives
+# Root directory for site-specific template override files.
+template_dir: $var_dir/templates
+# There are also a number of paths to specific file locations that can be
+# defined.  For these, the directory containing the file must already exist,
+# or be one of the directories created by Mailman as per above.
+#
+# This is where PID file for the master runner is stored.
+pid_file: /run/mailman3/master.pid
+# Lock file.
+lock_file: $lock_dir/master.lck
+
+
+[database]
+# The class implementing the IDatabase.
+class: mailman.database.sqlite.SQLiteDatabase
+#class: mailman.database.mysql.MySQLDatabase
+#class: mailman.database.postgresql.PostgreSQLDatabase
+
+# Use this to set the Storm database engine URL.  You generally have one
+# primary database connection for all of Mailman.  List data and most rosters
+# will store their data in this database, although external rosters may access
+# other databases in their own way.  This string supports standard
+# 'configuration' substitutions.
+url: sqlite:///$DATA_DIR/mailman.db
+#url: mysql+pymysql://mailman3:mmpass@localhost/mailman3?charset=utf8&use_unicode=1
+#url: postgresql://mailman3:mmpass@localhost/mailman3
+
+debug: no
+
+
+[logging.debian]
+# This defines various log settings.  The options available are:
+#
+# - level     -- Overrides the default level; this may be any of the
+#                standard Python logging levels, case insensitive.
+# - format    -- Overrides the default format string
+# - datefmt   -- Overrides the default date format string
+# - path      -- Overrides the default logger path.  This may be a relative
+#                path name, in which case it is relative to Mailman's LOG_DIR,
+#                or it may be an absolute path name.  You cannot change the
+#                handler class that will be used.
+# - propagate -- Boolean specifying whether to propagate log message from this
+#                logger to the root "mailman" logger.  You cannot override
+#                settings for the root logger.
+#
+# In this section, you can define defaults for all loggers, which will be
+# prefixed by 'mailman.'.  Use subsections to override settings for specific
+# loggers.  The names of the available loggers are:
+#
+# - archiver        --  All archiver output
+# - bounce          --  All bounce processing logs go here
+# - config          --  Configuration issues
+# - database        --  Database logging (SQLAlchemy and Alembic)
+# - debug           --  Only used for development
+# - error           --  All exceptions go to this log
+# - fromusenet      --  Information related to the Usenet to Mailman gateway
+# - http            --  Internal wsgi-based web interface
+# - locks           --  Lock state changes
+# - mischief        --  Various types of hostile activity
+# - runner          --  Runner process start/stops
+# - smtp            --  Successful SMTP activity
+# - smtp-failure    --  Unsuccessful SMTP activity
+# - subscribe       --  Information about leaves/joins
+# - vette           --  Message vetting information
+format: %(asctime)s (%(process)d) %(message)s
+datefmt: %b %d %H:%M:%S %Y
+propagate: no
+level: info
+path: mailman.log
+
+[webservice]
+# The hostname at which admin web service resources are exposed.
+hostname: localhost
+
+# The port at which the admin web service resources are exposed.
+port: 8001
+
+# Whether or not requests to the web service are secured through SSL.
+use_https: no
+
+# Whether or not to show tracebacks in an HTTP response for a request that
+# raised an exception.
+show_tracebacks: yes
+
+# The API version number for the current (highest) API.
+api_version: 3.1
+
+# The administrative username.
+admin_user: restadmin
+
+# The administrative password.
+admin_pass: /927xNm2R4ujpPS+RrCMityUwNb+E+LUW0DhJdpGuGu7xl9i
+
+[mta]
+# The class defining the interface to the incoming mail transport agent.
+#incoming: mailman.mta.exim4.LMTP
+incoming: mailman.mta.postfix.LMTP
+
+# The callable implementing delivery to the outgoing mail transport agent.
+# This must accept three arguments, the mailing list, the message, and the
+# message metadata dictionary.
+outgoing: mailman.mta.deliver.deliver
+
+# How to connect to the outgoing MTA.  If smtp_user and smtp_pass is given,
+# then Mailman will attempt to log into the MTA when making a new connection.
+smtp_host: localhost
+smtp_port: 25
+smtp_user:
+smtp_pass:
+
+# Where the LMTP server listens for connections.  Use 127.0.0.1 instead of
+# localhost for Postfix integration, because Postfix only consults DNS
+# (e.g. not /etc/hosts).
+lmtp_host: 127.0.0.1
+lmtp_port: 8024
+
+# Where can we find the mail server specific configuration file?  The path can
+# be either a file system path or a Python import path.  If the value starts
+# with python: then it is a Python import path, otherwise it is a file system
+# path.  File system paths must be absolute since no guarantees are made about
+# the current working directory.  Python paths should not include the trailing
+# .cfg, which the file must end with.
+#configuration: python:mailman.config.exim4
+configuration: python:mailman.config.postfix
+[?2004hroot@b0bd22362a44:/app# id list 2>&1; head -30 /usr/bin/mailman 2>&1; ls /usr/lib/python3/dist-packages/mailman/messages/ 2>/dev/null | head -40
+[?2004luid=38(list) gid=38(list) groups=38(list)
+#!/usr/bin/python3
+# EASY-INSTALL-ENTRY-SCRIPT: 'mailman==3.3.8','console_scripts','mailman'
+import re
+import sys
+
+# for compatibility with easy_install; see #2198
+__requires__ = 'mailman==3.3.8'
+
+try:
+    from importlib.metadata import distribution
+except ImportError:
+    try:
+        from importlib_metadata import distribution
+    except ImportError:
+        from pkg_resources import load_entry_point
+
+
+def importlib_load_entry_point(spec, group, name):
+    dist_name, _, _ = spec.partition('==')
+    matches = (
+        entry_point
+        for entry_point in distribution(dist_name).entry_points
+        if entry_point.group == group and entry_point.name == name
+    )
+    return next(matches).load()
+
+
+globals().setdefault('load_entry_point', importlib_load_entry_point)
+
+
+__init__.py
+__pycache__
+bg
+bn
+ca
+cs
+de
+el
+en
+eo
+es
+fa
+fi
+fr
+he
+hu
+id
+it
+ja
+ko
+mailman.pot
+nb_NO
+nl
+oc
+pl
+pt
+pt_BR
+ru
+si
+sq
+sv
+tr
+uk
+zh_Hans
+[?2004hroot@b0bd22362a44:/app# grep -rn "In-Reply-To" /usr/lib/python3/dist-packages/mailman/*.py /usr/lib/python3/dist-packages/mailman/mta/*.py 2>/dev/null
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -rn "notice_from" /usr/lib/python3/dist-packages/mailman/*.py /usr/lib/python3/dist-packages/mailman/subscribers/*.py /usr/lib/python3/dist-packages/mailman/mta/*.py 2>/dev/null | head -20
+[?2004l[?2004hroot@b0bd22362a44:/app# ls /usr/lib/python3/dist-packages/mailman/messages/en/ | grep -i -E 'pending|confirm|subscrib'
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -rln "confirm" /usr/lib/python3/dist-packages/mailman/subscribers/ /usr/lib/python3/dist-packages/mailman/mta/ 2>/dev/null
+[?2004l[35m[K/usr/lib/python3/dist-packages/mailman/mta/__pycache__/aliases.cpython-312.pyc[m[K
+[35m[K/usr/lib/python3/dist-packages/mailman/mta/__pycache__/postfix.cpython-312.pyc[m[K
+[35m[K/usr/lib/python3/dist-packages/mailman/mta/aliases.py[m[K
+[35m[K/usr/lib/python3/dist-packages/mailman/mta/postfix.py[m[K
+[35m[K/usr/lib/python3/dist-packages/mailman/mta/tests/__pycache__/test_aliases.cpython-312.pyc[m[K
+[35m[K/usr/lib/python3/dist-packages/mailman/mta/tests/test_aliases.py[m[K
+[?2004hroot@b0bd22362a44:/app# ls /usr/lib/python3/dist-packages/mailman/subscribers/ /usr/lib/python3/dist-packages/mailman/messages/en/ | head -60
+[?2004lls: cannot access '/usr/lib/python3/dist-packages/mailman/subscribers/': No such file or directory
+/usr/lib/python3/dist-packages/mailman/messages/en/:
+LC_MESSAGES
+[?2004hroot@b0bd22362a44:/app# grep -rln "PendingSubscription" /usr/lib/python3/dist-packages/mailman/ --include=*.py | head
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -rn "notice_pending\|pending.mtxt" /usr/lib/python3/dist-packages/mailman/ --include=*.py | head
+[?2004l[?2004hroot@b0bd22362a44:/app# python3 -c "import mailman, os; print(mailman.__file__); print(mailman.__version__)"
+[?2004l/usr/lib/python3/dist-packages/mailman/__init__.py
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+AttributeError: module 'mailman' has no attribute '__version__'
+[?2004hroot@b0bd22362a44:/app# ls /usr/lib/python3/dist-packages/mailman/ | head -40
+[?2004l__init__.py
+__pycache__
+app
+archiving
+bin
+chains
+commands
+compat
+config
+core
+database
+email
+handlers
+interfaces
+languages
+messages
+model
+mta
+pipelines
+plugins
+rest
+rules
+runners
+styles
+templates
+testing
+tests
+utilities
+version.py
+[?2004hroot@b0bd22362a44:/app# ls /usr/lib/python3/dist-packages/mailman/model/ ; echo ---; ls /usr/lib/python3/dist-packages/mailman/messages/en/
+[?2004l__init__.py  autorespond.py  cache.py    language.py     member.py        mime.py         requests.py       template.py  user.py
+[0m[01;34m__pycache__[0m  bans.py         digests.py  listmanager.py  message.py       pending.py      roster.py         [01;34mtests[0m        usermanager.py
+address.py   bounce.py       domain.py   mailinglist.py  messagestore.py  preferences.py  subscriptions.py  uid.py       workflow.py
+---
+[0m[01;34mLC_MESSAGES[0m
+[?2004hroot@b0bd22362a44:/app# grep -n "subscription\|unsubscription\|confirm" /usr/lib/python3/dist-packages/mailman/mta/lmtp.py | head -40
+[?2004lgrep: /usr/lib/python3/dist-packages/mailman/mta/lmtp.py: No such file or directory
+[?2004hroot@b0bd22362a44:/app# grep -rn "def confirm\|def add\|subscription_policy" /usr/lib/python3/dist-packages/mailman/model/pending.py 2>/dev/null | head -20
+[?2004l91:    def add(self, store, pendable, lifetime=None):
+131:    def confirm(self, store, token, *, expunge=True):
+[?2004hroot@b0bd22362a44:/app# ls /usr/lib/python3/dist-packages/mailman/mta/ /usr/lib/python3/dist-packages/mailman/commands/ 2>&1
+[?2004l/usr/lib/python3/dist-packages/mailman/commands/:
+__init__.py        cli_changeaddress.py  cli_digests.py     cli_import.py  cli_members.py  cli_syncmembers.py  eml_confirm.py  eml_membership.py
+[0m[01;34m__pycache__[0m        cli_conf.py           cli_findmember.py  cli_info.py    cli_notify.py   cli_unshunt.py      eml_echo.py     eml_who.py
+cli_addmembers.py  cli_control.py        cli_gatenews.py    cli_inject.py  cli_qfile.py    cli_version.py      eml_end.py      [01;34mtests[0m
+cli_aliases.py     cli_delmembers.py     cli_help.py        cli_lists.py   cli_status.py   cli_withlist.py     eml_help.py
+
+/usr/lib/python3/dist-packages/mailman/mta/:
+__init__.py  aliases.py      base.py  connection.py  deliver.py  null.py          postfix.py  verp.py
+[01;34m__pycache__[0m  arc_signing.py  bulk.py  decorating.py  exim4.py    personalized.py  [01;34mtests[0m
+[?2004hroot@b0bd22362a44:/app# grep -n "Policy\|add_user\|_create_pending\|notice" /usr/lib/python3/dist-packages/mailman/model/subscriptions.py | head -40
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -rn "pending" /usr/lib/python3/dist-packages/mailman/messages/__init__.py 2>/dev/null | head; ls /usr/lib/python3/dist-packages/mailman/templates 2>/dev/null | head -30
+[?2004l__init__.py
+__pycache__
+ca
+cs
+de
+en
+eo
+es
+fr
+he
+hu
+it
+ja
+ko
+oc
+pt
+pt_BR
+sk
+tr
+zh_Hans
+[?2004hroot@b0bd22362a44:/app# grep -rn "class Lmtp" /usr/lib/python3/dist-packages/mailman/ --include=*.py
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -rn "subscription_address" /usr/lib/python3/dist-packages/mailman/ --include=*.py | grep -v tests | head -20
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -n "Policy" /usr/lib/python3/dist-packages/mailman/model/subscriptions.py | head -30
+[?2004l[?2004hroot@b0bd22362a44:/app# wc -c /usr/lib/python3/dist-packages/mailman/mta/postfix.py /usr/lib/python3/dist-packages/mailman/model/subscriptions.py /usr/lib/python3/dist-packages/mailman/mta/__init__.py
+[?2004l10347 /usr/lib/python3/dist-packages/mailman/mta/postfix.py
+ 9253 /usr/lib/python3/dist-packages/mailman/model/subscriptions.py
+    0 /usr/lib/python3/dist-packages/mailman/mta/__init__.py
+19600 total
+[?2004hroot@b0bd22362a44:/app# head -40 /usr/lib/python3/dist-packages/mailman/mta/postfix.py
+[?2004l# Copyright (C) 2001-2023 by the Free Software Foundation, Inc.
+#
+# This file is part of GNU Mailman.
+#
+# GNU Mailman is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# GNU Mailman is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# GNU Mailman.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Creation/deletion hooks for the Postfix MTA."""
+
+import os
+import logging
+
+from collections import defaultdict
+from contextlib import contextmanager
+from flufl.lock import Lock
+from mailman.config import config
+from mailman.config.config import external_configuration
+from mailman.interfaces.domain import IDomainManager
+from mailman.interfaces.listmanager import IListManager
+from mailman.interfaces.mta import (
+    IMailTransportAgentAliases,
+    IMailTransportAgentLifecycle,
+)
+from mailman.utilities.datetime import now
+from operator import attrgetter
+from public import public
+from zope.component import getUtility
+from zope.interface import implementer
+
+
+[?2004hroot@b0bd22362a44:/app# grep -c "class" /usr/lib/python3/dist-packages/mailman/mta/postfix.py; grep -rn "Lmtp" /usr/lib/python3/dist-packages/mailman/mta/__init__.py | head
+[?2004l2
+[?2004hroot@b0bd22362a44:/app# grep -rln -i "lmtp" /usr/lib/python3/dist-packages/mailman/ --include=*.py | grep -v tests | head -20
+[?2004l/usr/lib/python3/dist-packages/mailman/archiving/mailarchive.py
+/usr/lib/python3/dist-packages/mailman/archiving/mhonarc.py
+/usr/lib/python3/dist-packages/mailman/mta/exim4.py
+/usr/lib/python3/dist-packages/mailman/mta/postfix.py
+/usr/lib/python3/dist-packages/mailman/runners/lmtp.py
+/usr/lib/python3/dist-packages/mailman/testing/helpers.py
+/usr/lib/python3/dist-packages/mailman/testing/layers.py
+[?2004hroot@b0bd22362a44:/app# cat /usr/lib/python3/dist-packages/mailman/version.py | grep -v '^#' | head; ls /usr/lib/python3/dist-packages/mailman/mta/__pycache__/ | head -30
+[?2004l
+"""Mailman version strings."""
+
+VERSION = '3.3.8'
+CODENAME = 'Tom Sawyer'
+
+ALPHA = 0xa
+BETA  = 0xb                                         # noqa: E221
+GAMMA = 0xc
+RC    = GAMMA                                       # noqa: E221
+__init__.cpython-312.pyc
+aliases.cpython-312.pyc
+arc_signing.cpython-312.pyc
+base.cpython-312.pyc
+bulk.cpython-312.pyc
+connection.cpython-312.pyc
+decorating.cpython-312.pyc
+deliver.cpython-312.pyc
+exim4.cpython-312.pyc
+null.cpython-312.pyc
+personalized.cpython-312.pyc
+postfix.cpython-312.pyc
+verp.cpython-312.pyc
+[?2004hroot@b0bd22362a44:/app# grep -n "join\|confirm\|valid\|listname\|startswith" /usr/lib/python3/dist-packages/mailman/runners/lmtp.py | head -40
+[?2004l62:# We only care about the listname and the sub-addresses as in listname@ or
+63:# listname-request@.  This maps user visible subaddress names (which may
+67:    confirm='confirm',
+68:    join='join',
+72:    subscribe='join',
+80:    confirm='command',
+81:    join='command',
+96:    """Split an address into listname, subaddress and domain parts.
+120:    listname, dash, subaddress = localpart.rpartition('-')
+121:    if subaddress not in SUBADDRESS_NAMES or listname == '' or dash == '':
+122:        listname = localpart
+124:    return listname, subaddress, domain
+136:        listnames = set(getUtility(IListManager).names)
+142:                listname = '{}-{}@{}'.format(local, subaddress, domain)
+143:                if listname in listnames:
+146:            listname = '{}@{}'.format(local, domain)
+147:            if listname not in listnames:
+159:                # A valid subaddress.
+162:            # recipient validated, just do the same as aiosmtpd.LMTP would do
+181:            listnames = set(getUtility(IListManager).names)
+189:            return CRLF.join(ERR_451 for to in envelope.rcpt_tos)
+209:        # see if it's destined for a valid mailing list.  If so, then queue
+219:                    listname = '{}-{}@{}'.format(local, subaddress, domain)
+220:                    if listname in listnames:
+225:                listname = '{}@{}'.format(local, domain)
+226:                if listname not in listnames:
+229:                mlist = getUtility(IListManager).get_by_fqdn(listname)
+230:                # The recipient is a valid mailing list.  Find the subaddress
+250:                    # A valid subaddress.
+260:                # If we found a valid destination, enqueue the message and add
+273:        return CRLF.join(status)
+[?2004hroot@b0bd22362a44:/app# grep -rn "SubscriptionPolicy" /usr/lib/python3/dist-packages/mailman/model/*.py /usr/lib/python3/dist-packages/mailman/constants/*.py 2>/dev/null | grep -v tests | head -20
+[?2004l/usr/lib/python3/dist-packages/mailman/model/mailinglist.py:53:    SubscriptionPolicy,
+/usr/lib/python3/dist-packages/mailman/model/mailinglist.py:214:    subscription_policy = Column(Enum(SubscriptionPolicy))
+/usr/lib/python3/dist-packages/mailman/model/mailinglist.py:218:    unsubscription_policy = Column(Enum(SubscriptionPolicy))
+[?2004hroot@b0bd22362a44:/app# sed -n '55,135p' /usr/lib/python3/dist-packages/mailman/runners/lmtp.py
+[?2004l
+
+elog = logging.getLogger('mailman.error')
+qlog = logging.getLogger('mailman.runner')
+slog = logging.getLogger('mailman.smtp')
+
+
+# We only care about the listname and the sub-addresses as in listname@ or
+# listname-request@.  This maps user visible subaddress names (which may
+# include aliases) to the internal canonical subaddress name.
+SUBADDRESS_NAMES = dict(
+    bounces='bounces',
+    confirm='confirm',
+    join='join',
+    leave='leave',
+    owner='owner',
+    request='request',
+    subscribe='join',
+    unsubscribe='leave',
+    )
+
+# This maps subaddress canonical name to the destination queue that handles
+# messages sent to that subaddress.
+SUBADDRESS_QUEUES = dict(
+    bounces='bounces',
+    confirm='command',
+    join='command',
+    leave='command',
+    owner='in',
+    request='command',
+    )
+
+DASH = '-'
+CRLF = '\r\n'
+ERR_451 = '451 Requested action aborted: error in processing'
+ERR_501 = '501 Message has defects'
+ERR_502 = '502 Error: command HELO not implemented'
+ERR_550 = '550 Requested action not taken: mailbox unavailable'
+
+
+def split_recipient(address):
+    """Split an address into listname, subaddress and domain parts.
+
+    For example:
+
+    >>> split_recipient('mylist@example.com')
+    ('mylist', None, 'example.com')
+
+    >>> split_recipient('mylist-request@example.com')
+    ('mylist', 'request', 'example.com')
+
+    :param address: The destination address.
+    :return: A 3-tuple of the form (list-shortname, subaddress, domain).
+        subaddress may be None if this is the list's posting address.
+
+    If the domain of the destination address matches an alias_domain of some
+    IDomain Domain, the domain is replaced by the Domain's mail_host.
+    """
+    localpart, domain = address.split('@', 1)
+    domain_manager = getUtility(IDomainManager)
+    for d in domain_manager:
+        if d.alias_domain is not None and domain == d.alias_domain:
+            domain = d.mail_host
+            break
+    localpart = localpart.split(config.mta.verp_delimiter, 1)[0]
+    listname, dash, subaddress = localpart.rpartition('-')
+    if subaddress not in SUBADDRESS_NAMES or listname == '' or dash == '':
+        listname = localpart
+        subaddress = None
+    return listname, subaddress, domain
+
+
+class LMTPHandler:
+
+    async def handle_RCPT(self, server, session, envelope, to, rcpt_options):
+        # Use a helper function to use the transactional wrapper on since it
+        # doesn't yet work on awaitables (async def funcs.)
+        return self._handle_RCPT(server, session, envelope, to, rcpt_options)
+
+    @transactional
+    def _handle_RCPT(self, server, session, envelope, to, rcpt_options):
+[?2004hroot@b0bd22362a44:/app# sed -n '205,275p' /usr/lib/python3/dist-packages/mailman/runners/lmtp.py
+[?2004l        msg['X-MailFrom'] = envelope.mail_from
+        # RFC 2033 requires us to return a status code for every recipient.
+        status = []
+        # Now for each address in the recipients, parse the address to first
+        # see if it's destined for a valid mailing list.  If so, then queue
+        # the message to the appropriate place and record a 250 status for
+        # that recipient.  If not, record a failure status for that recipient.
+        received_time = now()
+        for to in envelope.rcpt_tos:
+            try:
+                to = parseaddr(to)[1].lower()
+                local, subaddress, domain = split_recipient(to)
+                if subaddress is not None:
+                    # Check that local-subaddress is not an actual list name.
+                    listname = '{}-{}@{}'.format(local, subaddress, domain)
+                    if listname in listnames:
+                        local = '{}-{}'.format(local, subaddress)
+                        subaddress = None
+                slog.debug('%s to: %s, list: %s, sub: %s, dom: %s',
+                           message_id, to, local, subaddress, domain)
+                listname = '{}@{}'.format(local, domain)
+                if listname not in listnames:
+                    status.append(ERR_550)
+                    continue
+                mlist = getUtility(IListManager).get_by_fqdn(listname)
+                # The recipient is a valid mailing list.  Find the subaddress
+                # if there is one, and set things up to enqueue to the proper
+                # queue.
+                queue = None
+                msgdata = dict(listid=mlist.list_id,
+                               original_size=msg.original_size,
+                               received_time=received_time)
+                canonical_subaddress = SUBADDRESS_NAMES.get(subaddress)
+                queue = SUBADDRESS_QUEUES.get(canonical_subaddress)
+                if subaddress is None:
+                    # The message is destined for the mailing list.
+                    msgdata['to_list'] = True
+                    queue = 'in'
+                elif canonical_subaddress is None:
+                    # The subaddress was bogus.
+                    slog.error('%s unknown sub-address: %s',
+                               message_id, subaddress)
+                    status.append(ERR_550)
+                    continue
+                else:
+                    # A valid subaddress.
+                    msgdata['subaddress'] = canonical_subaddress
+                    if subaddress == 'request':
+                        msgdata['to_request'] = True
+                    if canonical_subaddress == 'owner':
+                        msgdata.update(dict(
+                            to_owner=True,
+                            envsender=config.mailman.site_owner,
+                            ))
+                        queue = 'in'
+                # If we found a valid destination, enqueue the message and add
+                # a success status for this recipient.
+                if queue is not None:
+                    config.switchboards[queue].enqueue(msg, msgdata)
+                    slog.debug('%s subaddress: %s, queue: %s',
+                               message_id, canonical_subaddress, queue)
+                    status.append('250 Ok')
+            except Exception:
+                slog.exception('Queue detection: %s', msg['message-id'])
+                config.db.abort()
+                status.append(ERR_550)
+        # All done; returning this big status string should give the expected
+        # response to the LMTP client.
+        return CRLF.join(status)
+
+
+[?2004hroot@b0bd22362a44:/app# grep -n "policy\|confirm\|pending" /usr/lib/python3/dist-packages/mailman/model/subscriptions.py | head -40
+[?2004l[?2004hroot@b0bd22362a44:/app# cat /usr/lib/python3/dist-packages/mailman/commands/eml_confirm.py
+[?2004l# Copyright (C) 2009-2023 by the Free Software Foundation, Inc.
+#
+# This file is part of GNU Mailman.
+#
+# GNU Mailman is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# GNU Mailman is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# GNU Mailman.  If not, see <https://www.gnu.org/licenses/>.
+
+"""The 'confirm' email command."""
+
+from mailman.app.moderator import handle_message
+from mailman.core.i18n import _
+from mailman.interfaces.action import Action
+from mailman.interfaces.command import ContinueProcessing, IEmailCommand
+from mailman.interfaces.member import (
+    AlreadySubscribedError,
+    MembershipIsBannedError,
+)
+from mailman.interfaces.pending import IPendings
+from mailman.interfaces.subscriptions import ISubscriptionManager, TokenOwner
+from mailman.rules.approved import Approved
+from public import public
+from zope.component import getUtility
+from zope.interface import implementer
+
+
+@public
+@implementer(IEmailCommand)
+class Confirm:
+    """The email 'confirm' command."""
+
+    name = 'confirm'
+    argument_description = 'token'
+    description = _('Confirm a subscription or held message request.')
+    short_description = description
+
+    def process(self, mlist, msg, msgdata, arguments, results):
+        """See `IEmailCommand`."""
+        # The token must be in the arguments.
+        if len(arguments) == 0:
+            print(_('No confirmation token found'), file=results)
+            return ContinueProcessing.no
+        # Make sure we don't try to confirm the same token more than once.
+        token = arguments[0]
+        tokens = getattr(results, 'confirms', set())
+        if token in tokens:
+            # Do not try to confirm this one again.
+            return ContinueProcessing.no
+        tokens.add(token)
+        results.confirms = tokens
+        # now figure out what this token is for.
+        pendable = getUtility(IPendings).confirm(token, expunge=False)
+        if pendable is None:
+            print(_('Confirmation token did not match'), file=results)
+            results.send_response = True
+            return ContinueProcessing.no
+        if pendable['type'] == 'held message':
+            return self.process_held(
+                mlist, msg, msgdata, token, pendable, results)
+        try:
+            new_token, token_owner, member = ISubscriptionManager(
+                mlist).confirm(token)
+            if new_token is None:
+                assert token_owner is TokenOwner.no_one, token_owner
+                # We can't assert anything about member.  It will be None when
+                # the workflow we're confirming is a subscription request,
+                # and non-None when we're confirming an unsubscription request.
+                # This class doesn't know which is happening.
+                succeeded = True
+            elif token_owner is TokenOwner.moderator:
+                # This must have been a confirm-then-moderate (un)subscription.
+                assert new_token != token
+                # We can't assert anything about member for the above reason.
+                succeeded = True
+            else:
+                assert token_owner is not TokenOwner.no_one, token_owner
+                assert member is None, member
+                succeeded = False
+        except LookupError:
+            # The token must not exist in the database.
+            succeeded = False
+        except (MembershipIsBannedError, AlreadySubscribedError) as e:
+            print(str(e), file=results)
+            return ContinueProcessing.no
+        if succeeded:
+            print(_('Confirmed'), file=results)
+            # After the 'confirm' command, do not process any other commands in
+            # the email.
+            return ContinueProcessing.no
+        print(_('Confirmation token did not match'), file=results)
+        return ContinueProcessing.no
+
+    def process_held(self, mlist, msg, msgdata, token, pendable, results):
+        # Is this confirmation approved?
+        approved = Approved().check(mlist, msg, msgdata)
+        if approved:
+            action = Action.accept
+            message = 'accepted'                          # noqa: F841
+        elif not msgdata.get('has_approved', False):
+            action = Action.discard
+            message = 'discarded'                         # noqa: F841
+        else:
+            print(_('Invalid Approved: password'), file=results)
+            return ContinueProcessing.no
+        handle_message(mlist, pendable['id'], action)
+        print(_('Message ${message}'), file=results)
+        return ContinueProcessing.no
+[?2004hroot@b0bd22362a44:/app# grep -n "pending\|policy" /usr/lib/python3/dist-packages/mailman/model/member.py | head -30
+[?2004l239:    def memberships_pending_warning(self, store):
+275:    def memberships_pending_removal(self, store):
+[?2004hroot@b0bd22362a44:/app# grep -n "subaddress\|join\|def " /usr/lib/python3/dist-packages/mailman/commands/eml_membership.py | head -40
+[?2004l18:"""The email commands 'join' and 'subscribe'."""
+40:def match_subscriber(email, display_name):
+64:    """The email 'join' command."""
+66:    name = 'join'
+81:    def process(self, mlist, msg, msgdata, arguments, results):
+107:        # Have we already seen one join request from this user during the
+109:        joins = getattr(results, 'joins', set())
+110:        if email in joins:
+111:            # Do not register this join.
+113:        joins.add(email)
+114:        results.joins = joins
+138:    def _parse_arguments(self, arguments, results):
+172:    """The email 'subscribe' command (an alias for 'join')."""
+175:    description = _("An alias for 'join'.")
+191:    def process(self, mlist, msg, msgdata, arguments, results):
+[?2004hroot@b0bd22362a44:/app# grep -rn "subaddress" /usr/lib/python3/dist-packages/mailman/ --include=*.py -l | grep -v tests
+[?2004l/usr/lib/python3/dist-packages/mailman/runners/command.py
+/usr/lib/python3/dist-packages/mailman/runners/lmtp.py
+[?2004hroot@b0bd22362a44:/app# cat /usr/lib/python3/dist-packages/mailman/runners/command.py
+[?2004l# Copyright (C) 1998-2023 by the Free Software Foundation, Inc.
+#
+# This file is part of GNU Mailman.
+#
+# GNU Mailman is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# GNU Mailman is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# GNU Mailman.  If not, see <https://www.gnu.org/licenses/>.
+
+"""-request robot command runner."""
+
+# See the delivery diagram in IncomingRunner.py.  This module handles all
+# email destined for mylist-request, -join, and -leave.  It no longer handles
+# bounce messages (i.e. -admin or -bounces), nor does it handle mail to
+# -owner.
+
+import re
+import logging
+
+from contextlib import suppress
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
+from email.iterators import typed_subpart_iterator
+from io import StringIO
+from mailman.config import config
+from mailman.core.i18n import _
+from mailman.core.runner import Runner
+from mailman.email.message import UserNotification
+from mailman.interfaces.autorespond import ResponseAction
+from mailman.interfaces.command import ContinueProcessing, IEmailResults
+from mailman.interfaces.languages import ILanguageManager
+from public import public
+from zope.component import getUtility
+from zope.interface import implementer
+
+
+NL = '\n'
+log = logging.getLogger('mailman.vette')
+
+
+class CommandFinder:
+    """Generate commands from the content of a message."""
+
+    def __init__(self, msg, msgdata, results):
+        self.command_lines = []
+        self.ignored_lines = []
+        self.processed_lines = []
+        results.send_response = True
+        # Depending on where the message was destined to, add some implicit
+        # commands.  For example, if this was sent to the -join or -leave
+        # addresses, it's the same as if 'join' or 'leave' commands were sent
+        # to the -request address.
+        is_address_command = False
+        subaddress = msgdata.get('subaddress')
+        if subaddress == 'join':
+            self.command_lines.append('join')
+            results.send_response = False
+            is_address_command = True
+        elif subaddress == 'leave':
+            self.command_lines.append('leave')
+            is_address_command = True
+            results.send_response = False
+        elif subaddress == 'confirm':
+            # match with re.DOTALL in case header is folded.
+            mo = re.match(config.mta.verp_confirm_regexp,
+                          msg.get('to', ''), re.DOTALL)
+            if mo:
+                self.command_lines.append('confirm ' + mo.group('cookie'))
+                is_address_command = True
+                results.send_response = False
+        # Stop processing if the address already contained a valid command
+        if is_address_command:
+            return
+        # Extract the subject header and do RFC 2047 decoding.
+        raw_subject = msg.get('subject', '')
+        try:
+            subject = str(make_header(decode_header(raw_subject)))
+            # Mail commands must be ASCII, so strip non-ascii.
+            self.command_lines.append(subject.encode('us-ascii', 'ignore'))
+        except (HeaderParseError, UnicodeError, LookupError):
+            # The Subject header was unparseable or not ASCII.  If the raw
+            # subject is a unicode object, convert it to ASCII ignoring all
+            # bogus characters.  Otherwise, there's nothing in the subject
+            # that we can use.
+            if isinstance(raw_subject, str):
+                safe_subject = raw_subject.encode('us-ascii', 'ignore')
+                self.command_lines.append(safe_subject)
+        # Find the first text/plain part of the message.
+        part = None
+        for part in typed_subpart_iterator(msg, 'text', 'plain'):
+            break
+        if part is None or part is not msg:
+            # Either there was no text/plain part or we ignored some
+            # non-text/plain parts.
+            print(_('Ignoring non-text/plain MIME parts'), file=results)
+        if part is None:
+            # There was no text/plain part to be found.
+            return
+        body = part.get_payload(decode=True)
+        # text/plain parts better have string payloads.
+        assert body is not None, 'Non-text payload'
+        body = body.decode(part.get_content_charset('us-ascii'),
+                           errors='replace')
+        lines = body.splitlines()
+        # Use no more lines than specified
+        max_lines = int(config.mailman.email_commands_max_lines)
+        self.command_lines.extend(lines[:max_lines])
+        self.ignored_lines.extend(lines[max_lines:])
+
+    def __iter__(self):
+        """Return each command line, split into space separated arguments."""
+        while self.command_lines:
+            line = self.command_lines.pop(0)
+            self.processed_lines.append(line)
+            parts = line.strip().split()
+            if len(parts) == 0:
+                continue
+            # Ensure that all the parts are unicodes.  Since we only accept
+            # ASCII commands and arguments, ignore anything else.
+            parts = [(part.lower()
+                      if isinstance(part, str)
+                      else part.decode('ascii', 'ignore').lower())
+                     for part in parts]
+            yield parts
+
+
+@public
+@implementer(IEmailResults)
+class Results:
+    """The email command results."""
+
+    def __init__(self, charset='us-ascii'):
+        self._output = StringIO()
+        self.charset = charset
+        self.send_response = True
+        print(_("""\
+The results of your email command are provided below.
+"""), file=self._output)
+
+    def write(self, text):
+        if isinstance(text, bytes):
+            text = text.decode(self.charset, 'ignore')
+        self._output.write(text)
+
+    def __str__(self):
+        value = self._output.getvalue()
+        assert isinstance(value, str), 'Not a string: %r' % value
+        return value
+
+
+@public
+class CommandRunner(Runner):
+    """The email command runner."""
+
+    def _dispose(self, mlist, msg, msgdata):
+        message_id = msg.get('message-id', 'n/a')
+        # The policy here is similar to the Replybot policy.  If a message has
+        # "Precedence: bulk|junk|list" and no "X-Ack: yes" header, we discard
+        # the command message.
+        precedence = msg.get('precedence', '').lower()
+        ack = msg.get('x-ack', '').lower()
+        if ack != 'yes' and precedence in ('bulk', 'junk', 'list'):
+            log.info('%s Precedence: %s message discarded by: %s',
+                     message_id, precedence, mlist.request_address)
+            return False
+        # Do replybot for commands.
+        replybot = config.handlers['replybot']
+        replybot.process(mlist, msg, msgdata)
+        if mlist.autorespond_requests == ResponseAction.respond_and_discard:
+            # Respond and discard.
+            log.info('%s -request message replied and discarded', message_id)
+            return False
+        # Now craft the response and process the command lines.
+        charset = msg.get_param('charset')
+        if charset is None:
+            charset = 'us-ascii'
+        results = Results(charset)
+        # Include just a few key pieces of information from the original: the
+        # sender, date, and message id.
+        print(_('- Original message details:'), file=results)
+        subject = str(make_header(decode_header(                 # noqa: F841
+            msg.get('subject', 'n/a'))))
+        date = msg.get('date', 'n/a')                            # noqa: F841
+        from_ = str(make_header(decode_header(                   # noqa: F841
+            msg.get('from', 'n/a'))))
+        print(_('    From: ${from_}'), file=results)
+        print(_('    Subject: ${subject}'), file=results)
+        print(_('    Date: ${date}'), file=results)
+        print(_('    Message-ID: ${message_id}'), file=results)
+        print(_('\n- Results:'), file=results)
+        finder = CommandFinder(msg, msgdata, results)
+        for parts in finder:
+            command = None
+            # Try to find a command on this line.  There may be a Re: prefix
+            # (possibly internationalized) so try with the first and second
+            # words on the line.
+            if len(parts) > 0:
+                command_name = parts.pop(0)
+                command = config.commands.get(command_name)
+            if command is None and len(parts) > 0:
+                command_name = parts.pop(0)
+                command = config.commands.get(command_name)
+            if command is None:
+                print(_('No such command: ${command_name}'), file=results)
+            else:
+                status = command.process(
+                    mlist, msg, msgdata, parts, results)
+                assert status in ContinueProcessing, (
+                    'Invalid status: %s' % status)
+                if status == ContinueProcessing.no:
+                    break
+        # All done. If we don't need to send response, return.
+        if not results.send_response:
+            return
+        # Strip blank lines and send the response.
+        lines = [line.strip() for line in finder.command_lines if line]
+        if len(lines) > 0:
+            print(_('\n- Unprocessed:'), file=results)
+            for line in lines:
+                print(line, file=results)
+        lines = [line.strip() for line in finder.ignored_lines if line]
+        if len(lines) > 0:
+            print(_('\n- Ignored:'), file=results)
+            for line in lines:
+                print(line, file=results)
+        print(_('\n- Done.'), file=results)
+        # Send a reply, but do not attach the original message.  This is a
+        # compromise because the original message is often helpful in tracking
+        # down problems, but it's also a vector for backscatter spam.
+        language = getUtility(ILanguageManager)[msgdata['lang']]
+        reply = UserNotification(msg.sender, mlist.bounces_address,
+                                 _('The results of your email commands'),
+                                 lang=language)
+        cte = msg.get('content-transfer-encoding')
+        if cte is not None:
+            reply['Content-Transfer-Encoding'] = cte
+        # Find a charset for the response body.  Try the original message's
+        # charset first, then ascii, then latin-1 and finally falling back to
+        # utf-8.
+        reply_body = str(results)
+        for charset in (results.charset, 'us-ascii', 'latin-1'):
+            with suppress(UnicodeError):
+                reply_body.encode(charset)
+                break
+        else:
+            charset = 'utf-8'
+        reply.set_payload(reply_body, charset=charset)
+        reply.send(mlist)
+[?2004hroot@b0bd22362a44:/app# grep -rn "verp_confirm_regexp" /usr/lib/python3/dist-packages/mailman/ --include=*.py | grep -v tests
+[?2004l/usr/lib/python3/dist-packages/mailman/runners/command.py:73:            mo = re.match(config.mta.verp_confirm_regexp,
+[?2004hroot@b0bd22362a44:/app# grep -rn "cookie" /usr/lib/python3/dist-packages/mailman/ --include=*.py | grep -v tests | head -20
+[?2004l/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py:257:    def confirm_address(cookie=''):
+/usr/lib/python3/dist-packages/mailman/model/mailinglist.py:332:    def confirm_address(self, cookie):
+/usr/lib/python3/dist-packages/mailman/model/mailinglist.py:336:            cookie=cookie))
+/usr/lib/python3/dist-packages/mailman/runners/command.py:76:                self.command_lines.append('confirm ' + mo.group('cookie'))
+[?2004hroot@b0bd22362a44:/app# sed -n '1,120p' /usr/lib/python3/dist-packages/mailman/model/pending.py
+[?2004l# Copyright (C) 2007-2023 by the Free Software Foundation, Inc.
+#
+# This file is part of GNU Mailman.
+#
+# GNU Mailman is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# GNU Mailman is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# GNU Mailman.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Implementations of the IPendable and IPending interfaces."""
+
+import json
+
+from lazr.config import as_timedelta
+from mailman.config import config
+from mailman.database.model import Model
+from mailman.database.transaction import dbconnection
+from mailman.database.types import SAUnicode, SAUnicodeXL
+from mailman.interfaces.pending import (
+    IPendable,
+    IPended,
+    IPendedKeyValue,
+    IPendings,
+)
+from mailman.interfaces.workflow import IWorkflowStateManager
+from mailman.utilities.datetime import now
+from mailman.utilities.uid import TokenFactory
+from public import public
+from sqlalchemy import and_, Column, DateTime, ForeignKey, Index, Integer
+from sqlalchemy.orm import aliased, relationship
+from zope.component import getUtility
+from zope.interface import implementer
+from zope.interface.verify import verifyObject
+
+
+token_factory = TokenFactory()
+
+
+@public
+@implementer(IPendedKeyValue)
+class PendedKeyValue(Model):
+    """A pended key/value pair, tied to a token."""
+
+    __tablename__ = 'pendedkeyvalue'
+    __table_args__ = (Index('ix_pendedkeyvalue_value', 'value',
+                            mysql_length=100), )
+
+    id = Column(Integer, primary_key=True)
+    key = Column(SAUnicode, index=True)
+    value = Column(SAUnicodeXL)
+    pended_id = Column(Integer, ForeignKey('pended.id'), index=True)
+
+    def __init__(self, key, value):
+        self.key = key
+        self.value = value
+
+
+@public
+@implementer(IPended)
+class Pended(Model):
+    """A pended event, tied to a token."""
+
+    __tablename__ = 'pended'
+
+    id = Column(Integer, primary_key=True)
+    token = Column(SAUnicode, index=True)
+    expiration_date = Column(DateTime, index=True)
+    key_values = relationship('PendedKeyValue', cascade='all, delete-orphan')
+
+
+@public
+@implementer(IPendable)
+class UnpendedPendable(dict):
+    PEND_TYPE = 'unpended'
+
+
+@public
+@implementer(IPendings)
+class Pendings:
+    """Implementation of the IPending interface."""
+
+    @dbconnection
+    def add(self, store, pendable, lifetime=None):
+        verifyObject(IPendable, pendable)
+        # Calculate the token and the lifetime.
+        if lifetime is None:
+            if pendable.get('token_owner', None) == 'moderator':
+                lifetime = as_timedelta(config.mailman.moderator_request_life)
+            else:
+                lifetime = as_timedelta(config.mailman.pending_request_life)
+        for attempts in range(3):
+            token = token_factory.new()
+            # In practice, we'll never get a duplicate, but we'll be anal
+            # about checking anyway.
+            if store.query(Pended).filter_by(token=token).count() == 0:
+                break
+        else:
+            raise RuntimeError('Could not find a valid pendings token')
+        # Create the record, and then the individual key/value pairs.
+        pending = Pended(
+            token=token,
+            expiration_date=now() + lifetime)
+        pendable_type = pendable.get('type', pendable.PEND_TYPE)
+        pending.key_values.append(
+            PendedKeyValue(key='type', value=pendable_type))
+        for key, value in pendable.items():
+            # The type has been handled above.
+            if key == 'type':
+                continue
+            # Both keys and values must be strings.
+            if isinstance(key, bytes):
+                key = key.decode('utf-8')
+[?2004hroot@b0bd22362a44:/app# sed -n '280,360p' /usr/lib/python3/dist-packages/mailman/model/mailinglist.py
+[?2004l    @property
+    def data_path(self):
+        """See `IMailingList`."""
+        return os.path.join(config.LIST_DATA_DIR, self.list_id)
+
+    # IMailingListAddresses
+
+    @property
+    def posting_address(self):
+        """See `IMailingList`."""
+        return self.fqdn_listname
+
+    @property
+    def no_reply_address(self):
+        """See `IMailingList`."""
+        return '{}@{}'.format(config.mailman.noreply_address, self.mail_host)
+
+    @property
+    def owner_address(self):
+        """See `IMailingList`."""
+        return '{}-owner@{}'.format(self.list_name, self.mail_host)
+
+    @property
+    def request_address(self):
+        """See `IMailingList`."""
+        return '{}-request@{}'.format(self.list_name, self.mail_host)
+
+    @property
+    def bounces_address(self):
+        """See `IMailingList`."""
+        return '{}-bounces@{}'.format(self.list_name, self.mail_host)
+
+    @property
+    def join_address(self):
+        """See `IMailingList`."""
+        return '{}-join@{}'.format(self.list_name, self.mail_host)
+
+    @property
+    def leave_address(self):
+        """See `IMailingList`."""
+        return '{}-leave@{}'.format(self.list_name, self.mail_host)
+
+    @property
+    def subscribe_address(self):
+        """See `IMailingList`."""
+        return '{}-subscribe@{}'.format(self.list_name, self.mail_host)
+
+    @property
+    def unsubscribe_address(self):
+        """See `IMailingList`."""
+        return '{}-unsubscribe@{}'.format(self.list_name, self.mail_host)
+
+    def confirm_address(self, cookie):
+        """See `IMailingList`."""
+        local_part = expand(config.mta.verp_confirm_format, self, dict(
+            address='{}-confirm'.format(self.list_name),
+            cookie=cookie))
+        return '{}@{}'.format(local_part, self.mail_host)
+
+    @property
+    def preferred_language(self):
+        """See `IMailingList`."""
+        return getUtility(ILanguageManager)[self._preferred_language]
+
+    @preferred_language.setter
+    def preferred_language(self, language):
+        """See `IMailingList`."""
+        # Accept both a language code and a `Language` instance.
+        try:
+            self._preferred_language = language.code
+        except AttributeError:
+            self._preferred_language = language
+
+    @dbconnection
+    def send_one_last_digest_to(self, store, address, delivery_mode):
+        """See `IMailingList`."""
+        digest = OneLastDigest(self, address, delivery_mode)
+        store.add(digest)
+
+    @property
+    @dbconnection
+[?2004hroot@b0bd22362a44:/app# ls /usr/lib/python3/dist-packages/mailman/config/; grep -rn "verp_" /usr/lib/python3/dist-packages/mailman/config/*.py | head
+[?2004l__init__.py  alembic.cfg  configure.zcml  gunicorn.cfg      mailman.cfg  passlib.cfg  schema.cfg
+[0m[01;34m__pycache__[0m  config.py    exim4.cfg       mail_archive.cfg  mhonarc.cfg  postfix.cfg  [01;34mtests[0m
+[?2004hroot@b0bd22362a44:/app# grep -n -A2 -B2 "verp" /usr/lib/python3/dist-packages/mailman/config/mailman.cfg | head -40
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -v "^#" /usr/lib/python3/dist-packages/mailman/config/postfix.cfg | grep -v "^$"
+[?2004l[postfix]
+postmap_command: /usr/sbin/postmap
+transport_file_type: hash
+[?2004hroot@b0bd22362a44:/app# sed -n '40,172p' /usr/lib/python3/dist-packages/mailman/commands/eml_membership.py
+[?2004ldef match_subscriber(email, display_name):
+    # Return something matching the email which should be used as the
+    # subscriber by the ISubscriptionManager interface.
+    manager = getUtility(IUserManager)
+    # Is there a user with a preferred address matching the email?
+    user = manager.get_user(email)
+    if user is not None:
+        preferred = user.preferred_address
+        if preferred is not None and preferred.email == email.lower():
+            return user
+    # Is there an address matching the email?
+    address = manager.get_address(email)
+    if address is not None:
+        return address
+    # Make a new user and subscribe their first (and only) address.  We can't
+    # make the first address their preferred address because it hasn't been
+    # verified yet.
+    user = manager.make_user(email, display_name)
+    return list(user.addresses)[0]
+
+
+@public
+@implementer(IEmailCommand)
+class Join:
+    """The email 'join' command."""
+
+    name = 'join'
+    # XXX 2012-02-29 BAW: DeliveryMode.summary is not yet supported.
+    argument_description = ('[digest=<no|mime|plain>] '
+                            '[address=user@example.com]')
+    description = _("""\
+You will be asked to confirm your subscription request and you may be issued a
+provisional password.
+
+By using the 'digest' option, you can specify whether you want digest delivery
+or not.  If not specified, the mailing list's default delivery mode will be
+used.  You can use the 'address' option to request subscription of an address
+other than the sender of the command.
+""")
+    short_description = _('Join this mailing list.')
+
+    def process(self, mlist, msg, msgdata, arguments, results):
+        """See `IEmailCommand`."""
+        # Parse the arguments.
+        delivery_mode, address = self._parse_arguments(arguments, results)
+        if delivery_mode is ContinueProcessing.no:
+            return ContinueProcessing.no
+        if not address:
+            # RFC 2047 decode the From: header.
+            if msg['from'] is None:
+                display_name, email = ('', '')
+            else:
+                # Parse before decoding in case decoded display_name contains
+                # a comma.
+                display_name, email = parseaddr(msg['from'])
+                display_name = str(make_header(decode_header(display_name)))
+        else:
+            display_name, email = ('', address)
+        # Address could be None or the empty string.
+        if not email:
+            email = msg.sender
+        if not email:
+            print(_('${self.name}: No valid address found to subscribe'),
+                  file=results)
+            return ContinueProcessing.no
+        if isinstance(email, bytes):
+            email = email.decode('ascii')
+        # Have we already seen one join request from this user during the
+        # processing of this email?
+        joins = getattr(results, 'joins', set())
+        if email in joins:
+            # Do not register this join.
+            return ContinueProcessing.yes
+        joins.add(email)
+        results.joins = joins
+        person = formataddr((display_name, email))                # noqa: F841
+        try:
+            subscriber = match_subscriber(email, display_name)
+        except InvalidEmailAddressError as e:
+            print('Invalid email address: {}'.format(e), file=results)
+            return ContinueProcessing.yes
+        try:
+            ISubscriptionManager(mlist).register(subscriber,
+                                                 delivery_mode=delivery_mode)
+        except (AlreadySubscribedError, InvalidEmailAddressError,
+                MembershipIsBannedError) as e:
+            print(str(e), file=results)
+            results.send_response = True
+        except SubscriptionPendingError:
+            # SubscriptionPendingError doesn't return an error message.
+            listname = mlist.fqdn_listname                        # noqa: F841
+            print(_('${person} has a pending subscription for ${listname}'),
+                  file=results)
+            results.send_response = True
+        else:
+            print(_('Confirmation email sent to ${person}'), file=results)
+        return ContinueProcessing.yes
+
+    def _parse_arguments(self, arguments, results):
+        """Parse command arguments.
+
+        :param arguments: The sequences of arguments as given to the
+            `process()` method.
+        :param results: The results object.
+        :return: A tuple (delivery mode, address) or
+            (ContinueProcessing.no, None) on error.
+        """
+        mode = DeliveryMode.regular
+        address = None
+        for argument in arguments:
+            parts = argument.split('=', 1)
+            if len(parts) != 2 or parts[0] not in ('digest', 'address'):
+                print(self.name, _('bad argument: ${argument}'),
+                      file=results)
+                return (ContinueProcessing.no, None)
+            if parts[0] == 'digest':
+                mode = {
+                    'no': DeliveryMode.regular,
+                    'plain': DeliveryMode.plaintext_digests,
+                    'mime': DeliveryMode.mime_digests,
+                    }.get(parts[1])
+                if mode is None:
+                    print(self.name, _('bad argument: ${argument}'),
+                          file=results)
+                    return (ContinueProcessing.no, None)
+            if parts[0] == 'address':
+                address = parts[1]
+        return (mode, address)
+
+
+@public
+class Subscribe(Join):
+    """The email 'subscribe' command (an alias for 'join')."""
+[?2004hroot@b0bd22362a44:/app# grep -rn "verp_confirm_format\|verp_regex" /usr/lib/python3/dist-packages/mailman/ --include=*.py | grep -v tests | head
+[?2004l/usr/lib/python3/dist-packages/mailman/app/bounces.py:147:        super().__init__(config.mta.verp_regexp)
+/usr/lib/python3/dist-packages/mailman/model/mailinglist.py:334:        local_part = expand(config.mta.verp_confirm_format, self, dict(
+[?2004hroot@b0bd22362a44:/app# grep -rn "verp" /usr/lib/python3/dist-packages/mailman/config/config.py /usr/lib/python3/dist-packages/mailman/config/mailman.cfg 2>/dev/null | head -20
+[?2004l[?2004hroot@b0bd22362a44:/app# head -60 /usr/lib/python3/dist-packages/mailman/model/subscriptions.py; grep -c . /usr/lib/python3/dist-packages/mailman/model/subscriptions.py
+[?2004l# Copyright (C) 2016-2023 by the Free Software Foundation, Inc.
+#
+# This file is part of GNU Mailman.
+#
+# GNU Mailman is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# GNU Mailman is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# GNU Mailman.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Subscription services."""
+
+from mailman.app.membership import delete_member
+from mailman.database.transaction import dbconnection
+from mailman.interfaces.listmanager import IListManager, NoSuchListError
+from mailman.interfaces.member import MemberRole
+from mailman.interfaces.subscriptions import (
+    ISubscriptionService,
+    TooManyMembersError,
+)
+from mailman.interfaces.usermanager import IUserManager
+from mailman.model.address import Address
+from mailman.model.member import Member
+from mailman.model.user import User
+from mailman.utilities.queries import QuerySequence
+from operator import attrgetter
+from public import public
+from sqlalchemy import or_, select, union_all
+from sqlalchemy.orm import aliased
+from zope.component import getUtility
+from zope.interface import implementer
+
+
+EMPTY = object()
+
+
+@public
+@implementer(ISubscriptionService)
+class SubscriptionService:
+    """Subscription services for the REST API."""
+
+    __name__ = 'members'
+
+    def get_members(self):
+        """See `ISubscriptionService`."""
+        # {list_id -> {role -> [members]}}
+        by_list = {}
+        user_manager = getUtility(IUserManager)
+        for member in user_manager.members:
+            by_role = by_list.setdefault(member.list_id, {})
+            members = by_role.setdefault(member.role.name, [])
+            members.append(member)
+        # Flatten into single list sorted as per the interface.
+198
+[?2004hroot@b0bd22362a44:/app# grep -rn "implementer(ISubscriptionManager\|ISubscriptionManager)" /usr/lib/python3/dist-packages/mailman/ --include=*.py | grep -v tests | head
+[?2004l/usr/lib/python3/dist-packages/mailman/app/subscriptions.py:564:@implementer(ISubscriptionManager)
+[?2004hroot@b0bd22362a44:/app# grep -rn "lmtp_host" /usr/lib/python3/dist-packages/mailman/ --include=*.py | grep -v tests | head
+[?2004l/usr/lib/python3/dist-packages/mailman/mta/postfix.py:42:ALIASTMPL = '{0:{2}}lmtp:[{1.mta.lmtp_host}]:{1.mta.lmtp_port}'
+/usr/lib/python3/dist-packages/mailman/runners/lmtp.py:293:        hostname = config.mta.lmtp_host
+/usr/lib/python3/dist-packages/mailman/testing/helpers.py:234:                config.mta.lmtp_host, int(config.mta.lmtp_port))
+[?2004hroot@b0bd22362a44:/app# grep -n -A 40 "^\[mta\]" /usr/lib/python3/dist-packages/mailman/config/mailman.cfg
+[?2004l[?2004hroot@b0bd22362a44:/app# sed -n '560,720p' /usr/lib/python3/dist-packages/mailman/app/subscriptions.py
+[?2004l        self.push('do_unsubscription')
+
+
+@public
+@implementer(ISubscriptionManager)
+class SubscriptionManager:
+    def __init__(self, mlist):
+        self._mlist = mlist
+
+    def register(self, subscriber=None, *,
+                 pre_verified=False, pre_confirmed=False, pre_approved=False,
+                 invitation=False, send_welcome_message=None,
+                 delivery_mode=None, delivery_status=None):
+        """See `ISubscriptionManager`."""
+        workflow = SubscriptionWorkflow(
+            self._mlist, subscriber,
+            pre_verified=pre_verified,
+            pre_confirmed=pre_confirmed,
+            pre_approved=pre_approved,
+            invitation=invitation,
+            send_welcome_message=send_welcome_message,
+            delivery_mode=delivery_mode,
+            delivery_status=delivery_status,
+            )
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def unregister(self, subscriber=None, *,
+                   pre_confirmed=False, pre_approved=False):
+        workflow = UnSubscriptionWorkflow(
+            self._mlist, subscriber,
+            pre_confirmed=pre_confirmed,
+            pre_approved=pre_approved)
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def confirm(self, token):
+        if token is None:
+            raise LookupError
+        pendable = getUtility(IPendings).confirm(token, expunge=False)
+        if pendable is None:
+            raise LookupError
+        workflow_type = pendable.get('type')
+        assert workflow_type in (PendableSubscription.PEND_TYPE,
+                                 PendableUnsubscription.PEND_TYPE)
+        workflow = (SubscriptionWorkflow
+                    if workflow_type == PendableSubscription.PEND_TYPE
+                    else UnSubscriptionWorkflow)(self._mlist)
+        workflow.token = token
+        workflow.restore()
+        # In order to just run the whole workflow, all we need to do
+        # is iterate over the workflow object. On calling the __next__
+        # over the workflow iterator it automatically executes the steps
+        # that needs to be done.
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def discard(self, token):
+        with flush():
+            getUtility(IPendings).confirm(token)
+            getUtility(IWorkflowStateManager).discard(token)
+
+
+def _handle_confirmation_needed_events(event, template_name):
+    # This function handles sending the confirmation email to the user
+    # for both subscriptions requiring confirmation and invitations
+    # requiring acceptance.
+    with _.using(event.mlist.preferred_language.code):
+        if template_name.endswith(':invite'):
+            subject = _('You have been invited to join the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+        elif template_name.endswith(':unsubscribe'):
+            subject = _('Your confirmation is needed to leave the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+        else:
+            assert template_name.endswith(':subscribe')
+            subject = _('Your confirmation is needed to join the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+    confirm_address = event.mlist.confirm_address(event.token)
+    email_address = event.email
+    # Send a verification email to the address.
+    template = getUtility(ITemplateLoader).get(template_name, event.mlist)
+    text = expand(template, event.mlist, dict(
+        token=event.token,
+        subject=subject,
+        confirm_email=confirm_address,
+        user_email=email_address,
+        # For backward compatibility.
+        confirm_address=confirm_address,
+        email_address=email_address,
+        domain_name=event.mlist.domain.mail_host,
+        contact_address=event.mlist.owner_address,
+        ))
+    if ('verp_confirmations' in config.mta and not
+            as_boolean(config.mta.verp_confirmations)):
+        subject = 'confirm {}'.format(event.token)
+        confirm_address = event.mlist.request_address
+    msg = UserNotification(
+        email_address, confirm_address, subject, text,
+        event.mlist.preferred_language)
+    del msg['auto-submitted']
+    msg['Auto-Submitted'] = 'auto-generated'
+    msg.send(event.mlist, add_precedence=False)
+
+
+@public
+def handle_SubscriptionConfirmationNeededEvent(event):
+    if not isinstance(event, SubscriptionConfirmationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:subscribe')
+
+
+@public
+def handle_SubscriptionInvitationNeededEvent(event):
+    if not isinstance(event, SubscriptionInvitationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:invite')
+
+
+@public
+def handle_UnsubscriptionConfirmationNeededEvent(event):
+    if not isinstance(event, UnsubscriptionConfirmationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:unsubscribe')
+
+
+@public
+def handle_ListDeletingEvent(event):
+    """Delete a mailing list's members when the list is being deleted."""
+
+    if not isinstance(event, ListDeletingEvent):
+        return
+    # Find all the members still associated with the mailing list.
+    members = getUtility(ISubscriptionService).find_members(
+        list_id=event.mailing_list.list_id)
+    for member in members:
+        member.unsubscribe()
+[?2004hroot@b0bd22362a44:/app# sed -n '40,200p' /usr/lib/python3/dist-packages/mailman/mta/postfix.py
+[?2004l
+log = logging.getLogger('mailman.error')
+ALIASTMPL = '{0:{2}}lmtp:[{1.mta.lmtp_host}]:{1.mta.lmtp_port}'
+VMAPTMPL = '{0:{1}}{2}'
+NL = '\n'
+
+
+@contextmanager
+def atomic(path):
+    # Write a new file and then atomically rename it.
+    new_path = path + '.new'
+    try:
+        with open(new_path, 'w', encoding='utf-8') as fp:
+            yield fp
+    except:                                      # noqa: E722 pragma: nocover
+        os.remove(new_path)
+        raise
+    else:
+        os.rename(new_path, path)
+
+
+def _get_alias_domain(domain):
+    domain_manager = getUtility(IDomainManager)
+    d = domain_manager.get(domain)
+    if d is not None and d.alias_domain:
+        return d.alias_domain
+    return domain
+
+
+class _FakeList:
+    """Duck-typed list for the `IMailTransportAgentAliases` interface."""
+
+    def __init__(self, list_name, mail_host):
+        self.list_name = list_name
+        self.true_mail_host = mail_host
+        self.mail_host = _get_alias_domain(mail_host)
+        self.posting_address = '{}@{}'.format(list_name, self.mail_host)
+
+
+@public
+@implementer(IMailTransportAgentLifecycle)
+class LMTP:
+    """Connect Mailman to Postfix via LMTP."""
+
+    def __init__(self):
+        # Locate and read the Postfix specific configuration file.
+        mta_config = external_configuration(config.mta.configuration)
+        self.postmap_command = mta_config.get('postfix', 'postmap_command')
+        self.transport_file_type = mta_config.get(
+            'postfix', 'transport_file_type')
+
+    def create(self, mlist):
+        """See `IMailTransportAgentLifecycle`."""
+        # We can ignore the mlist argument because for LMTP delivery, we just
+        # generate the entire file every time.
+        self.regenerate()
+
+    delete = create
+
+    def regenerate(self, directory=None):
+        """See `IMailTransportAgentLifecycle`."""
+        # Acquire a lock file to prevent other processes from racing us here.
+        if directory is None:
+            directory = config.DATA_DIR
+        lock_file = os.path.join(config.LOCK_DIR, 'mta')
+        with Lock(lock_file):
+            lmtp_path = os.path.join(directory, 'postfix_lmtp')
+            with atomic(lmtp_path) as fp:
+                self._generate_lmtp_file(fp)
+            domains_path = os.path.join(directory, 'postfix_domains')
+            with atomic(domains_path) as fp:
+                self._generate_domains_file(fp)
+            vmap_path = os.path.join(directory, 'postfix_vmap')
+            with atomic(vmap_path) as fp:
+                vmap = self._generate_vmap_file(fp)
+            if not vmap:
+                # If we didn't write anything, remove the file.
+                os.remove(vmap_path)
+            # If the transport_file_type is 'hash' then run the postmap command
+            # on newly generated file to convert them in to hash table like
+            # Postfix wants.
+            if self.transport_file_type == 'hash':
+                errors = []
+                files = [lmtp_path, domains_path]
+                if vmap:
+                    files.append(vmap_path)
+                for path in files:
+                    command = self.postmap_command + ' ' + path
+                    status = (os.system(command) >> 8) & 0xff
+                    if status:
+                        msg = 'command failure: %s, %s, %s'
+                        errstr = os.strerror(status)
+                        log.error(msg, command, status, errstr)
+                        errors.append(msg % (command, status, errstr))
+                if errors:
+                    raise RuntimeError(NL.join(errors))
+
+    def _generate_lmtp_file(self, fp):
+        # The format for Postfix's LMTP transport map is defined here:
+        # http://www.postfix.org/transport.5.html
+        #
+        # Sort all existing mailing list names first by domain, then by
+        # local part.  For Postfix we need a dummy entry for the domain.
+        list_manager = getUtility(IListManager)
+        utility = getUtility(IMailTransportAgentAliases)
+        by_domain = {}
+        sort_key = attrgetter('list_name')
+        for list_name, mail_host in list_manager.name_components:
+            mlist = _FakeList(list_name, mail_host)
+            by_domain.setdefault(mlist.mail_host, []).append(mlist)
+        print("""\
+# AUTOMATICALLY GENERATED BY MAILMAN ON {}
+#
+# This file is generated by Mailman, and is kept in sync with the binary hash
+# file.  YOU SHOULD NOT MANUALLY EDIT THIS FILE unless you know what you're
+# doing, and can keep the two files properly in sync.  If you screw it up,
+# you're on your own.
+    """.format(now().replace(microsecond=0)), file=fp)
+        for domain in sorted(by_domain):
+            print("""\
+# Aliases which are visible only in the @{} domain.""".format(domain),
+                  file=fp)
+            for mlist in sorted(by_domain[domain], key=sort_key):
+                aliases = list(utility.aliases(mlist))
+                width = max(len(alias) for alias in aliases) + \
+                    aliases[0].count('.') + 10
+                print(ALIASTMPL.format(self._decorate(aliases.pop(0)),
+                                       config, width), file=fp)
+                for alias in aliases:
+                    print(ALIASTMPL.format(self._decorate(alias),
+                                           config, width), file=fp)
+                print(file=fp)
+
+    def _decorate(self, name):
+        # Postfix regex tables need regex matching listname or domains. This
+        # method just decorates the name to be printed in the transport map
+        # file or relay domains file.
+        # We have to do a bit more with the -bounces and -confirm names as
+        # they can have + extra information and that results in no match in
+        # regexp tables.
+        if self.transport_file_type == 'regex':
+            local, at, domain = name.partition('@')
+            if local.endswith('-bounces') or local.endswith('-confirm'):
+                local = local.replace('.', '\\.')
+                domain = domain.replace('.', '\\.')
+                return '/^{}(\\+.*)?@{}$/'.format(local, domain)
+            else:
+                return '/^{}$/'.format(name).replace('.', '\\.')
+        return name
+
+    def _generate_domains_file(self, fp):
+        # Uniquify the domains, then sort them alphabetically.
+        domains = set()
+        for list_name, mail_host in getUtility(IListManager).name_components:
+            domains.add(mail_host)
+        print("""\
+# AUTOMATICALLY GENERATED BY MAILMAN ON {}
+#
+# This file is generated by Mailman, and is kept in sync with the binary hash
+# file.  YOU SHOULD NOT MANUALLY EDIT THIS FILE unless you know what you're
+# doing, and can keep the two files properly in sync.  If you screw it up,
+[?2004hroot@b0bd22362a44:/app# sed -n '564,700p' /usr/lib/python3/dist-packages/mailman/app/subscriptions.py
+[?2004l@implementer(ISubscriptionManager)
+class SubscriptionManager:
+    def __init__(self, mlist):
+        self._mlist = mlist
+
+    def register(self, subscriber=None, *,
+                 pre_verified=False, pre_confirmed=False, pre_approved=False,
+                 invitation=False, send_welcome_message=None,
+                 delivery_mode=None, delivery_status=None):
+        """See `ISubscriptionManager`."""
+        workflow = SubscriptionWorkflow(
+            self._mlist, subscriber,
+            pre_verified=pre_verified,
+            pre_confirmed=pre_confirmed,
+            pre_approved=pre_approved,
+            invitation=invitation,
+            send_welcome_message=send_welcome_message,
+            delivery_mode=delivery_mode,
+            delivery_status=delivery_status,
+            )
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def unregister(self, subscriber=None, *,
+                   pre_confirmed=False, pre_approved=False):
+        workflow = UnSubscriptionWorkflow(
+            self._mlist, subscriber,
+            pre_confirmed=pre_confirmed,
+            pre_approved=pre_approved)
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def confirm(self, token):
+        if token is None:
+            raise LookupError
+        pendable = getUtility(IPendings).confirm(token, expunge=False)
+        if pendable is None:
+            raise LookupError
+        workflow_type = pendable.get('type')
+        assert workflow_type in (PendableSubscription.PEND_TYPE,
+                                 PendableUnsubscription.PEND_TYPE)
+        workflow = (SubscriptionWorkflow
+                    if workflow_type == PendableSubscription.PEND_TYPE
+                    else UnSubscriptionWorkflow)(self._mlist)
+        workflow.token = token
+        workflow.restore()
+        # In order to just run the whole workflow, all we need to do
+        # is iterate over the workflow object. On calling the __next__
+        # over the workflow iterator it automatically executes the steps
+        # that needs to be done.
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def discard(self, token):
+        with flush():
+            getUtility(IPendings).confirm(token)
+            getUtility(IWorkflowStateManager).discard(token)
+
+
+def _handle_confirmation_needed_events(event, template_name):
+    # This function handles sending the confirmation email to the user
+    # for both subscriptions requiring confirmation and invitations
+    # requiring acceptance.
+    with _.using(event.mlist.preferred_language.code):
+        if template_name.endswith(':invite'):
+            subject = _('You have been invited to join the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+        elif template_name.endswith(':unsubscribe'):
+            subject = _('Your confirmation is needed to leave the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+        else:
+            assert template_name.endswith(':subscribe')
+            subject = _('Your confirmation is needed to join the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+    confirm_address = event.mlist.confirm_address(event.token)
+    email_address = event.email
+    # Send a verification email to the address.
+    template = getUtility(ITemplateLoader).get(template_name, event.mlist)
+    text = expand(template, event.mlist, dict(
+        token=event.token,
+        subject=subject,
+        confirm_email=confirm_address,
+        user_email=email_address,
+        # For backward compatibility.
+        confirm_address=confirm_address,
+        email_address=email_address,
+        domain_name=event.mlist.domain.mail_host,
+        contact_address=event.mlist.owner_address,
+        ))
+    if ('verp_confirmations' in config.mta and not
+            as_boolean(config.mta.verp_confirmations)):
+        subject = 'confirm {}'.format(event.token)
+        confirm_address = event.mlist.request_address
+    msg = UserNotification(
+        email_address, confirm_address, subject, text,
+        event.mlist.preferred_language)
+    del msg['auto-submitted']
+    msg['Auto-Submitted'] = 'auto-generated'
+    msg.send(event.mlist, add_precedence=False)
+
+
+@public
+def handle_SubscriptionConfirmationNeededEvent(event):
+    if not isinstance(event, SubscriptionConfirmationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:subscribe')
+
+
+@public
+def handle_SubscriptionInvitationNeededEvent(event):
+    if not isinstance(event, SubscriptionInvitationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:invite')
+
+
+@public
+def handle_UnsubscriptionConfirmationNeededEvent(event):
+    if not isinstance(event, UnsubscriptionConfirmationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:unsubscribe')
+
+
+@public
+def handle_ListDeletingEvent(event):
+    """Delete a mailing list's members when the list is being deleted."""
+
+    if not isinstance(event, ListDeletingEvent):
+        return
+    # Find all the members still associated with the mailing list.
+    members = getUtility(ISubscriptionService).find_members(
+        list_id=event.mailing_list.list_id)
+    for member in members:
+        member.unsubscribe()
+[?2004hroot@b0bd22362a44:/app# grep -n "def \|policy\|ConfirmationNeeded\|notice_\|confirm_address\|template" /usr/lib/python3/dist-packages/mailman/app/subscriptions.py | head -60
+[?2004l47:    SubscriptionConfirmationNeededEvent,
+51:    UnsubscriptionConfirmationNeededEvent,
+53:from mailman.interfaces.template import ITemplateLoader
+88:    def __init__(self, mlist, subscriber):
+108:    def user_key(self):
+113:    def user_key(self, hex_key):
+121:    def address_key(self):
+126:    def address_key(self, email):
+132:    def subscriber_key(self):
+136:    def subscriber_key(self, key):
+140:    def token_owner_key(self):
+144:    def token_owner_key(self, value):
+147:    def _set_token(self, token_owner):
+191:    def __init__(self, mlist, subscriber=None, *,
+218:    def _step_sanity_checks(self):
+262:    def _step_verification_checks(self):
+279:    def _step_confirmation_checks(self):
+280:        # If the list's subscription policy is open, then the user can be
+282:        if self.mlist.subscription_policy is SubscriptionPolicy.open:
+287:        if self.mlist.subscription_policy is SubscriptionPolicy.moderate:
+297:                if self.mlist.subscription_policy is
+305:    def _step_moderation_checks(self):
+307:        assert self.mlist.subscription_policy in (
+310:            ), self.mlist.subscription_policy
+316:    def _step_get_moderator_approval(self):
+333:            template = getUtility(ITemplateLoader).get(
+335:            text = wrap(expand(template, self.mlist, dict(
+347:    def _step_subscribe_from_restored(self):
+360:    def _step_do_subscription(self):
+374:    def _step_send_confirmation(self):
+379:        notify(SubscriptionConfirmationNeededEvent(
+384:    def _step_send_invitation(self):
+394:    def _step_do_confirm_verify(self):
+411:        # The next step depends on the mailing list's subscription policy.
+413:                     if self.mlist.subscription_policy in (
+436:    def __init__(self, mlist, subscriber=None, *,
+445:    def _step_subscription_checks(self):
+451:    def _step_confirmation_checks(self):
+452:        # If list's unsubscription policy is open, the user can unsubscribe
+454:        if self.mlist.unsubscription_policy is SubscriptionPolicy.open:
+459:        if self.mlist.unsubscription_policy is SubscriptionPolicy.moderate:
+470:    def _step_send_confirmation(self):
+474:        notify(UnsubscriptionConfirmationNeededEvent(
+478:    def _step_moderation_checks(self):
+480:        assert self.mlist.unsubscription_policy in (
+483:            ), self.mlist.unsubscription_policy
+489:    def _step_get_moderator_approval(self):
+502:            template = getUtility(ITemplateLoader).get(
+504:            text = wrap(expand(template, self.mlist, dict(
+516:    def _step_do_confirm_verify(self):
+535:                     if self.mlist.unsubscription_policy in (
+542:    def _step_do_unsubscription(self):
+552:    def _step_unsubscribe_from_restored(self):
+566:    def __init__(self, mlist):
+569:    def register(self, subscriber=None, *,
+587:    def unregister(self, subscriber=None, *,
+596:    def confirm(self, token):
+617:    def discard(self, token):
+623:def _handle_confirmation_needed_events(event, template_name):
+628:        if template_name.endswith(':invite'):
+[?2004hroot@b0bd22362a44:/app# sed -n '279,345p' /usr/lib/python3/dist-packages/mailman/app/subscriptions.py
+[?2004l    def _step_confirmation_checks(self):
+        # If the list's subscription policy is open, then the user can be
+        # subscribed right here and now.
+        if self.mlist.subscription_policy is SubscriptionPolicy.open:
+            self.push('do_subscription')
+            return
+        # If we do not need the user's confirmation, then skip to the
+        # moderation checks.
+        if self.mlist.subscription_policy is SubscriptionPolicy.moderate:
+            self.push('moderation_checks')
+            return
+        # If the subscription has been pre-confirmed, then we can skip the
+        # confirmation check can be skipped.  If moderator approval is
+        # required we need to check that, otherwise we can go straight to
+        # subscription.
+        if self.pre_confirmed:
+            next_step = (
+                'moderation_checks'
+                if self.mlist.subscription_policy is
+                    SubscriptionPolicy.confirm_then_moderate   # noqa: E131
+                else 'do_subscription')
+            self.push(next_step)
+            return
+        # The user must confirm their subscription.
+        self.push('send_confirmation')
+
+    def _step_moderation_checks(self):
+        # Does the moderator need to approve the subscription request?
+        assert self.mlist.subscription_policy in (
+            SubscriptionPolicy.moderate,
+            SubscriptionPolicy.confirm_then_moderate,
+            ), self.mlist.subscription_policy
+        if self.pre_approved:
+            self.push('do_subscription')
+        else:
+            self.push('get_moderator_approval')
+
+    def _step_get_moderator_approval(self):
+        # Here's the next step in the workflow, assuming the moderator
+        # approves of the subscription.  If they don't, the workflow and
+        # subscription request will just be thrown away.
+        self._set_token(TokenOwner.moderator)
+        self.push('subscribe_from_restored')
+        self.save()
+        log.info('{}: held subscription request from {}'.format(
+            self.mlist.fqdn_listname, self.address.email))
+        # Possibly send a notification to the list moderators.
+        if self.mlist.admin_immed_notify:
+            subject = _(
+                'New subscription request to ${self.mlist.display_name} '
+                'from ${self.address.email}')
+            username =\
+                f'{self.subscriber.display_name} <{self.address.email}>'\
+                if self.subscriber.display_name else self.address.email
+            template = getUtility(ITemplateLoader).get(
+                'list:admin:action:subscribe', self.mlist)
+            text = wrap(expand(template, self.mlist, dict(
+                member=username,
+                )))
+            # This message should appear to come from the <list>-owner so as
+            # to avoid any useless bounce processing.
+            msg = UserNotification(
+                self.mlist.owner_address, self.mlist.owner_address,
+                subject, text, self.mlist.preferred_language)
+            msg.send(self.mlist)
+        # The workflow must stop running here.
+        raise StopIteration
+[?2004hroot@b0bd22362a44:/app# grep -rn "class SubscriptionPolicy" -A 12 /usr/lib/python3/dist-packages/mailman/interfaces/*.py
+[?2004l[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K:[m[K[32m[K80[m[K[36m[K:[m[K[01;31m[Kclass SubscriptionPolicy[m[K(Enum):
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K81[m[K[36m[K-[m[K    """All subscription/unsubscription policies for a mailing list."""
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K82[m[K[36m[K-[m[K    # Neither confirmation, nor moderator approval is required.
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K83[m[K[36m[K-[m[K    open = 0
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K84[m[K[36m[K-[m[K    # The user must confirm the subscription.
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K85[m[K[36m[K-[m[K    confirm = 1
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K86[m[K[36m[K-[m[K    # The moderator must approve the subscription.
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K87[m[K[36m[K-[m[K    moderate = 2
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K88[m[K[36m[K-[m[K    # The user must first confirm their subscription, and then if that is
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K89[m[K[36m[K-[m[K    # successful, the moderator must also approve it.
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K90[m[K[36m[K-[m[K    confirm_then_moderate = 3
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K91[m[K[36m[K-[m[K
+[35m[K/usr/lib/python3/dist-packages/mailman/interfaces/mailinglist.py[m[K[36m[K-[m[K[32m[K92[m[K[36m[K-[m[K
+[?2004hroot@b0bd22362a44:/app# grep -n -B3 -A12 "list:user:action" /usr/lib/python3/dist-packages/mailman/messages/mailman.pot | head -80
+[?2004l2069-msgid "list:member:regular:header.txt"
+2070-msgstr ""
+2071-
+2072:msgid "list:user:action:invite.txt"
+2073-msgstr ""
+2074-
+2075:msgid "list:user:action:subscribe.txt"
+2076-msgstr ""
+2077-
+2078:msgid "list:user:action:unsubscribe.txt"
+2079-msgstr ""
+2080-
+2081-msgid "list:user:notice:goodbye.txt"
+2082-msgstr ""
+2083-
+2084-msgid "list:user:notice:hold.txt"
+2085-msgstr ""
+2086-
+2087-msgid "list:user:notice:no-more-today.txt"
+2088-msgstr ""
+2089-
+2090-msgid "list:user:notice:post.txt"
+[?2004hroot@b0bd22362a44:/app# ls /usr/lib/python3/dist-packages/mailman/templates/en/ | head -60
+[?2004l__init__.py
+__pycache__
+domain:admin:notice:new-list.txt
+help.txt
+list:admin:action:post.txt
+list:admin:action:subscribe.txt
+list:admin:action:unsubscribe.txt
+list:admin:notice:disable.txt
+list:admin:notice:increment.txt
+list:admin:notice:pending.txt
+list:admin:notice:removal.txt
+list:admin:notice:subscribe.txt
+list:admin:notice:unrecognized.txt
+list:admin:notice:unsubscribe.txt
+list:member:digest:header.txt
+list:member:digest:masthead.txt
+list:member:generic:footer.txt
+list:member:regular:header.txt
+list:user:action:invite.txt
+list:user:action:subscribe.txt
+list:user:action:unsubscribe.txt
+list:user:notice:goodbye.txt
+list:user:notice:hold.txt
+list:user:notice:no-more-today.txt
+list:user:notice:post.txt
+list:user:notice:probe.txt
+list:user:notice:refuse.txt
+list:user:notice:rejected.txt
+list:user:notice:warning.txt
+list:user:notice:welcome.txt
+[?2004hroot@b0bd22362a44:/app# cat "/usr/lib/python3/dist-packages/mailman/templates/en/list:user:action:subscribe.txt"
+[?2004lEmail Address Registration Confirmation
+
+Hello, this is the GNU Mailman server at $domain.
+
+We have received a registration request for the email address
+
+    $user_email
+
+Before you can start using GNU Mailman at this site, you must first confirm
+that this is your email address.  You can do this by replying to this message.
+
+Or you should include the following line -- and only the following
+line -- in a message to $request_email:
+
+    confirm $token
+
+Note that simply sending a `reply' to this message should work from
+most mail readers.
+
+If you do not wish to register this email address, simply disregard this
+message.  If you think you are being maliciously subscribed to the list, or
+have any other questions, you may contact
+
+    $owner_email
+[?2004hroot@b0bd22362a44:/app# cat "/usr/lib/python3/dist-packages/mailman/templates/en/list:user:action:unsubscribe.txt"
+[?2004lEmail Address Unsubscription Confirmation
+
+Hello, this is the GNU Mailman server at $domain.
+
+We have received an unsubscription request for the email address
+
+    $user_email
+
+Before GNU Mailman can unsubscribe you, you must first confirm your request.
+You can do this by simply replying to this message.
+
+Or you should include the following line -- and only the following
+line -- in a message to $request_email:
+
+    confirm $token
+
+Note that simply sending a `reply' to this message should work from
+most mail readers.
+
+If you do not wish to unsubscribe this email address, simply disregard this
+message.  If you think you are being maliciously unsubscribed from the list,
+or have any other questions, you may contact
+
+    $owner_email
+[?2004hroot@b0bd22362a44:/app# sed -n '623,690p' /usr/lib/python3/dist-packages/mailman/app/subscriptions.py
+[?2004ldef _handle_confirmation_needed_events(event, template_name):
+    # This function handles sending the confirmation email to the user
+    # for both subscriptions requiring confirmation and invitations
+    # requiring acceptance.
+    with _.using(event.mlist.preferred_language.code):
+        if template_name.endswith(':invite'):
+            subject = _('You have been invited to join the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+        elif template_name.endswith(':unsubscribe'):
+            subject = _('Your confirmation is needed to leave the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+        else:
+            assert template_name.endswith(':subscribe')
+            subject = _('Your confirmation is needed to join the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+    confirm_address = event.mlist.confirm_address(event.token)
+    email_address = event.email
+    # Send a verification email to the address.
+    template = getUtility(ITemplateLoader).get(template_name, event.mlist)
+    text = expand(template, event.mlist, dict(
+        token=event.token,
+        subject=subject,
+        confirm_email=confirm_address,
+        user_email=email_address,
+        # For backward compatibility.
+        confirm_address=confirm_address,
+        email_address=email_address,
+        domain_name=event.mlist.domain.mail_host,
+        contact_address=event.mlist.owner_address,
+        ))
+    if ('verp_confirmations' in config.mta and not
+            as_boolean(config.mta.verp_confirmations)):
+        subject = 'confirm {}'.format(event.token)
+        confirm_address = event.mlist.request_address
+    msg = UserNotification(
+        email_address, confirm_address, subject, text,
+        event.mlist.preferred_language)
+    del msg['auto-submitted']
+    msg['Auto-Submitted'] = 'auto-generated'
+    msg.send(event.mlist, add_precedence=False)
+
+
+@public
+def handle_SubscriptionConfirmationNeededEvent(event):
+    if not isinstance(event, SubscriptionConfirmationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:subscribe')
+
+
+@public
+def handle_SubscriptionInvitationNeededEvent(event):
+    if not isinstance(event, SubscriptionInvitationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:invite')
+
+
+@public
+def handle_UnsubscriptionConfirmationNeededEvent(event):
+    if not isinstance(event, UnsubscriptionConfirmationNeededEvent):
+        return
+    _handle_confirmation_needed_events(event, 'list:user:action:unsubscribe')
+
+
+@public
+def handle_ListDeletingEvent(event):
+    """Delete a mailing list's members when the list is being deleted."""
+
+    if not isinstance(event, ListDeletingEvent):
+[?2004hroot@b0bd22362a44:/app# sed -n '623,645p' /usr/lib/python3/dist-packages/mailman/app/subscriptions.py
+[?2004ldef _handle_confirmation_needed_events(event, template_name):
+    # This function handles sending the confirmation email to the user
+    # for both subscriptions requiring confirmation and invitations
+    # requiring acceptance.
+    with _.using(event.mlist.preferred_language.code):
+        if template_name.endswith(':invite'):
+            subject = _('You have been invited to join the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+        elif template_name.endswith(':unsubscribe'):
+            subject = _('Your confirmation is needed to leave the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+        else:
+            assert template_name.endswith(':subscribe')
+            subject = _('Your confirmation is needed to join the '
+                        '${event.mlist.fqdn_listname} mailing list.')
+    confirm_address = event.mlist.confirm_address(event.token)
+    email_address = event.email
+    # Send a verification email to the address.
+    template = getUtility(ITemplateLoader).get(template_name, event.mlist)
+    text = expand(template, event.mlist, dict(
+        token=event.token,
+        subject=subject,
+        confirm_email=confirm_address,
+[?2004hroot@b0bd22362a44:/app# head -50 "/usr/lib/python3/dist-packages/mailman/templates/en/list:user:action:subscribe.txt"; echo ===; head -50 "/usr/lib/python3/dist-packages/mailman/templates/en/list:user:action:unsubscribe.txt"
+[?2004lEmail Address Registration Confirmation
+
+Hello, this is the GNU Mailman server at $domain.
+
+We have received a registration request for the email address
+
+    $user_email
+
+Before you can start using GNU Mailman at this site, you must first confirm
+that this is your email address.  You can do this by replying to this message.
+
+Or you should include the following line -- and only the following
+line -- in a message to $request_email:
+
+    confirm $token
+
+Note that simply sending a `reply' to this message should work from
+most mail readers.
+
+If you do not wish to register this email address, simply disregard this
+message.  If you think you are being maliciously subscribed to the list, or
+have any other questions, you may contact
+
+    $owner_email
+===
+Email Address Unsubscription Confirmation
+
+Hello, this is the GNU Mailman server at $domain.
+
+We have received an unsubscription request for the email address
+
+    $user_email
+
+Before GNU Mailman can unsubscribe you, you must first confirm your request.
+You can do this by simply replying to this message.
+
+Or you should include the following line -- and only the following
+line -- in a message to $request_email:
+
+    confirm $token
+
+Note that simply sending a `reply' to this message should work from
+most mail readers.
+
+If you do not wish to unsubscribe this email address, simply disregard this
+message.  If you think you are being maliciously unsubscribed from the list,
+or have any other questions, you may contact
+
+    $owner_email
+[?2004hroot@b0bd22362a44:/app# grep -rn "confirm_format\|confirm_regexp" /usr/lib/python3/dist-packages/mailman/ 2>/dev/null | grep -v ".pyc" | head
+[?2004lsed -n '566,622p' /usr/lib/python3/dist-packages/mailman/app/subscriptions.py
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:865:verp_confirm_format: $address+$cookie
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:876:# verp_confirm_format.  MUAs have been observed that mung
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:885:verp_confirm_regexp: ^(.*<)?(?P<addr>[^+]+?)\+(?P<cookie>[^@]+)@.*$
+/usr/lib/python3/dist-packages/mailman/model/mailinglist.py:334:        local_part = expand(config.mta.verp_confirm_format, self, dict(
+/usr/lib/python3/dist-packages/mailman/runners/command.py:73:            mo = re.match(config.mta.verp_confirm_regexp,
+[?2004hroot@b0bd22362a44:/app# sed -n '566,622p' /usr/lib/python3/dist-packages/mailman/app/subscriptions.py
+[?2004l    def __init__(self, mlist):
+        self._mlist = mlist
+
+    def register(self, subscriber=None, *,
+                 pre_verified=False, pre_confirmed=False, pre_approved=False,
+                 invitation=False, send_welcome_message=None,
+                 delivery_mode=None, delivery_status=None):
+        """See `ISubscriptionManager`."""
+        workflow = SubscriptionWorkflow(
+            self._mlist, subscriber,
+            pre_verified=pre_verified,
+            pre_confirmed=pre_confirmed,
+            pre_approved=pre_approved,
+            invitation=invitation,
+            send_welcome_message=send_welcome_message,
+            delivery_mode=delivery_mode,
+            delivery_status=delivery_status,
+            )
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def unregister(self, subscriber=None, *,
+                   pre_confirmed=False, pre_approved=False):
+        workflow = UnSubscriptionWorkflow(
+            self._mlist, subscriber,
+            pre_confirmed=pre_confirmed,
+            pre_approved=pre_approved)
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def confirm(self, token):
+        if token is None:
+            raise LookupError
+        pendable = getUtility(IPendings).confirm(token, expunge=False)
+        if pendable is None:
+            raise LookupError
+        workflow_type = pendable.get('type')
+        assert workflow_type in (PendableSubscription.PEND_TYPE,
+                                 PendableUnsubscription.PEND_TYPE)
+        workflow = (SubscriptionWorkflow
+                    if workflow_type == PendableSubscription.PEND_TYPE
+                    else UnSubscriptionWorkflow)(self._mlist)
+        workflow.token = token
+        workflow.restore()
+        # In order to just run the whole workflow, all we need to do
+        # is iterate over the workflow object. On calling the __next__
+        # over the workflow iterator it automatically executes the steps
+        # that needs to be done.
+        list(workflow)
+        return workflow.token, workflow.token_owner, workflow.member
+
+    def discard(self, token):
+        with flush():
+            getUtility(IPendings).confirm(token)
+            getUtility(IWorkflowStateManager).discard(token)
+
+
+[?2004hroot@b0bd22362a44:/app# grep -n "verp\|class .*Section\|def _add\|add_section" /usr/lib/python3/dist-packages/mailman/config/config.py | head -40
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -rn "verp" /usr/lib/python3/dist-packages/mailman/config/ 2>/dev/null | grep -v ".pyc"
+[?2004l/usr/lib/python3/dist-packages/mailman/config/schema.cfg:827:# http://cr.yp.to/proto/verp.txt
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:855:verp_delimiter: +
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:856:verp_format: ${bounces}+${local}=${domain}
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:861:# Format is like verp_format, but with the following substitutions:
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:865:verp_confirm_format: $address+$cookie
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:873:verp_regexp: ^(?P<bounces>[^+]+?)\+(?P<local>[^=]+)=(?P<domain>[^@]+)@.*$
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:875:# This is analogous to verp_regexp, but for splitting apart the
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:876:# verp_confirm_format.  MUAs have been observed that mung
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:885:verp_confirm_regexp: ^(.*<)?(?P<addr>[^+]+?)\+(?P<cookie>[^@]+)@.*$
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:889:verp_confirmations: yes
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:895:verp_personalized_deliveries: no
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:903:verp_delivery_interval: 0
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:906:verp_probe_format: $bounces+$token@$domain
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:907:verp_probe_regexp: ^(?P<bounces>[^+]+?)\+(?P<token>[^@]+)@.*$
+/usr/lib/python3/dist-packages/mailman/config/schema.cfg:909:verp_probes: no
+[?2004hroot@b0bd22362a44:/app# grep -n -A 40 "^\[postfix\]" /usr/lib/python3/dist-packages/mailman/config/schema.cfg
+[?2004l[?2004hroot@b0bd22362a44:/app# grep -n "def \|transport_file\|aliases_file\|reload\|subprocess\|check_call\|hook\|register" /usr/lib/python3/dist-packages/mailman/mta/postfix.py | head -40
+[?2004l18:"""Creation/deletion hooks for the Postfix MTA."""
+48:def atomic(path):
+61:def _get_alias_domain(domain):
+72:    def __init__(self, list_name, mail_host):
+84:    def __init__(self):
+88:        self.transport_file_type = mta_config.get(
+89:            'postfix', 'transport_file_type')
+91:    def create(self, mlist):
+99:    def regenerate(self, directory=None):
+118:            # If the transport_file_type is 'hash' then run the postmap command
+121:            if self.transport_file_type == 'hash':
+137:    def _generate_lmtp_file(self, fp):
+173:    def _decorate(self, name):
+180:        if self.transport_file_type == 'regex':
+190:    def _generate_domains_file(self, fp):
+208:    def _generate_vmap_file(self, fp):
+[?2004hroot@b0bd22362a44:/app# grep -n "option\|add_argument\|def main\|generate\|create" /usr/lib/python3/dist-packages/mailman/commands/cli_aliases.py | head -30
+[?2004l7:# Software Foundation, either version 3 of the License, or (at your option)
+26:from mailman.utilities.options import I18nCommand
+33:    help=_('Regenerate the aliases appropriate for your MTA.'))
+34:@click.option(
+40:    call_name(config.mta.incoming).regenerate(directory)
+[?2004hroot@b0bd22362a44:/app# sed -n '44,140p' /usr/lib/python3/dist-packages/mailman/mta/postfix.py
+[?2004lNL = '\n'
+
+
+@contextmanager
+def atomic(path):
+    # Write a new file and then atomically rename it.
+    new_path = path + '.new'
+    try:
+        with open(new_path, 'w', encoding='utf-8') as fp:
+            yield fp
+    except:                                      # noqa: E722 pragma: nocover
+        os.remove(new_path)
+        raise
+    else:
+        os.rename(new_path, path)
+
+
+def _get_alias_domain(domain):
+    domain_manager = getUtility(IDomainManager)
+    d = domain_manager.get(domain)
+    if d is not None and d.alias_domain:
+        return d.alias_domain
+    return domain
+
+
+class _FakeList:
+    """Duck-typed list for the `IMailTransportAgentAliases` interface."""
+
+    def __init__(self, list_name, mail_host):
+        self.list_name = list_name
+        self.true_mail_host = mail_host
+        self.mail_host = _get_alias_domain(mail_host)
+        self.posting_address = '{}@{}'.format(list_name, self.mail_host)
+
+
+@public
+@implementer(IMailTransportAgentLifecycle)
+class LMTP:
+    """Connect Mailman to Postfix via LMTP."""
+
+    def __init__(self):
+        # Locate and read the Postfix specific configuration file.
+        mta_config = external_configuration(config.mta.configuration)
+        self.postmap_command = mta_config.get('postfix', 'postmap_command')
+        self.transport_file_type = mta_config.get(
+            'postfix', 'transport_file_type')
+
+    def create(self, mlist):
+        """See `IMailTransportAgentLifecycle`."""
+        # We can ignore the mlist argument because for LMTP delivery, we just
+        # generate the entire file every time.
+        self.regenerate()
+
+    delete = create
+
+    def regenerate(self, directory=None):
+        """See `IMailTransportAgentLifecycle`."""
+        # Acquire a lock file to prevent other processes from racing us here.
+        if directory is None:
+            directory = config.DATA_DIR
+        lock_file = os.path.join(config.LOCK_DIR, 'mta')
+        with Lock(lock_file):
+            lmtp_path = os.path.join(directory, 'postfix_lmtp')
+            with atomic(lmtp_path) as fp:
+                self._generate_lmtp_file(fp)
+            domains_path = os.path.join(directory, 'postfix_domains')
+            with atomic(domains_path) as fp:
+                self._generate_domains_file(fp)
+            vmap_path = os.path.join(directory, 'postfix_vmap')
+            with atomic(vmap_path) as fp:
+                vmap = self._generate_vmap_file(fp)
+            if not vmap:
+                # If we didn't write anything, remove the file.
+                os.remove(vmap_path)
+            # If the transport_file_type is 'hash' then run the postmap command
+            # on newly generated file to convert them in to hash table like
+            # Postfix wants.
+            if self.transport_file_type == 'hash':
+                errors = []
+                files = [lmtp_path, domains_path]
+                if vmap:
+                    files.append(vmap_path)
+                for path in files:
+                    command = self.postmap_command + ' ' + path
+                    status = (os.system(command) >> 8) & 0xff
+                    if status:
+                        msg = 'command failure: %s, %s, %s'
+                        errstr = os.strerror(status)
+                        log.error(msg, command, status, errstr)
+                        errors.append(msg % (command, status, errstr))
+                if errors:
+                    raise RuntimeError(NL.join(errors))
+
+    def _generate_lmtp_file(self, fp):
+        # The format for Postfix's LMTP transport map is defined here:
+        # http://www.postfix.org/transport.5.html
+        #
+[?2004hroot@b0bd22362a44:/app# grep -n -A 60 "^\[paths.debian\]" /etc/mailman3/mailman.cfg | grep -v "^--$" | head -70
+[?2004l108:[paths.debian]
+109-# Important directories for Mailman operation.  These are defined here so that
+110-# different layouts can be supported.   For example, a developer layout would
+111-# be different from a FHS layout.  Most paths are based off the var_dir, and
+112-# often just setting that will do the right thing for all the other paths.
+113-# You might also have to set spool_dir though.
+114-#
+115-# Substitutions are allowed, but must be of the form $var where 'var' names a
+116-# configuration variable in the paths.* section.  Substitutions are expanded
+117-# recursively until no more $-variables are present.  Beware of infinite
+118-# expansion loops!
+119-#
+120-# This is the root of the directory structure that Mailman will use to store
+121-# its run-time data.
+122-var_dir: /var/lib/mailman3
+123-# This is where the Mailman queue files directories will be created.
+124-queue_dir: $var_dir/queue
+125-# This is the directory containing the Mailman 'runner' and 'master' commands
+126-# if set to the string '$argv', it will be taken as the directory containing
+127-# the 'mailman' command.
+128-bin_dir: /usr/lib/mailman3/bin
+129-# All list-specific data.
+130-list_data_dir: $var_dir/lists
+131-# Directory where log files go.
+132-log_dir: /var/log/mailman3
+133-# Directory for system-wide locks.
+134-lock_dir: $var_dir/locks
+135-# Directory for system-wide data.
+136-data_dir: $var_dir/data
+137-# Cache files.
+138-cache_dir: $var_dir/cache
+139-# Directory for configuration files and such.
+140-etc_dir: /etc/mailman3
+141-# Directory containing Mailman plugins.
+142-ext_dir: $var_dir/ext
+143-# Directory where the default IMessageStore puts its messages.
+144-messages_dir: $var_dir/messages
+145-# Directory for archive backends to store their messages in.  Archivers should
+146-# create a subdirectory in here to store their files.
+147-archive_dir: $var_dir/archives
+148-# Root directory for site-specific template override files.
+149-template_dir: $var_dir/templates
+150-# There are also a number of paths to specific file locations that can be
+151-# defined.  For these, the directory containing the file must already exist,
+152-# or be one of the directories created by Mailman as per above.
+153-#
+154-# This is where PID file for the master runner is stored.
+155-pid_file: /run/mailman3/master.pid
+156-# Lock file.
+157-lock_file: $lock_dir/master.lck
+158-
+159-
+160-[database]
+161-# The class implementing the IDatabase.
+162-class: mailman.database.sqlite.SQLiteDatabase
+163-#class: mailman.database.mysql.MySQLDatabase
+164-#class: mailman.database.postgresql.PostgreSQLDatabase
+165-
+166-# Use this to set the Storm database engine URL.  You generally have one
+167-# primary database connection for all of Mailman.  List data and most rosters
+168-# will store their data in this database, although external rosters may access
+[?2004hroot@b0bd22362a44:/app# sed -n '137,175p' /usr/lib/python3/dist-packages/mailman/mta/postfix.py
+[?2004l    def _generate_lmtp_file(self, fp):
+        # The format for Postfix's LMTP transport map is defined here:
+        # http://www.postfix.org/transport.5.html
+        #
+        # Sort all existing mailing list names first by domain, then by
+        # local part.  For Postfix we need a dummy entry for the domain.
+        list_manager = getUtility(IListManager)
+        utility = getUtility(IMailTransportAgentAliases)
+        by_domain = {}
+        sort_key = attrgetter('list_name')
+        for list_name, mail_host in list_manager.name_components:
+            mlist = _FakeList(list_name, mail_host)
+            by_domain.setdefault(mlist.mail_host, []).append(mlist)
+        print("""\
+# AUTOMATICALLY GENERATED BY MAILMAN ON {}
+#
+# This file is generated by Mailman, and is kept in sync with the binary hash
+# file.  YOU SHOULD NOT MANUALLY EDIT THIS FILE unless you know what you're
+# doing, and can keep the two files properly in sync.  If you screw it up,
+# you're on your own.
+    """.format(now().replace(microsecond=0)), file=fp)
+        for domain in sorted(by_domain):
+            print("""\
+# Aliases which are visible only in the @{} domain.""".format(domain),
+                  file=fp)
+            for mlist in sorted(by_domain[domain], key=sort_key):
+                aliases = list(utility.aliases(mlist))
+                width = max(len(alias) for alias in aliases) + \
+                    aliases[0].count('.') + 10
+                print(ALIASTMPL.format(self._decorate(aliases.pop(0)),
+                                       config, width), file=fp)
+                for alias in aliases:
+                    print(ALIASTMPL.format(self._decorate(alias),
+                                           config, width), file=fp)
+                print(file=fp)
+
+    def _decorate(self, name):
+        # Postfix regex tables need regex matching listname or domains. This
+        # method just decorates the name to be printed in the transport map
+[?2004hroot@b0bd22362a44:/app# cat /usr/lib/python3/dist-packages/mailman/commands/cli_aliases.py
+[?2004l# Copyright (C) 2009-2023 by the Free Software Foundation, Inc.
+#
+# This file is part of GNU Mailman.
+#
+# GNU Mailman is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# GNU Mailman is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# GNU Mailman.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Generate Mailman alias files for your MTA."""
+
+import click
+
+from mailman.config import config
+from mailman.core.i18n import _
+from mailman.interfaces.command import ICLISubCommand
+from mailman.utilities.modules import call_name
+from mailman.utilities.options import I18nCommand
+from public import public
+from zope.interface import implementer
+
+
+@click.command(
+    cls=I18nCommand,
+    help=_('Regenerate the aliases appropriate for your MTA.'))
+@click.option(
+    '--directory', '-d',
+    type=click.Path(exists=True, file_okay=False, resolve_path=True,
+                    writable=True),
+    help=_('An alternative directory to output the various MTA files to.'))
+def aliases(directory):
+    call_name(config.mta.incoming).regenerate(directory)
+
+
+@public
+@implementer(ICLISubCommand)
+class Aliases:
+    name = 'aliases'
+    command = aliases
+[?2004hroot@b0bd22362a44:/app# grep -rn "IMailTransportAgentLifecycle" /usr/lib/python3/dist-packages/mailman/ --include=*.py | grep -v tests | head
+[?2004l/usr/lib/python3/dist-packages/mailman/interfaces/mta.py:68:class IMailTransportAgentLifecycle(Interface):
+/usr/lib/python3/dist-packages/mailman/mta/exim4.py:20:from mailman.interfaces.mta import IMailTransportAgentLifecycle
+/usr/lib/python3/dist-packages/mailman/mta/exim4.py:26:@implementer(IMailTransportAgentLifecycle)
+/usr/lib/python3/dist-packages/mailman/mta/exim4.py:30:    See `IMailTransportAgentLifecycle`.
+/usr/lib/python3/dist-packages/mailman/mta/exim4.py:43:        """See `IMailTransportAgentLifecycle`."""
+/usr/lib/python3/dist-packages/mailman/mta/null.py:23:from mailman.interfaces.mta import IMailTransportAgentLifecycle
+/usr/lib/python3/dist-packages/mailman/mta/null.py:29:@implementer(IMailTransportAgentLifecycle)
+/usr/lib/python3/dist-packages/mailman/mta/null.py:34:        """See `IMailTransportAgentLifecycle`."""
+/usr/lib/python3/dist-packages/mailman/mta/null.py:38:        """See `IMailTransportAgentLifecycle`."""
+/usr/lib/python3/dist-packages/mailman/mta/null.py:42:        """See `IMailTransportAgentLifecycle`."""
+[?2004hroot@b0bd22362a44:/app# grep -n -A 80 "^\[paths.debian\]" /etc/mailman3/mailman.cfg | sed 's/#.*//' | grep -v "^$" | head -30
+[?2004l108:[paths.debian]
+109-
+110-
+111-
+112-
+113-
+114-
+115-
+116-
+117-
+118-
+119-
+120-
+121-
+122-var_dir: /var/lib/mailman3
+123-
+124-queue_dir: $var_dir/queue
+125-
+126-
+127-
+128-bin_dir: /usr/lib/mailman3/bin
+129-
+130-list_data_dir: $var_dir/lists
+131-
+132-log_dir: /var/log/mailman3
+133-
+134-lock_dir: $var_dir/locks
+135-
+136-data_dir: $var_dir/data
+137-
+[?2004hroot@b0bd22362a44:/app# sed -n '140,200p' /usr/lib/python3/dist-packages/mailman/mta/postfix.py
+[?2004l        #
+        # Sort all existing mailing list names first by domain, then by
+        # local part.  For Postfix we need a dummy entry for the domain.
+        list_manager = getUtility(IListManager)
+        utility = getUtility(IMailTransportAgentAliases)
+        by_domain = {}
+        sort_key = attrgetter('list_name')
+        for list_name, mail_host in list_manager.name_components:
+            mlist = _FakeList(list_name, mail_host)
+            by_domain.setdefault(mlist.mail_host, []).append(mlist)
+        print("""\
+# AUTOMATICALLY GENERATED BY MAILMAN ON {}
+#
+# This file is generated by Mailman, and is kept in sync with the binary hash
+# file.  YOU SHOULD NOT MANUALLY EDIT THIS FILE unless you know what you're
+# doing, and can keep the two files properly in sync.  If you screw it up,
+# you're on your own.
+    """.format(now().replace(microsecond=0)), file=fp)
+        for domain in sorted(by_domain):
+            print("""\
+# Aliases which are visible only in the @{} domain.""".format(domain),
+                  file=fp)
+            for mlist in sorted(by_domain[domain], key=sort_key):
+                aliases = list(utility.aliases(mlist))
+                width = max(len(alias) for alias in aliases) + \
+                    aliases[0].count('.') + 10
+                print(ALIASTMPL.format(self._decorate(aliases.pop(0)),
+                                       config, width), file=fp)
+                for alias in aliases:
+                    print(ALIASTMPL.format(self._decorate(alias),
+                                           config, width), file=fp)
+                print(file=fp)
+
+    def _decorate(self, name):
+        # Postfix regex tables need regex matching listname or domains. This
+        # method just decorates the name to be printed in the transport map
+        # file or relay domains file.
+        # We have to do a bit more with the -bounces and -confirm names as
+        # they can have + extra information and that results in no match in
+        # regexp tables.
+        if self.transport_file_type == 'regex':
+            local, at, domain = name.partition('@')
+            if local.endswith('-bounces') or local.endswith('-confirm'):
+                local = local.replace('.', '\\.')
+                domain = domain.replace('.', '\\.')
+                return '/^{}(\\+.*)?@{}$/'.format(local, domain)
+            else:
+                return '/^{}$/'.format(name).replace('.', '\\.')
+        return name
+
+    def _generate_domains_file(self, fp):
+        # Uniquify the domains, then sort them alphabetically.
+        domains = set()
+        for list_name, mail_host in getUtility(IListManager).name_components:
+            domains.add(mail_host)
+        print("""\
+# AUTOMATICALLY GENERATED BY MAILMAN ON {}
+#
+# This file is generated by Mailman, and is kept in sync with the binary hash
+# file.  YOU SHOULD NOT MANUALLY EDIT THIS FILE unless you know what you're
+# doing, and can keep the two files properly in sync.  If you screw it up,
+[?2004hroot@b0bd22362a44:/app# awk '/^\[paths.debian\]/,/^[a-z#]/' /etc/mailman3/mailman.cfg | grep -E "dir|path" | grep -v "^#" | head -20
+[?2004l[paths.debian]
+[?2004hroot@b0bd22362a44:/app# grep -n -A 45 "def aliases" /usr/lib/python3/dist-packages/mailman/mta/aliases.py | head -60
+[?2004l42:    def aliases(self, mlist):
+43-        """See `IMailTransportAgentAliases`."""
+44-        # Always return
+45-        yield mlist.posting_address
+46-        for destination in sorted(SUBDESTINATIONS):
+47-            yield '{}-{}@{}'.format(
+48-                mlist.list_name, destination, mlist.mail_host)
+49-
+50-    def destinations(self, mlist):
+51-        """See `IMailTransportAgentAliases`."""
+52-        # Always return
+53-        yield mlist.list_name
+54-        for destination in sorted(SUBDESTINATIONS):
+55-            yield '{}-{}'.format(mlist.list_name, destination)
+[?2004hroot@b0bd22362a44:/app# grep -n -B2 -A15 "SUBDESTINATIONS = " /usr/lib/python3/dist-packages/mailman/mta/aliases.py | head -25
+[?2004l23-
+24-
+25:SUBDESTINATIONS = (
+26-    'bounces',
+27-    'confirm',
+28-    'join',
+29-    'leave',
+30-    'owner',
+31-    'request',
+32-    'subscribe',
+33-    'unsubscribe',
+34-    )
+35-
+36-
+37-@public
+38-@implementer(IMailTransportAgentAliases)
+39-class MailTransportAgentAliases:
+40-    """Utility for generating all the aliases of a mailing list."""
+[?2004hroot@b0bd22362a44:/app# grep -n "paths.debian" /etc/mailman3/mailman.cfg; N=$(grep -n "paths.debian" /etc/mailman3/mailman.cfg | cut -d: -f1); sed -n "${N},$((N+45))p" /etc/mailman3/mailman.cfg | grep -E ":" 
+[?2004l[32m[K108[m[K[36m[K:[m[K[[01;31m[Kpaths.debian[m[K]
+var_dir[01;31m[K:[m[K /var/lib/mailman3
+queue_dir[01;31m[K:[m[K $var_dir/queue
+bin_dir[01;31m[K:[m[K /usr/lib/mailman3/bin
+list_data_dir[01;31m[K:[m[K $var_dir/lists
+log_dir[01;31m[K:[m[K /var/log/mailman3
+lock_dir[01;31m[K:[m[K $var_dir/locks
+data_dir[01;31m[K:[m[K $var_dir/data
+cache_dir[01;31m[K:[m[K $var_dir/cache
+etc_dir[01;31m[K:[m[K /etc/mailman3
+ext_dir[01;31m[K:[m[K $var_dir/ext
+messages_dir[01;31m[K:[m[K $var_dir/messages
+archive_dir[01;31m[K:[m[K $var_dir/archives
+template_dir[01;31m[K:[m[K $var_dir/templates
+[?2004hroot@b0bd22362a44:/app# cat /usr/lib/mailman3/bin/mailman /usr/lib/mailman3/bin/master /usr/lib/mailman3/bin/runner
+[?2004l#!/usr/bin/python3
+# EASY-INSTALL-ENTRY-SCRIPT: 'mailman==3.3.8','console_scripts','mailman'
+import re
+import sys
+
+# for compatibility with easy_install; see #2198
+__requires__ = 'mailman==3.3.8'
+
+try:
+    from importlib.metadata import distribution
+except ImportError:
+    try:
+        from importlib_metadata import distribution
+    except ImportError:
+        from pkg_resources import load_entry_point
+
+
+def importlib_load_entry_point(spec, group, name):
+    dist_name, _, _ = spec.partition('==')
+    matches = (
+        entry_point
+        for entry_point in distribution(dist_name).entry_points
+        if entry_point.group == group and entry_point.name == name
+    )
+    return next(matches).load()
+
+
+globals().setdefault('load_entry_point', importlib_load_entry_point)
+
+
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw?|\.exe)?$', '', sys.argv[0])
+    sys.exit(load_entry_point('mailman==3.3.8', 'console_scripts', 'mailman')())
+#!/usr/bin/python3
+# EASY-INSTALL-ENTRY-SCRIPT: 'mailman==3.3.8','console_scripts','master'
+import re
+import sys
+
+# for compatibility with easy_install; see #2198
+__requires__ = 'mailman==3.3.8'
+
+try:
+    from importlib.metadata import distribution
+except ImportError:
+    try:
+        from importlib_metadata import distribution
+    except ImportError:
+        from pkg_resources import load_entry_point
+
+
+def importlib_load_entry_point(spec, group, name):
+    dist_name, _, _ = spec.partition('==')
+    matches = (
+        entry_point
+        for entry_point in distribution(dist_name).entry_points
+        if entry_point.group == group and entry_point.name == name
+    )
+    return next(matches).load()
+
+
+globals().setdefault('load_entry_point', importlib_load_entry_point)
+
+
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw?|\.exe)?$', '', sys.argv[0])
+    sys.exit(load_entry_point('mailman==3.3.8', 'console_scripts', 'master')())
+#!/usr/bin/python3
+# EASY-INSTALL-ENTRY-SCRIPT: 'mailman==3.3.8','console_scripts','runner'
+import re
+import sys
+
+# for compatibility with easy_install; see #2198
+__requires__ = 'mailman==3.3.8'
+
+try:
+    from importlib.metadata import distribution
+except ImportError:
+    try:
+        from importlib_metadata import distribution
+    except ImportError:
+        from pkg_resources import load_entry_point
+
+
+def importlib_load_entry_point(spec, group, name):
+    dist_name, _, _ = spec.partition('==')
+    matches = (
+        entry_point
+        for entry_point in distribution(dist_name).entry_points
+        if entry_point.group == group and entry_point.name == name
+    )
+    return next(matches).load()
+
+
+globals().setdefault('load_entry_point', importlib_load_entry_point)
+
+
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw?|\.exe)?$', '', sys.argv[0])
+    sys.exit(load_entry_point('mailman==3.3.8', 'console_scripts', 'runner')())
+[?2004hroot@b0bd22362a44:/app# grep -n "^\[" /etc/mailman3/mailman.cfg; ls -la /var/lib/ | grep -i mail
+[?2004l[32m[K23[m[K[36m[K:[m[K[01;31m[K[[m[Kmailman]
+[32m[K86[m[K[36m[K:[m[K[01;31m[K[[m[Kshell]
+[32m[K108[m[K[36m[K:[m[K[01;31m[K[[m[Kpaths.debian]
+[32m[K160[m[K[36m[K:[m[K[01;31m[K[[m[Kdatabase]
+[32m[K178[m[K[36m[K:[m[K[01;31m[K[[m[Klogging.debian]
+[32m[K218[m[K[36m[K:[m[K[01;31m[K[[m[Kwebservice]
+[32m[K241[m[K[36m[K:[m[K[01;31m[K[[m[Kmta]
+drwxr-xr-x 3 list    list      26 Oct 28  2025 [01;31m[Kmail[m[Kman3
+[?2004hroot@b0bd22362a44:/app# sed -n '160,178p' /etc/mailman3/mailman.cfg
+[?2004l[database]
+# The class implementing the IDatabase.
+class: mailman.database.sqlite.SQLiteDatabase
+#class: mailman.database.mysql.MySQLDatabase
+#class: mailman.database.postgresql.PostgreSQLDatabase
+
+# Use this to set the Storm database engine URL.  You generally have one
+# primary database connection for all of Mailman.  List data and most rosters
+# will store their data in this database, although external rosters may access
+# other databases in their own way.  This string supports standard
+# 'configuration' substitutions.
+url: sqlite:///$DATA_DIR/mailman.db
+#url: mysql+pymysql://mailman3:mmpass@localhost/mailman3?charset=utf8&use_unicode=1
+#url: postgresql://mailman3:mmpass@localhost/mailman3
+
+debug: no
+
+
+[logging.debian]
+[?2004hroot@b0bd22362a44:/app# mailman --help 2>&1 | head -30
+[?2004lmailman create --help 2>&1 | head -30
+Usage: mailman [OPTIONS] COMMAND [ARGS]...
+
+  The GNU Mailman mailing list management system Copyright 1998-2018 by the
+  Free Software Foundation, Inc. http://www.list.org
+
+Options:
+  --version          Show the version and exit.
+  --run-as-root      Running mailman commands as root is not recommended and
+                     mailman will refuse to run as root unless this option is
+                     specified.
+  -C, --config FILE  Configuration file to use.  If not given, the environment
+                     variable MAILMAN_CONFIG_FILE is consulted and used if
+                     set.  If neither are given, a default configuration file
+                     is loaded.
+  -h, --help         Show this message and exit.
+
+Commands:
+  addmembers     Add all member addresses in FILENAME with delivery mode...
+  aliases        Regenerate the aliases appropriate for your MTA.
+  changeaddress  Change a user's email address from old_address to...
+  conf           Print the Mailman configuration.
+  create         Create a mailing list.
+  delmembers     Delete members from a mailing list.
+  digests        Operate on digests.
+  findmember     Display all memberships for a user or users with address...
+  gatenews       Poll the NNTP server for messages to be gatewayed to...
+  help           Show this help message and exit.
+  import21       Import Mailman 2.1 list data.
+  info           Information about this Mailman instance.
+  inject         Inject a message from a file into a mailing list's queue.
+[?2004hroot@b0bd22362a44:/app# mailman create --help 2>&1 | head -30
+[?2004lUsage: mailman [OPTIONS] COMMAND [ARGS]...
+Try 'mailman -h' for help.
+
+Error: If you are sure you want to run as root, specify --run-as-root.
+[?2004hroot@b0bd22362a44:/app# ls -ld /var/mail /var/spool 2>&1
+[?2004ldrwxrwsr-x 2 root mail 10 Oct  1  2025 [0m[01;34m/var/mail[0m
+drwxr-xr-x 1 root root 45 Oct 28  2025 [01;34m/var/spool[0m
+[?2004hroot@b0bd22362a44:/app# mailman --help 2>&1 | sed -n '14,45p'
+[?2004l                     is loaded.
+  -h, --help         Show this message and exit.
+
+Commands:
+  addmembers     Add all member addresses in FILENAME with delivery mode...
+  aliases        Regenerate the aliases appropriate for your MTA.
+  changeaddress  Change a user's email address from old_address to...
+  conf           Print the Mailman configuration.
+  create         Create a mailing list.
+  delmembers     Delete members from a mailing list.
+  digests        Operate on digests.
+  findmember     Display all memberships for a user or users with address...
+  gatenews       Poll the NNTP server for messages to be gatewayed to...
+  help           Show this help message and exit.
+  import21       Import Mailman 2.1 list data.
+  info           Information about this Mailman instance.
+  inject         Inject a message from a file into a mailing list's queue.
+  lists          List all mailing lists.
+  members        Display a mailing list's members.
+  notify         Notify list owners/moderators of pending requests.
+  qfile          Get information out of a queue file.
+  remove         Remove a mailing list.
+  reopen         Signal the Mailman processes to re-open their log files.
+  restart        Stop and restart the Mailman runner subprocesses.
+  shell          Operate on a mailing list.
+  start          Start the Mailman master and runner processes.
+  status         Show the current running status of the Mailman system.
+  stop           Stop the Mailman master and runner processes.
+  syncmembers    Add and delete members as necessary to syncronize a...
+  unshunt        Unshunt messages.
+  version        Display Mailman's version.
+  withlist       Operate on a mailing list.
+mailman master --help 2>&1 | head -25
+[?2004hroot@b0bd22362a44:/app# mailman master --help 2>&1 | head -25
+[?2004lUsage: mailman [OPTIONS] COMMAND [ARGS]...
+Try 'mailman -h' for help.
+
+Error: No such command 'master'.
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg create --help" 2>&1 | head -25
+[?2004lTraceback (most recent call last):
+  File "/usr/bin/mailman", line 33, in <module>
+    sys.exit(load_entry_point('mailman==3.3.8', 'console_scripts', 'mailman')())
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1157, in __call__
+su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg start --help" 2>&1 | head -15
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1077, in main
+    with self.make_context(prog_name, args, **extra) as ctx:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 943, in make_context
+    self.parse_args(ctx, args)
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1644, in parse_args
+    rest = super().parse_args(ctx, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1408, in parse_args
+    value, args = param.handle_parse_result(ctx, opts, args)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 2400, in handle_parse_result
+    value = self.process_value(ctx, value)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 2362, in process_value
+    value = self.callback(ctx, self, value)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/mailman/bin/mailman.py", line 95, in initialize_config
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg start --help" 2>&1 | head -15
+[?2004lsu -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg withlist --help" 2>&1 | head -30
+Traceback (most recent call last):
+  File "/usr/bin/mailman", line 33, in <module>
+    sys.exit(load_entry_point('mailman==3.3.8', 'console_scripts', 'mailman')())
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1157, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1077, in main
+    with self.make_context(prog_name, args, **extra) as ctx:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 943, in make_context
+    self.parse_args(ctx, args)
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1644, in parse_args
+    rest = super().parse_args(ctx, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg withlist --help" 2>&1 | head -30
+[?2004lTraceback (most recent call last):
+  File "/usr/bin/mailman", line 33, in <module>
+    sys.exit(load_entry_point('mailman==3.3.8', 'console_scripts', 'mailman')())
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1157, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1077, in main
+    with self.make_context(prog_name, args, **extra) as ctx:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 943, in make_context
+    self.parse_args(ctx, args)
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1644, in parse_args
+    rest = super().parse_args(ctx, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 1408, in parse_args
+    value, args = param.handle_parse_result(ctx, opts, args)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 2400, in handle_parse_result
+    value = self.process_value(ctx, value)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/click/core.py", line 2362, in process_value
+    value = self.callback(ctx, self, value)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3/dist-packages/mailman/bin/mailman.py", line 95, in initialize_config
+    initialize(value)
+  File "/usr/lib/python3/dist-packages/mailman/core/initialize.py", line 228, in initialize
+    initialize_1(config_path)
+  File "/usr/lib/python3/dist-packages/mailman/core/initialize.py", line 122, in initialize_1
+    mailman.config.config.load(config_path)
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg create --help" 2>&1 | tail -20
+[?2004l  File "/usr/lib/python3/dist-packages/mailman/core/initialize.py", line 228, in initialize
+    initialize_1(config_path)
+  File "/usr/lib/python3/dist-packages/mailman/core/initialize.py", line 122, in initialize_1
+    mailman.config.config.load(config_path)
+  File "/usr/lib/python3/dist-packages/mailman/config/config.py", line 145, in load
+    self.push(filename, user_config.read())
+  File "/usr/lib/python3/dist-packages/mailman/config/config.py", line 151, in push
+    self._post_process()
+  File "/usr/lib/python3/dist-packages/mailman/config/config.py", line 163, in _post_process
+    self.ensure_directories_exist()
+  File "/usr/lib/python3/dist-packages/mailman/config/config.py", line 266, in ensure_directories_exist
+    with Lock(lock_file):
+  File "/usr/lib/python3/dist-packages/flufl/lock/_lockfile.py", line 439, in __enter__
+    self.lock()
+  File "/usr/lib/python3/dist-packages/flufl/lock/_lockfile.py", line 307, in lock
+    self._write()
+  File "/usr/lib/python3/dist-packages/flufl/lock/_lockfile.py", line 467, in _write
+    with open(self._claimfile, 'w') as fp:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: '/var/lib/mailman3/locks/mailman-cfg.lck|b0bd22362a44|1689|4001888460929766246'
+[?2004hroot@b0bd22362a44:/app# ls -la /var/log/ | grep -i mail; ls -la /var/lib/mailman3/
+[?2004ldrwxr-xr-x 1 list list               119 Sep  6 15:04 [01;31m[Kmail[m[Kman3
+total 4
+drwxr-xr-x  1 list list  155 Sep  6 15:04 [0m[01;34m.[0m
+drwxr-xr-x  1 root root   85 Sep  6 13:04 [01;34m..[0m
+drwxr-xr-x  2 root root   10 Sep  6 15:04 [01;34marchives[0m
+drwxr-xr-x  2 root root   10 Sep  6 15:04 [01;34mcache[0m
+drwxrwx---  1 list list   32 Sep  6 15:04 [01;34mdata[0m
+drwxr-xr-x  2 root root   10 Sep  6 15:04 [01;34mlists[0m
+drwxr-xr-x  2 root root   10 Sep  6 15:07 [01;34mlocks[0m
+drwxr-xr-x  2 root root   10 Sep  6 15:04 [01;34mmessages[0m
+drwxr-xr-x 14 root root 4096 Sep  6 15:04 [01;34mqueue[0m
+drwxr-xr-x  2 root root   10 Sep  6 15:04 [01;34mtemplates[0m
+[?2004hroot@b0bd22362a44:/app# chown -R list:list /var/lib/mailman3 /var/log/mailman3; ls -la /var/lib/mailman3/ /var/lib/mailman3/data/ /var/lib/mailman3/lists/ /var/lib/mailman3/queue/ 2>&1 | head -40
+[?2004l/var/lib/mailman3/:
+total 4
+drwxr-xr-x  1 list list  155 Sep  6 15:04 .
+drwxr-xr-x  1 root root   85 Sep  6 13:04 ..
+drwxr-xr-x  2 list list   10 Sep  6 15:04 archives
+drwxr-xr-x  2 list list   10 Sep  6 15:04 cache
+drwxrwx---  1 list list   32 Sep  6 15:04 data
+drwxr-xr-x  2 list list   10 Sep  6 15:04 lists
+drwxr-xr-x  2 list list   10 Sep  6 15:07 locks
+drwxr-xr-x  2 list list   10 Sep  6 15:04 messages
+drwxr-xr-x 14 list list 4096 Sep  6 15:04 queue
+drwxr-xr-x  2 list list   10 Sep  6 15:04 templates
+
+/var/lib/mailman3/data/:
+total 264
+drwxrwx--- 1 list list     32 Sep  6 15:04 .
+drwxr-xr-x 1 list list    155 Sep  6 15:04 ..
+-rw-rw---- 1 list list 270336 Sep  6 15:04 mailman.db
+
+/var/lib/mailman3/lists/:
+total 0
+drwxr-xr-x 2 list list  10 Sep  6 15:04 .
+drwxr-xr-x 1 list list 155 Sep  6 15:04 ..
+
+/var/lib/mailman3/queue/:
+total 4
+drwxr-xr-x 14 list list 4096 Sep  6 15:04 .
+drwxr-xr-x  1 list list  155 Sep  6 15:04 ..
+drwxrwx---  2 list list   10 Sep  6 15:04 archive
+drwxrwx---  2 list list   10 Sep  6 15:04 bad
+drwxrwx---  2 list list   10 Sep  6 15:04 bounces
+drwxrwx---  2 list list   10 Sep  6 15:04 command
+drwxrwx---  2 list list   10 Sep  6 15:04 digest
+drwxrwx---  2 list list   10 Sep  6 15:04 in
+drwxrwx---  2 list list   10 Sep  6 15:04 nntp
+drwxrwx---  2 list list   10 Sep  6 15:04 out
+drwxrwx---  2 list list   10 Sep  6 15:04 pipeline
+drwxrwx---  2 list list   10 Sep  6 15:04 retry
+drwxrwx---  2 list list   10 Sep  6 15:04 shunt
+drwxrwx---  2 list list   10 Sep  6 15:04 virgin
+[?2004hroot@b0bd22362a44:/app# ls /var/log/mailman3/
+[?2004lbounce.log  debug.log  mailman.log  plugins.log  smtp.log
+[?2004hroot@b0bd22362a44:/app# chmod 1777 /var/mail && ls -ld /var/mail
+[?2004ldrwxrwsrwt 1 root mail 6 Oct  1  2025 [0m[30;42m/var/mail[0m
+[?2004hroot@b0bd22362a44:/app# cp /etc/mailman3/mailman.cfg /etc/mailman3/mailman.cfg.bak && sed -i 's/^site_owner:.*$/site_owner: root@local.edu/' /etc/mailman3/mailman.cfg && grep -n "site_owner" /etc/mailman3/mailman.cfg
+[?2004l[32m[K28[m[K[36m[K:[m[K[01;31m[Ksite_owner[m[K: root@local.edu
+[?2004hroot@b0bd22362a44:/app# sed -i 's/^transport_file_type: hash$/transport_file_type: regex/' /usr/lib/python3/dist-packages/mailman/config/postfix.cfg && grep transport_file_type /usr/lib/python3/dist-packages/mailman/config/postfix.cfg
+[?2004l[01;31m[Ktransport_file_type[m[K: regex
+[?2004hroot@b0bd22362a44:/app# rm -f /var/lib/mailman3/data/mailman.db /var/lib/mailman3/data/mailman.db-journal /var/lib/mailman3/data/mailman.db-wal
+[?2004l[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg create --help" 2>&1 | tail -15
+[?2004l                                  Mailman, the address is registered and
+                                  linked to a user. Mailman will send a
+                                  confirmation message to the address, but it
+                                  will also send a list creation notice to the
+                                  address.  More than one owner can be
+                                  specified.
+  -n, --notify / -no-notify, -N   Notify the list owner by email that their
+                                  mailing list has been created.
+  -q, --quiet                     Print less output.
+  -d, --domain / -D, --no-domain  Register the mailing list's domain if not
+                                  yet registered.  This is the default
+                                  behavior, but these options are provided for
+                                  backward compatibility.  With -D do not
+                                  register the mailing list's domain.
+  -h, --help                      Show this message and exit.
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg create --help" > /tmp/help_create.txt 2>&1; echo rc=$?
+[?2004lrc=0
+[?2004hroot@b0bd22362a44:/app# cat /tmp/help_create.txt
+[?2004lUsage: mailman create [OPTIONS] LISTNAME
+
+  Create a mailing list.
+
+  The 'fully qualified list name', i.e. the posting address of the mailing
+  list is required.  It must be a valid email address and the domain must be
+  registered with Mailman.  List names are forced to lower case.
+
+Options:
+  --language CODE                 Set the list's preferred language to CODE,
+                                  which must be a registered two letter
+                                  language code.
+  -o, --owner OWNER               Specify a list owner email address.  If the
+                                  address is not currently registered with
+                                  Mailman, the address is registered and
+                                  linked to a user. Mailman will send a
+                                  confirmation message to the address, but it
+                                  will also send a list creation notice to the
+                                  address.  More than one owner can be
+                                  specified.
+  -n, --notify / -no-notify, -N   Notify the list owner by email that their
+                                  mailing list has been created.
+  -q, --quiet                     Print less output.
+  -d, --domain / -D, --no-domain  Register the mailing list's domain if not
+                                  yet registered.  This is the default
+                                  behavior, but these options are provided for
+                                  backward compatibility.  With -D do not
+                                  register the mailing list's domain.
+  -h, --help                      Show this message and exit.
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg version" 2>&1 | tail -3
+[?2004lGNU Mailman 3.3.8 (Tom Sawyer)
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg create reading-group@local.edu -o root@local.edu" 2>&1
+[?2004lCreated mailing list: reading-group@local.edu
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "cat > /tmp/set_policy.py <<'EOF'
+[?2004l[?2004h> from mailman.core.initialize import initialize
+[?2004l[?2004h> from mailman.interfaces.listmanager import IListManager
+[?2004l[?2004h> from mailman.interfaces.mailinglist import SubscriptionPolicy
+[?2004l[?2004h> from mailman.database.transaction import flush
+[?2004l[?2004h> from zope.component import getUtility
+[?2004l[?2004h> initialize('/etc/mailman3/mailman.cfg')
+[?2004l[?2004h> mlist = getUtility(IListManager).get('reading-group@local.edu')
+[?2004l[?2004h> mlist.subscription_policy = SubscriptionPolicy.confirm
+[?2004l[?2004h> mlist.unsubscription_policy = SubscriptionPolicy.confirm
+[?2004l[?2004h> flush()
+[?2004l[?2004h> print('subscription_policy:', mlist.subscription_policy)
+[?2004l[?2004h> print('unsubscription_policy:', mlist.unsubscription_policy)
+[?2004l[?2004h> print('accept_mail:', mlist.accept_mail)
+[?2004l[?2004h> print('join_address:', mlist.join_address)
+[?2004l[?2004h> print('leave_address:', mlist.leave_address)
+[?2004l[?2004h> EOF
+[?2004l[?2004h> python3 /tmp/set_policy.py" 2>&1
+[?2004lsubscription_policy: SubscriptionPolicy.confirm
+unsubscription_policy: SubscriptionPolicy.confirm
+Traceback (most recent call last):
+  File "/tmp/set_policy.py", line 13, in <module>
+    print('accept_mail:', mlist.accept_mail)
+                          ^^^^^^^^^^^^^^^^^
+AttributeError: 'MailingList' object has no attribute 'accept_mail'
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg lists" 2>&1
+[?2004l1 matching mailing lists found:
+reading-group@local.edu
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg aliases" 2>&1; echo ---; cat /var/lib/mailman3/data/postfix_lmtp 2>&1
+[?2004l---
+# AUTOMATICALLY GENERATED BY MAILMAN ON 2026-09-06 15:22:28
+#
+# This file is generated by Mailman, and is kept in sync with the binary hash
+# file.  YOU SHOULD NOT MANUALLY EDIT THIS FILE unless you know what you're
+# doing, and can keep the two files properly in sync.  If you screw it up,
+# you're on your own.
+    
+# Aliases which are visible only in the @local.edu domain.
+/^reading-group@local\.edu$/                  lmtp:[127.0.0.1]:8024
+/^reading-group-bounces(\+.*)?@local\.edu$/   lmtp:[127.0.0.1]:8024
+/^reading-group-confirm(\+.*)?@local\.edu$/   lmtp:[127.0.0.1]:8024
+/^reading-group-join@local\.edu$/             lmtp:[127.0.0.1]:8024
+/^reading-group-leave@local\.edu$/            lmtp:[127.0.0.1]:8024
+/^reading-group-owner@local\.edu$/            lmtp:[127.0.0.1]:8024
+/^reading-group-request@local\.edu$/          lmtp:[127.0.0.1]:8024
+/^reading-group-subscribe@local\.edu$/        lmtp:[127.0.0.1]:8024
+/^reading-group-unsubscribe@local\.edu$/      lmtp:[127.0.0.1]:8024
+
+[?2004hroot@b0bd22362a44:/app# postconf -e "mydestination = \$myhostname, localhost, localhost.localdomain, local.edu" && postconf -e "transport_maps = regexp:/var/lib/mailman3/data/postfix_lmtp" && postconf -e "mailman_destination_recipient_limit = 1" && postconf mydestination transport_maps mailman_destination_recipient_limit
+[?2004lsu -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg start --help" 2>&1 | tail -10
+postconf: warning: mailman_destination_recipient_limit: unknown parameter
+mydestination = $myhostname, localhost, localhost.localdomain, local.edu
+transport_maps = regexp:/var/lib/mailman3/data/postfix_lmtp
+postconf: warning: /etc/postfix/main.cf: unused parameter: mailman_destination_recipient_limit=1
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg start --help" 2>&1 | tail -10
+[?2004l                             and the program is run as the current user and
+                             group.  This flag is not recommended for normal
+                             production environments.  Note though, that if
+                             you run with -u and are not in the mailman group,
+                             you may have permission problems, such as being
+                             unable to delete a list's archives through the
+                             web.  Tough luck!
+  -q, --quiet                Don't print status messages.  Error messages are
+                             still printed to standard error.
+  -h, --help                 Show this message and exit.
+[?2004hroot@b0bd22362a44:/app# sed -i '/^mailman_destination_recipient_limit/d' /etc/postfix/main.cf && grep -c mailman_destination /etc/postfix/main.cf || true
+[?2004l0
+[?2004hroot@b0bd22362a44:/app# grep -n "foreground\|def start\|daemon\|nohup\|Popen\|subprocess" /usr/lib/python3/dist-packages/mailman/bin/mailman.py | head -20
+[?2004l[?2004hroot@b0bd22362a44:/app# service postfix start 2>&1; sleep 1; postfix status 2>&1
+[?2004lpostfix/postfix-script: starting the Postfix mail system
+   ...done.
+postfix/postfix-script: the Postfix mail system is running: PID: 2245
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg start --help" > /tmp/start_help.txt 2>&1; head -30 /tmp/start_help.txt
+[?2004lUsage: mailman start [OPTIONS]
+
+  Start the Mailman master and runner processes.
+
+Options:
+  -f, --force                If the master watcher finds an existing master
+                             lock, it will normally exit with an error
+                             message.  With this option, the master will
+                             perform an extra level of checking.  If a process
+                             matching the host/pid described in the lock file
+                             is running, the master will still exit, requiring
+                             you to manually clean up the lock.  But if no
+                             matching process is found, the master will remove
+                             the apparently stale lock and make another
+                             attempt to claim the master lock.
+  -g, --generate-alias-file  Generate the MTA alias files upon startup. Some
+                             MTA, like postfix, can't deliver email if alias
+                             files mentioned in its configuration are not
+                             present. In some situations, this could lead to a
+                             deadlock at the first start of mailman3 server.
+                             Setting this option to true will make this script
+                             create the files and thus allow the MTA to
+                             operate smoothly.
+  -u, --run-as-user          Normally, this script will refuse to run if the
+                             user id and group id are not set to the 'mailman'
+                             user and group (as defined when you configured
+                             Mailman).  If run as root, this script will
+                             change to this user and group before the check is
+                             made.  This can be inconvenient for testing and
+                             debugging purposes, so the -u flag means that the
+[?2004hroot@b0bd22362a44:/app# su -s /bin/bash list -c "mailman -C /etc/mailman3/mailman.cfg start -u -g" 2>&1
+[?2004lStarting Mailman's master runner
+[?2004hroot@b0bd22362a44:/app# ss -ltnp 2>/dev/null | grep -E ':25|:8024|:8001|:8025' ; echo ---; tail -20 /var/log/mailman3/mailman.log
+[?2004l---
+Sep 06 15:29:03 2026 (2304) Master started
+[?2004hroot@b0bd22362a44:/app# ps aux | grep -E "mailman|postfix" | grep -v grep | head -20
+[?2004lroot        2245  0.0  0.0  42864  5016 ?        Ss   15:27   0:00 /usr/lib/postfix/sbin/master -w
+postfix     2246  0.0  0.0  42892  7568 ?        S    15:27   0:00 pickup -l -t unix -u -c
+postfix     2247  0.0  0.0  42932  7552 ?        S    15:27   0:00 qmgr -l -t unix -u
+list        2304  1.6  0.0  82572 73556 ?        Ss   15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/master -C /etc/mailman3/mailman.cfg
+list        2305  1.8  0.0  81448 73196 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=archive:0:1
+list        2306  1.9  0.0  84212 75264 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=bounces:0:1
+list        2307  1.7  0.0  81448 73508 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=command:0:1
+list        2308  1.7  0.0  81444 73124 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=in:0:1
+list        2309  1.8  0.0 155196 73392 ?        Sl   15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=lmtp:0:1
+list        2310  1.7  0.0  81444 73432 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=nntp:0:1
+list        2311  1.8  0.0  81444 73260 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=out:0:1
+list        2312  1.9  0.0  81448 73516 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=pipeline:0:1
+list        2313  2.0  0.0  92696 83792 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=rest:0:1
+list        2314  1.8  0.0  81440 73424 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=retry:0:1
+list        2315  1.8  0.0  84188 74888 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=task:0:1
+list        2316  1.8  0.0  81444 73276 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=virgin:0:1
+list        2317  1.7  0.0  81448 73388 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=digest:0:1
+list        2339  0.0  0.0  92696 69932 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=rest:0:1
+list        2340  0.0  0.0  92696 69932 ?        S    15:29   0:00 /usr/bin/python3 /usr/lib/mailman3/bin/runner -C /etc/mailman3/mailman.cfg --runner=rest:0:1
+[?2004hroot@b0bd22362a44:/app# python3 - <<'EOF'
+[?2004l[?2004h> import socket
+[?2004l[?2004h> for port in (25, 8024, 8001):
+[?2004l[?2004h>     s = socket.socket()
+[?2004l[?2004h>     s.settimeout(2)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         s.connect(("127.0.0.1", port))
+[?2004l[?2004h>         print(port, "OPEN")
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print(port, "CLOSED", e)
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         s.close()
+[?2004l[?2004h> EOF
+[?2004l25 OPEN
+8024 OPEN
+8001 OPEN
+[?2004hroot@b0bd22362a44:/app# cat > /tmp/smoke.py <<'EOF'
+[?2004l[?2004h> import mailbox, os, smtplib, sys, time
+[?2004l[?2004h> from email.mime.text import MIMEText
+[?2004l[?2004h> 
+[?2004l[?2004h> def send(frm, to, subject, body, **hdrs):
+[?2004l[?2004h>     msg = MIMEText(body)
+[?2004l[?2004h>     msg["Subject"] = subject
+[?2004l[?2004h>     msg["From"] = frm
+[?2004l[?2004h>     msg["To"] = to
+[?2004l[?2004h>     for k, v in hdrs.items():
+[?2004l[?2004h>         msg[k] = v
+[?2004l[?2004h>     with smtplib.SMTP("localhost", 25) as s:
+[?2004l[?2004h>         s.send_message(msg)
+[?2004l[?2004h> 
+[?2004l[?2004h> def wait_mail(user, pred, timeout=20):
+[?2004l[?2004h>     deadline = time.time() + timeout
+[?2004l[?2004h>     path = f"/var/mail/{user}"
+[?2004l[?2004h>     while time.time() < deadline:
+[?2004l[?2004h>         if os.path.exists(path):
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 mb = mailbox.mbox(path)
+[?2004l[?2004h>             except Exception as e:
+[?2004l[?2004h>                 mb = None
+[?2004l[?2004h>             if mb:
+[?2004l[?2004h>                 for i in range(len(mb)):
+[?2004l[?2004h>                     try:
+[?2004l[?2004h>                         m = mb.get_message(i)
+[?2004l[?2004h>                     except Exception:
+[?2004l[?2004h>                         continue
+[?2004l[?2004h>                     if m and pred(m):
+[?2004l[?2004h>                         return m
+[?2004l[?2004h>         time.sleep(1)
+[?2004l[?2004h>     return None
+[?2004l[?2004h> 
+[?2004l[?2004h> def get_mlist():
+[?2004l[?2004h>     from mailman.core.initialize import initialize
+[?2004l[?2004h>     from mailman.interfaces.listmanager import IListManager
+[?2004l[?2004h>     from zope.component import getUtility
+[?2004l[?2004h>     initialize("/etc/mailman3/mailman.cfg")
+[?2004l[?2004h>     return getUtility(IListManager).get("reading-group@local.edu")
+[?2004l[?2004h> 
+[?2004l[?2004h> u1, u2 = "smokea", "smokeb"
+[?2004l[?2004h> os.system(f"useradd {u1} 2>/dev/null; useradd {u2} 2>/dev/null")
+[?2004l[?2004h> os.remove(f"/var/mail/{u1}") if os.path.exists(f"/var/mail/{u1}") else None
+[?2004l[?2004h> os.remove(f"/var/mail/{u2}") if os.path.exists(f"/var/mail/{u2}") else None
+[?2004l[?2004h> 
+[?2004l[?2004h> # 1) direct delivery
+[?2004l[?2004h> send(f"tester@local.edu", f"{u1}@local.edu", "DirectTest", "hi")
+[?2004l[?2004h> print("direct:", bool(wait_mail(u1, lambda m: m.get("Subject") == "DirectTest")))
+[?2004l[?2004h> 
+[?2004l[?2004h> # 2) join flow
+[?2004l[?2004h> send(f"{u1}@local.edu", "reading-group-join@local.edu", "", "")
+[?2004l[?2004h> c = wait_mail(u1, lambda m: m.get("From", "").startswith("reading-group-confirm") and "join" in m.get("Subject", ""))
+[?2004l[?2004h> print("join-confirm:", bool(c))
+[?2004l[?2004h> if c:
+[?2004l[?2004h>     print("  from:", c.get("From"))
+[?2004l[?2004h>     print("  subject:", c.get("Subject"))
+[?2004l[?2004h> send(f"{u1}@local.edu", c.get("From"), "", "")
+[?2004l[?2004h> def is_member():
+[?2004l[?2004h>     ml = get_mlist()
+[?2004l[?2004h>     return ml.members.get_member(f"{u1}@local.edu") is not None
+[?2004l[?2004h> ok = False
+[?2004l[?2004h> for _ in range(20):
+[?2004l[?2004h>     if is_member():
+[?2004l[?2004h>         ok = True
+[?2004l[?2004h>         break
+[?2004l[?2004h>     time.sleep(1)
+[?2004l[?2004h> print("now-member:", ok)
+[?2004l[?2004h> 
+[?2004l[?2004h> # 3) announce
+[?2004l[?2004h> send(f"{u1}@local.edu", "reading-group@local.edu", "AnnounceTest", "hello group")
+[?2004l[?2004h> m2 = wait_mail(u1, lambda m: m.get("Subject") == "AnnounceTest" and u1 == m.get("To", "").split("<")[-1].rstrip(">").split("@local.edu")[0] or m.get("Subject") == "AnnounceTest")
+[?2004l[?2004h> print("announce-delivered:", bool(m2), (m2.get("Subject"), m2.get("To")) if m2 else None)
+[?2004l[?2004h> 
+[?2004l[?2004h> # 4) leave flow
+[?2004l[?2004h> send(f"{u1}@local.edu", "reading-group-leave@local.edu", "", "")
+[?2004l[?2004h> c2 = wait_mail(u1, lambda m: m.get("From", "").startswith("reading-group-confirm") and "leave" in m.get("Subject", ""))
+[?2004l[?2004h> print("leave-confirm:", bool(c2))
+[?2004l[?2004h> if c2:
+[?2004l[?2004h>     print("  from:", c2.get("From"))
+[?2004l[?2004h>     print("  subject:", c2.get("Subject"))
+[?2004l[?2004h> send(f"{u1}@local.edu", c2.get("From"), "", "")
+[?2004l[?2004h> ok2 = True
+[?2004l[?2004h> for _ in range(20):
+[?2004l[?2004h>     if not is_member():
+[?2004l[?2004h>         ok2 = True
+[?2004l[?2004h>         break
+[?2004l[?2004h>     ok2 = False
+[?2004l[?2004h>     time.sleep(1)
+[?2004l[?2004h> print("now-not-member:", ok2)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0bd22362a44:/app# python3 /tmp/smoke.py
+[?2004ldirect: True
+Traceback (most recent call last):
+  File "/tmp/smoke.py", line 51, in <module>
+    send(f"{u1}@local.edu", "reading-group-join@local.edu", "", "")
+  File "/tmp/smoke.py", line 12, in send
+    s.send_message(msg)
+  File "/usr/lib/python3.12/smtplib.py", line 975, in send_message
+    return self.sendmail(from_addr, to_addrs, flatmsg, mail_options,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/smtplib.py", line 890, in sendmail
+    raise SMTPRecipientsRefused(senderrs)
+smtplib.SMTPRecipientsRefused: {'reading-group-join@local.edu': (550, b'5.1.1 <reading-group-join@local.edu>: Recipient address rejected: User unknown in local recipient table')}
+[?2004hroot@b0bd22362a44:/app# tail -30 /var/log/mail.log 2>/dev/null | grep -E "postfix|transport|regexp" | tail -15
+[?2004l[?2004hroot@b0bd22362a44:/app# chmod 755 /var/lib/mailman3/data /var/lib/mailman3/data/mailman.db 2>/dev/null; chmod 644 /var/lib/mailman3/data/mailman.db 2>/dev/null; ls -la /var/lib/mailman3/data/
+[?2004ltotal 272
+drwxr-xr-x 1 list list     83 Sep  6 15:22 [0m[01;34m.[0m
+drwxr-xr-x 1 list list    155 Sep  6 15:04 [01;34m..[0m
+-rw-r--r-- 1 list list 270336 Sep  6 15:22 mailman.db
+-rw-rw---- 1 list list    340 Sep  6 15:22 postfix_domains
+-rw-rw---- 1 list list    990 Sep  6 15:22 postfix_lmtp
+[?2004hroot@b0bd22362a44:/app# su -s /bin/sh nobody -c "cat /var/lib/mailman3/data/postfix_lmtp >/dev/null" 2>&1; echo readable_rc=$?
+[?2004lcat: /var/lib/mailman3/data/postfix_lmtp: Permission denied
+readable_rc=1
+[?2004hroot@b0bd22362a44:/app# chmod 644 /var/lib/mailman3/data/postfix_lmtp /var/lib/mailman3/data/postfix_domains 2>/dev/null; su -s /bin/sh nobody -c "cat /var/lib/mailman3/data/postfix_lmtp >/dev/null 2>&1"; echo readable_rc=$?
+[?2004lreadable_rc=0
+[?2004hroot@b0bd22362a44:/app# userdel -f smokea 2>/dev/null; userdel -f smokeb 2>/dev/null; rm -f /var/mail/smokea /var/mail/smokeb; python3 /tmp/smoke.py
+[?2004ldirect: True
+Traceback (most recent call last):
+  File "/tmp/smoke.py", line 51, in <module>
+    send(f"{u1}@local.edu", "reading-group-join@local.edu", "", "")
+  File "/tmp/smoke.py", line 12, in send
+    s.send_message(msg)
+  File "/usr/lib/python3.12/smtplib.py", line 975, in send_message
+    return self.sendmail(from_addr, to_addrs, flatmsg, mail_options,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/smtplib.py", line 890, in sendmail
+    raise SMTPRecipientsRefused(senderrs)
+smtplib.SMTPRecipientsRefused: {'reading-group-join@local.edu': (550, b'5.1.1 <reading-group-join@local.edu>: Recipient address rejected: User unknown in local recipient table')}
+[?2004hroot@b0bd22362a44:/app# postconf -n | grep -E "transport|mydestination|local_recipient"; postconf -m | head -5
+[?2004l[01;31m[Kmydestination[m[K = $myhostname, localhost, localhost.localdomain, local.edu
+[01;31m[Ktransport[m[K_maps = regexp:/var/lib/mailman3/data/postfix_lmtp
+btree
+cidr
+environ
+fail
+hash
+[?2004hroot@b0bd22362a44:/app# postmap -q "reading-group-join@local.edu" regexp:/var/lib/mailman3/data/postfix_lmtp; echo rc=$?
+[?2004llmtp:[127.0.0.1]:8024
+rc=0
+[?2004hroot@b0bd22362a44:/app# postmap -q "reading-group-confirm+abc@local.edu" regexp:/var/lib/mailman3/data/postfix_lmtp; echo rc=$?
+[?2004llmtp:[127.0.0.1]:8024
+rc=0
+[?2004hroot@b0bd22362a44:/app# postconf -e "maillog_file = /var/log/postfix.log" && postfix reload && sleep 1
+[?2004lpostfix/postfix-script: refreshing the Postfix mail system
+python3 -c "
+import smtplib
+s = smtplib.SMTP('localhost', 25)
+print(s.ehlo())
+print(s.docmd('MAIL FROM:<tester@local.edu>'))
+print(s.docmd('RCPT TO:<reading-group-join@local.edu>'))
+s.quit()
+" 2>&1
+[?2004hroot@b0bd22362a44:/app# python3 -c "
+[?2004l[?2004h> import smtplib
+[?2004l[?2004h> s = smtplib.SMTP('localhost', 25)
+[?2004l[?2004h> print(s.ehlo())
+[?2004l[?2004h> print(s.docmd('MAIL FROM:<tester@local.edu>'))
+[?2004l[?2004h> print(s.docmd('RCPT TO:<reading-group-join@local.edu>'))
+[?2004l[?2004h> s.quit()
+[?2004l[?2004h> " 2>&1
+[?2004l(250, b'localhost.local\nPIPELINING\nSIZE 10240000\nVRFY\nETRN\nSTARTTLS\nENHANCEDSTATUSCODES\n8BITMIME\nDSN\nSMTPUTF8\nCHUNKING')
+(250, b'2.1.0 Ok')
+(550, b'5.1.1 <reading-group-join@local.edu>: Recipient address rejected: User unknown in local recipient table')
+[?2004hroot@b0bd22362a44:/app# sleep 2; grep -E "reading-group|transport|regexp|warning|error" /var/log/postfix.log | tail -20
+[?2004lSep 06 15:46:04 localhost postfix/smtpd[2590]: NOQUEUE: reject: RCPT from localhost[::1]: 550 5.1.1 <reading-group-join@local.edu>: Recipient address rejected: User unknown in local recipient table; from=<tester@local.edu> to=<reading-group-join@local.edu> proto=ESMTP helo=<[172.81.59.2]>
+[?2004hroot@b0bd22362a44:/app# printf 'From: tester@local.edu\nTo: reading-group-join@local.edu\nSubject: t1\n\nbody line\n' | sendmail -t; echo sendmail_rc=$?; sleep 3; postqueue -p
+[?2004lsendmail_rc=0
+Mail queue is empty
+[?2004hroot@b0bd22362a44:/app# tail -30 /var/log/postfix.log
+[?2004lSep 06 15:46:03 localhost postfix/postfix-script[2575]: refreshing the Postfix mail system
+Sep 06 15:46:04 localhost postfix/smtpd[2590]: connect from localhost[::1]
+Sep 06 15:46:04 localhost postfix/smtpd[2590]: NOQUEUE: reject: RCPT from localhost[::1]: 550 5.1.1 <reading-group-join@local.edu>: Recipient address rejected: User unknown in local recipient table; from=<tester@local.edu> to=<reading-group-join@local.edu> proto=ESMTP helo=<[172.81.59.2]>
+Sep 06 15:46:04 localhost postfix/smtpd[2590]: disconnect from localhost[::1] ehlo=1 mail=1 rcpt=0/1 quit=1 commands=3/4
+Sep 06 15:49:25 localhost postfix/pickup[2582]: 837EA58D180DCC: uid=0 from=<root>
+Sep 06 15:49:25 localhost postfix/cleanup[2626]: 837EA58D180DCC: message-id=<20260906154925.837EA58D180DCC@localhost.local>
+Sep 06 15:49:25 localhost postfix/qmgr[2581]: 837EA58D180DCC: from=<root@localhost.local>, size=304, nrcpt=1 (queue active)
+Sep 06 15:49:25 localhost postfix/lmtp[2630]: 837EA58D180DCC: to=<reading-group-join@local.edu>, relay=127.0.0.1[127.0.0.1]:8024, delay=0.07, delays=0.02/0.01/0/0.04, dsn=2.0.0, status=sent (250 Ok)
+Sep 06 15:49:25 localhost postfix/qmgr[2581]: 837EA58D180DCC: removed
+Sep 06 15:49:27 localhost postfix/smtpd[2631]: connect from localhost[::1]
+Sep 06 15:49:27 localhost postfix/smtpd[2631]: NOQUEUE: reject: RCPT from localhost[::1]: 550 5.1.1 <tester@local.edu>: Recipient address rejected: User unknown in local recipient table; from=<reading-group-bounces@local.edu> to=<tester@local.edu> proto=ESMTP helo=<[172.81.59.2]>
+Sep 06 15:49:27 localhost postfix/smtpd[2631]: disconnect from localhost[::1] ehlo=1 mail=1 rcpt=0/1 rset=1 quit=1 commands=4/5
+[?2004hroot@b0bd22362a44:/app# find /var/lib/mailman3/queue -type f | head; echo ---; tail -5 /var/log/mailman3/mailman.log
+[?2004l---
+    return step()
+           ^^^^^^
+  File "/usr/lib/python3/dist-packages/mailman/app/subscriptions.py", line 382, in _step_send_confirmation
+    raise StopIteration
+StopIteration
+[?2004hroot@b0bd22362a44:/app# tail -40 /var/log/mailman3/mailman.log
+[?2004lSep 06 15:29:03 2026 (2304) Master started
+Sep 06 15:29:10 2026 (2305) archive runner started.
+Sep 06 15:29:11 2026 (2312) pipeline runner started.
+Sep 06 15:29:11 2026 (2306) bounces runner started.
+Sep 06 15:29:11 2026 (2313) rest runner started.
+Sep 06 15:29:11 2026 (2310) nntp runner started.
+[2026-09-06 15:29:11 +0000] [2313] [INFO] Starting gunicorn 20.1.0
+[2026-09-06 15:29:11 +0000] [2313] [INFO] Listening at: http://127.0.0.1:8001 (2313)
+Sep 06 15:29:11 2026 (2316) virgin runner started.
+[2026-09-06 15:29:11 +0000] [2313] [INFO] Using worker: sync
+[2026-09-06 15:29:11 +0000] [2339] [INFO] Booting worker with pid: 2339
+[2026-09-06 15:29:11 +0000] [2340] [INFO] Booting worker with pid: 2340
+Sep 06 15:29:11 2026 (2314) retry runner started.
+Sep 06 15:29:11 2026 (2308) in runner started.
+Sep 06 15:29:12 2026 (2307) command runner started.
+Sep 06 15:29:12 2026 (2317) digest runner started.
+Sep 06 15:29:12 2026 (2311) out runner started.
+Sep 06 15:29:12 2026 (2309) lmtp runner started.
+Sep 06 15:29:12 2026 (2315) task runner started.
+Sep 06 15:29:12 2026 (2315) Task runner evicted 0 expired pendings
+Sep 06 15:29:12 2026 (2315) Task runner deleted 0 orphaned workflows
+Sep 06 15:29:12 2026 (2315) Task runner deleted 0 orphaned requests
+Sep 06 15:29:12 2026 (2315) Task runner deleted 0 orphaned messages
+Sep 06 15:29:12 2026 (2315) Task runner evicted expired cache entries
+Sep 06 15:49:26 2026 (2307) deque: do_confirm_verify
+Traceback (most recent call last):
+  File "/usr/lib/python3/dist-packages/mailman/app/workflow.py", line 69, in __next__
+    return step()
+           ^^^^^^
+  File "/usr/lib/python3/dist-packages/mailman/app/subscriptions.py", line 382, in _step_send_confirmation
+    raise StopIteration
+StopIteration
+[?2004hroot@b0bd22362a44:/app# postconf -e "disable_local_recipient_check = yes" && postfix reload && sleep 1
+[?2004lpython3 -c "
+import smtplib
+s = smtplib.SMTP('localhost', 25)
+print(s.docmd('MAIL FROM:<tester@local.edu>'))
+print(s.docmd('RCPT TO:<reading-group-join@local.edu>'))
+print(s.docmd('DATA'))
+s.sendall(b'Subject: t2\r\n\r\n.\r\n')
+print(s.docmd('QUIT'))
+" 2>&1; sleep 2; tail -5 /var/log/postfix.log
+/usr/sbin/postconf: warning: /etc/postfix/main.cf: unused parameter: disable_local_recipient_check=yes
+postfix/postfix-script: refreshing the Postfix mail system
+[?2004hroot@b0bd22362a44:/app# python3 -c "
+[?2004l[?2004h> import smtplib
+[?2004l[?2004h> s = smtplib.SMTP('localhost', 25)
+[?2004l[?2004h> print(s.docmd('MAIL FROM:<tester@local.edu>'))
+[?2004l[?2004h> print(s.docmd('RCPT TO:<reading-group-join@local.edu>'))
+[?2004l[?2004h> print(s.docmd('DATA'))
+[?2004l[?2004h> s.sendall(b'Subject: t2\r\n\r\n.\r\n')
+[?2004l[?2004h> print(s.docmd('QUIT'))
+[?2004l[?2004h> " 2>&1; sleep 2; tail -5 /var/log/postfix.log
+[?2004l(250, b'2.1.0 Ok')
+(550, b'5.1.1 <reading-group-join@local.edu>: Recipient address rejected: User unknown in local recipient table')
+(554, b'5.5.1 Error: no valid recipients')
+Traceback (most recent call last):
+  File "<string>", line 7, in <module>
+AttributeError: 'SMTP' object has no attribute 'sendall'. Did you mean: 'sendmail'?
+Sep 06 15:58:24 localhost postfix/master[2245]: reload -- version 3.8.6, configuration /etc/postfix
+Sep 06 15:58:25 localhost postfix/smtpd[2711]: connect from localhost[::1]
+Sep 06 15:58:25 localhost postfix/smtpd[2711]: NOQUEUE: reject: RCPT from localhost[::1]: 550 5.1.1 <reading-group-join@local.edu>: Recipient address rejected: User unknown in local recipient table; from=<tester@local.edu> to=<reading-group-join@local.edu> proto=SMTP
+Sep 06 15:58:25 localhost postfix/smtpd[2711]: lost connection after DATA from localhost[::1]
+Sep 06 15:58:25 localhost postfix/smtpd[2711]: disconnect from localhost[::1] mail=1 rcpt=0/1 data=0/1 commands=1/3
+[?2004hroot@b0bd22362a44:/app# postconf -e "mydestination = \$myhostname, localhost, localhost.localdomain" && postconf -e "virtual_mailbox_domains = local.edu" && postconf -e "virtual_transport = lmtp:127.0.0.1:8024" && postconf -e "virtual_transport_maps = regexp:/etc/postfix/mailman-vtrans" && postconf -e "transport_maps =" && sed -i '/^disable_local_recipient_check/d' /etc/postfix/main.cf
+[?2004l[?2004hroot@b0bd22362a44:/app# cat > /etc/postfix/mailman-vtrans <<'EOF'
+[?2004l[?2004h> # Routing for local.edu: reading-group* goes to Mailman LMTP, everyone else to local delivery.
+[?2004l[?2004h> ^reading-group([.@+-].*)?@local\.edu$    lmtp:[127.0.0.1]:8024
+[?2004l[?2004h> ^([^@]+)@local\.edu$                     local:$1@local.edu
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0bd22362a44:/app# chmod 644 /etc/postfix/mailman-vtrans; cat /etc/postfix/mailman-vtrans
+[?2004l# Routing for local.edu: reading-group* goes to Mailman LMTP, everyone else to local delivery.
+^reading-group([.@+-].*)?@local\.edu$    lmtp:[127.0.0.1]:8024
+^([^@]+)@local\.edu$                     local:$1@local.edu
+[?2004hroot@b0bd22362a44:/app# postfix reload && sleep 1
+[?2004l/usr/sbin/postconf: warning: /etc/postfix/main.cf: unused parameter: virtual_transport_maps=regexp:/etc/postfix/mailman-vtrans
+postfix/postfix-script: refreshing the Postfix mail system
+[?2004hroot@b0bd22362a44:/app# python3 -c "
+[?2004l[?2004h> import smtplib
+[?2004l[?2004h> s = smtplib.SMTP('localhost', 25)
+[?2004l[?2004h> print(s.docmd('MAIL FROM:<tester@local.edu>'))
+[?2004l[?2004h> print(s.docmd('RCPT TO:<reading-group-join@local.edu>'))
+[?2004l[?2004h> print(s.docmd('QUIT'))
+[?2004l[?2004h> " 2>&1
+[?2004l(250, b'2.1.0 Ok')
+(250, b'2.1.5 Ok')
+(221, b'2.0.0 Bye')
+[?2004hroot@b0bd22362a44:/app# postconf -d | grep -E "^virtual_" | head
+[?2004lvirtual_alias_address_length_limit = 1000
+virtual_alias_domains = $virtual_alias_maps
+virtual_alias_expansion_limit = 1000
+virtual_alias_maps = $virtual_maps
+virtual_alias_recursion_limit = 1000
+virtual_delivery_slot_cost = $default_delivery_slot_cost
+virtual_delivery_slot_discount = $default_delivery_slot_discount
+virtual_delivery_slot_loan = $default_delivery_slot_loan
+virtual_delivery_status_filter = $default_delivery_status_filter
+virtual_destination_concurrency_failed_cohort_limit = $default_destination_concurrency_failed_cohort_limit
+[?2004hroot@b0bd22362a44:/app# useradd -M vtest1 2>/dev/null; python3 -c "
+[?2004l[?2004h> import smtplib
+[?2004l[?2004h> from email.mime.text import MIMEText
+[?2004l[?2004h> msg = MIMEText('hello vtest1')
+[?2004l[?2004h> msg['Subject'] = 'VTest1'
+[?2004l[?2004h> msg['From'] = 'tester@local.edu'
+[?2004l[?2004h> msg['To'] = 'vtest1@local.edu'
+[?2004l[?2004h> with smtplib.SMTP('localhost', 25) as s:
+[?2004l[?2004h>     s.send_message(msg)
+[?2004l[?2004h> print('sent')
+[?2004l[?2004h> "; sleep 3; grep -l VTest1 /var/mail/vtest1 2>/dev/null || tail -3 /var/log/postfix.log
+[?2004lsent
+Sep 06 16:04:57 localhost postfix/qmgr[2770]: A09E558D3C74BC: removed
+Sep 06 16:04:57 localhost postfix/lmtp[2821]: A686358D3C74BF: to=<tester@local.edu>, relay=127.0.0.1[127.0.0.1]:8024, delay=0.01, delays=0/0/0/0, dsn=5.0.0, status=bounced (host 127.0.0.1[127.0.0.1] said: 550 Requested action not taken: mailbox unavailable (in reply to RCPT TO command))
+Sep 06 16:04:57 localhost postfix/qmgr[2770]: A686358D3C74BF: removed
+[?2004hroot@b0bd22362a44:/app# postconf -d | grep -E "^virtual_transport|^mydestination"; echo ---; ls -la /var/mail/ ; grep -E "A09E558D3C74BC|vtest1" /var/log/postfix.log | tail -10
+[?2004l[01;31m[Kmydestination[m[K = $myhostname, localhost.$mydomain, localhost
+[01;31m[Kvirtual_transport[m[K = virtual
+[01;31m[Kvirtual_transport[m[K_rate_delay = $default_transport_rate_delay
+---
+total 4
+drwxrwsrwt 1 root   mail  28 Sep  6 15:40 [0m[30;42m.[0m
+drwxr-xr-x 1 root   root  90 Oct  1  2025 [01;34m..[0m
+-rw------- 1 smokea mail 585 Sep  6 15:40 smokea
+Sep 06 16:04:57 localhost postfix/smtpd[2779]: A09E558D3C74BC: client=localhost[::1]
+Sep 06 16:04:57 localhost postfix/cleanup[2784]: A09E558D3C74BC: message-id=<20260906160457.A09E558D3C74BC@localhost.local>
+Sep 06 16:04:57 localhost postfix/qmgr[2770]: A09E558D3C74BC: from=<tester@local.edu>, size=460, nrcpt=1 (queue active)
+Sep 06 16:04:57 localhost postfix/lmtp[2821]: A09E558D3C74BC: to=<vtest1@local.edu>, relay=127.0.0.1[127.0.0.1]:8024, delay=0.03, delays=0.01/0.01/0/0.01, dsn=5.0.0, status=bounced (host 127.0.0.1[127.0.0.1] said: 550 Requested action not taken: mailbox unavailable (in reply to RCPT TO command))
+Sep 06 16:04:57 localhost postfix/bounce[2823]: A09E558D3C74BC: sender non-delivery notification: A686358D3C74BF
+Sep 06 16:04:57 localhost postfix/qmgr[2770]: A09E558D3C74BC: removed
+[?2004hroot@b0bd22362a44:/app# Sep 06 18:05:11 2026 (2306) Running detector: <class 'flufl.bounce._detectors.dsn.DSN'>

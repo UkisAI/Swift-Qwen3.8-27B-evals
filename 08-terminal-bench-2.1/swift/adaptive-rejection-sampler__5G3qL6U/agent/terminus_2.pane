@@ -1,0 +1,2341 @@
+[?2004hroot@a8ff99d7b1c6:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@a8ff99d7b1c6:/app# clear
+[?2004l[H[J[3J[?2004hroot@a8ff99d7b1c6:/app# which R Rscript; R --version 2>/dev/null | head -2
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# ls /app
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# cat /etc/os-release | head -3
+[?2004lPRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+[?2004hroot@a8ff99d7b1c6:/app# apt-get update -qq 2>&1 | tail -2
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# DEBIAN_FRONTEND=noninteractive apt-get install -y -qq r-base-core 2>&1 | tail -3
+[?2004lSetting up libxml-twig-perl (1:3.52-2) ...
+Setting up libnet-dbus-perl (1.2.0-2build3) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.8) ...
+[?2004hroot@a8ff99d7b1c6:/app# cat > /app/ars.R << 'EOF'
+[?2004l[?2004h> # ============================================================================
+[?2004l[?2004h> # Adaptive Rejection Sampling (ARS)
+[?2004l[?2004h> #
+[?2004l[?2004h> # Implementation of: Gilks, W.R. & Wild, P. (1992). "Adaptive rejection
+[?2004l[?2004h> # sampling for Gibbs sampling." Journal of the Royal Statistical Society,
+[?2004l[?2004h> # Series C (Applied Statistics), 41(2), 337-348.
+[?2004l[?2004h> #
+[?2004l t[?2004h> # Design / style conventions:
+[?2004l[?2004h> #   * Plain functions in snake_case, all helpers share the 'ars_' prefix.
+[?2004l[?2004h> #   * The sampler state (the "envelope") is a list with components:
+[?2004l[?2004h> #       left, right     : domain endpoints (possibly +/- Inf)
+[?2004l[?2004h> #       x               : support points, strictly increasing
+[?2004l[?2004h> #       h               : h(x_i) = log of the (unnormalized) density
+[?2004l[?2004h> #       z               : tangent slopes h'(x_i), strictly decreasing
+[?2004l[?2004h> #       intercept       : tangent intercepts c_i = h(x_i) - z_i x_i
+[?2004l[?2004h> #       u               : piece boundaries of the upper hull, length k+1
+[?2004l[?2004h> #   * Module map (one discrete task per function):
+[?2004l[?2004h> #       ars_validate_inputs   - validate user inputs
+[?2004l[?2004h> #       ars_make_log_density  - close over f(x) to give vectorized h(x)
+[?2004l[?2004h> #       ars_derivative        - numerical derivative of h (central diff.)
+[?2004l[?2004h> #       ars_initialize        - choose initial tangent points
+[?2004l[?2004h> #       ars_probe_end         - walk outward towards an infinite boundary
+[?2004l[?2004h> #       ars_make_envelope     - build envelope from starting points
+[?2004l[?2004h> #       ars_check_concavity   - log-concavity check (decreasing slopes)
+[?2004l[?2004h> #       ars_check_tails       - integrability at infinite boundaries
+[?2004l[?2004h> #       ars_compute_u         - tangent intersections / piece pruning
+[?2004l[?2004h> #       ars_log_piece_weights - log-integrals of each upper-hull piece
+[?2004l[?2004h> #       ars_sample_envelope   - draw a proposal from the upper hull
+[?2004l[?2004h> #       ars_upper_hull        - evaluate u(x*) (the upper hull)
+[?2004l[?2004h> #       ars_lower_hull        - evaluate l(x*) (the lower hull / squeeze)
+[?2004l[?2004h> #       ars_update            - fold an accepted point into the envelope
+[?2004l[?2004h> #       ars                   - main sampling driver
+[?2004l[?2004h> #       test                  - formal test suite with known truths
+[?2004l[?2004h> #
+[?2004lbl[?2004h> # Usage examples:
+[?2004l[?2004h> #   source("/app/ars.R")
+[?2004l[?2004h> #   s <- ars(dnorm, c(-Inf, Inf), n = 1000)          # standard normal
+[?2004l[?2004h> #   s <- ars(dexp, c(0, Inf), n = 1000)              # Exponential(1)
+[?2004l[?2004h> #   s <- ars(function(x) dgamma(x, 3, 1), c(0, Inf)) # Gamma(3, 1)
+[?2004l[?2004h> #   test()                                            # run the test suite
+[?2004l[?2004h> # ============================================================================
+[?2004l[?2004h> 
+[?2004l[?2004h> ars_params <- list(
+[?2004l[?2004h>   slope_tol    = 1e-4,   # tolerance for numerical slope comparisons
+[?2004l[?2004h>   probe_margin = 0.5,    # log-density drop required when probing tails
+[?2004l[?2004h>   probe_max    = 300,    # max probe iterations per side
+[?2004l[?2004h>   min_sep      = 1e-4,   # minimum separation between support points
+[?2004l[?2004h>   max_points   = 200     # cap on number of support points (envelope maturity)
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # 1. Input validation
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> ars_validate_inputs <- function(density_function, domain, n) {
+[?2004l[?2004h>   if (!is.function(density_function))
+[?2004l[?2004h>     stop("ARS: 'density_function' must be a function, e.g. dnorm. ",
+[?2004l[?2004h>          "Got class: ", paste(class(density_function), collapse = ", "))
+[?2004l[?2004h>   if (!is.numeric(n) || length(n) != 1L || is.na(n) || n < 1 || n != floor(n))
+[?2004l[?2004h>     stop("ARS: 'n' must be a positive integer, got: ", n)
+[?2004l[?2004h>   if (!is.numeric(domain) || length(domain) != 2L || anyNA(domain))
+[?2004l[?2004h>     stop("ARS: 'domain' must be a numeric vector of length 2, e.g. c(0, Inf)")
+[?2004l[?2004h>   if (domain[1] >= domain[2])
+[?2004l[?2004h>     stop("ARS: invalid 'domain': lower bound (",
+[?2004l[?2004h>          domain[1], ") must be strictly less than upper bound (",
+[?2004l[?2004h>          domain[2], ")")
+[?2004l[?2004h>   # vectorizability: f applied to a length-2 vector must return a length-2
+[?2004l[?2004h>   # numeric vector (like the 'd*' family of R distributions)
+[?2004l[?2004h>   if (is.finite(domain[1]) && is.finite(domain[2])) {
+[?2004l[?2004h>     span <- domain[2] - domain[1]
+[?2004l[?2004h>     probe_points <- domain[1] + c(0.25, 0.5) * span
+[?2004l[?2004h>   } else {
+[?2004l[?2004h>     probe_points <- c(0, 1)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   vv <- density_function(probe_points)
+[?2004l[?2004h>   if (!is.numeric(vv) || length(vv) != 2L)
+[?2004l[?2004h>     stop("ARS: 'density_function' must be vectorized: evaluating it at a ",
+[?2004l[?2004h>          "length-2 vector must return a length-2 numeric vector")
+[?2004l[?2004h>   if (!any(is.finite(vv)))
+[?2004l[?2004h>     stop("ARS: the density is zero at the probe points ",
+[?2004l[?2004h>          paste(probe_points, collapse = ", "), " - density must be positive ",
+[?2004l[?2004h>          "somewhere in the given domain")
+[?2004l[?2004h>   invisible(TRUE)
+[?2004l[?2004h> }
+[?2004le [?2004h> 
+[?2004ld[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # 2. Density helpers
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l_[?2004h> ars_make_log_density <- function(density_function) {
+[?2004l[?2004h>   force(density_function)
+[?2004l[?2004h>   function(x) {
+[?2004l[?2004h>     f_val <- as.numeric(density_function(x))
+[?2004l[?2004h>     ifelse(f_val > 0, log(f_val), -Inf)
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l [?2004h> # Central (falling back to one-sided) finite-difference derivative of h.
+[?2004l[?2004h> ars_derivative <- function(h, x) {
+[?2004lz[?2004h>   d <- 1e-6 * max(1, abs(x))
+[?2004l[?2004h>   xm <- h(x - d); xp <- h(x + d); x0 <- h(x)
+[?2004l[?2004h>   ok_m <- is.finite(xm); ok_p <- is.finite(xp)
+[?2004l[?2004h>   if (ok_m && ok_p) (xp - xm) / (2 * d)
+[?2004l[?2004h>   else if (ok_p) (xp - x0) / d
+[?2004l[?2004h>   else if (ok_m) (x0 - xm) / d
+[?2004l[?2004h>   else NA_real_
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004lo[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # 3. Envelope construction and invariants
+[?2004l
+[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Log-concavity certificate: for a log-concave h the tangent slopes z must
+[?2004l[?2004h> # decrease as x increases; a violation => stop with an informative error.
+[?2004l[?2004h> ars_check_concavity <- function(env) {
+[?2004l "[?2004h>   if (length(env$z) >= 2 && any(diff(env$z) > ars_params$slope_tol))
+[?2004l[?2004h>     stop("ARS: density does not appear to be log-concave: adjacent tangent ",
+[?2004l[?2004h>          "slopes are not decreasing (recent slopes = ",
+[?2004l[?2004h>          paste(round(tail(env$z, 3L), 5), collapse = ", "), ")")
+[?2004l[?2004h>   env
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004ls[?2004h> # For unbounded domains the outermost tangents must point "downward" away
+[?2004lre[?2004h> # from the domain, otherwise the (and hence the) density is not integrable.
+[?2004l[?2004h> ars_check_tails <- function(env) {
+[?2004l[?2004h>   tol <- ars_params$slope_tol
+[?2004l[?2004h>   if (env$left == -Inf && env$z[1L] <= tol)
+[?2004l0.2[?2004h>     stop("ARS: density is not integrable at the left end: the tangent slope ",
+[?2004l[?2004h>          "at the leftmost support point is not > 0 (density must decay to 0 ",
+[?2004l[?2004h>          "as x -> -Inf)")
+[?2004l[?2004h>   if (env$right == Inf && env$z[length(env$z)] >= -tol)
+[?2004l[?2004h>     stop("ARS: density is not integrable at the right end: the tangent slope ",
+[?2004l[?2004h>          "at the rightmost support point is not < 0 (density must decay to 0 ",
+[?2004l[?2004h>          "as x -> +Inf)")
+[?2004l[?2004h>   env
+[?2004l[?2004h> }
+[?2004l
+ [?2004h> 
+[?2004l [?2004h> # Tangent intersections u_i = (c_{i+1} - c_i) / (z_i - z_{i+1}), with the
+[?2004l[?2004h> # pieces of any redundant (dominated) tangent removed. This keeps the upper
+[?2004l[?2004h> # hull = max of tangents exact while tolerating numerically parallel
+[?2004l[?2004h> # tangents (e.g. perfectly flat/linear h).
+[?2004l[?2004h> ars_compute_u <- function(env) {
+[?2004l[?2004h>   x <- env$x; z <- env$z; cpt <- env$intercept
+[?2004l[?2004h>   k <- length(x)
+[?2004l[?2004h>   stack <- integer(0)
+[?2004l[?2004h>   u_list <- env$left
+[?2004l[?2004h>   for (i in seq_len(k)) {
+[?2004l[?2004h>     done <- FALSE
+[?2004l[?2004h>     while (!done) {
+[?2004l[?2004h>       if (length(stack) == 0L) {
+[?2004l[?2004h>         stack <- iL
+[?2004l[?2004h>         done <- TRUE
+[?2004l[?2004h>         next
+[?2004l1e[?2004h>       }
+[?2004l[?2004h>       j <- stack[length(stack)]
+[?2004l[?2004h>       if (abs(z[i] - z[j]) <= ars_params$slope_tol) {
+[?2004l[?2004h>         # (nearly) parallel tangents: keep the higher one
+[?2004l[?2004h>         if (cpt[i] <= cpt[j]) done <- TRUE
+[?2004l[?2004h>         else stack <- stack[-length(stack)]
+[?2004l[?2004h>         next
+[?2004lope[?2004h>       }
+[?2004l b[?2004h>       u_int <- (cpt[i] - cpt[j]) / (z[j] - z[i])
+[?2004l[?2004h>       if (u_int > u_list[length(u_list)] + .Machine$double.eps) {
+[?2004l[?2004h>         stack <- c(stack, i)
+[?2004l[?2004h>         u_list <- c(u_list, u_int)
+[?2004l[?2004h>         done <- TRUE
+[?2004l[?2004h>       } else {
+[?2004l[?2004h>         stack <- stack[-length(stack)]  # previous tangent is redundant
+[?2004l[?2004h>       }
+[?2004l[?2004h>     }
+[?2004l[?2004h>   }
+[?2004l[?2004h>   env$u <- c(u_list, env$right)
+[?2004l[?2004h>   env$x <- x[stack]
+[?2004l[?2004h>   env$h <- env$h[stack]
+[?2004l[?2004h>   env$z <- z[stack]
+[?2004lly([?2004h>   env$intercept <- cpt[stack]
+[?2004l[?2004h>   env
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> ars_make_envelope <- function(h, left, right, x0) {
+[?2004l[?2004h>   x0 <- sort(unique(x0))
+[?2004l[?2004h>   hx <- h(x0)
+[?2004l[?2004h>   if (any(!is.finite(hx)))
+[?2004l[?2004h>     stop("ARS: the density must be strictly positive at the starting points (",
+[?2004l[?2004h>          paste(round(x0, 4), collapse = ", "), ")")
+[?2004l[?2004h>   z <- vapply(x0, function(xx) ars_derivative(h, xx), numeric(1))
+[?2004l[?2004h>   env <- list(left = left, right = right, x = x0, h = hx, z = z,
+[?2004l[?2004h>               intercept = hx - z * x0)
+[?2004l[?2004h>   env <- ars_check_concavity(env)
+[?2004lte[?2004h>   env <- ars_check_tails(env)
+[?2004lrror[?2004h>   env <- ars_compute_u(env)
+[?2004l[?2004h>   env
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l [?2004h> # 4. Initialization (choose starting tangent points)
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Walk outward from an anchor until the density has dropped enough and the
+[?2004l[?2004h> # tangent slope points the right way for the unbounded end. A slope-order
+[?2004l[?2004h> # violation on the way is already a log-concavity failure.
+[?2004l[?2004h> ars_probe_end <- function(h, anchor, side) {
+[?2004l[?2004h>   h_a <- h(anchor); z_a <- ars_derivative(h, anchor)
+[?2004l[?2004h>   p <- ars_params
+[?2004l[?2004h>   s <- 1.0
+[?2004l [?2004h>   for (iter in seq_len(p$probe_max)) {
+[?2004l[?2004h>     x_t <- if (side == "left") anchor - s else anchor + s
+[?2004l[?2004h>     h_t <- h(x_t)
+[?2004l[?2004h>     if (is.finite(h_t) && h_t < h_a - p$probe_margin) {
+[?2004l[?2004h>       z_t <- ars_derivative(h, x_t)
+[?2004le[?2004h>       if (is.finite(z_t)) {
+[?2004l[?2004h>         if (side == "left" && z_t < z_a - p$slope_tol)
+[?2004l[?2004h>           stop("ARS: density does not appear to be log-concave: tangent ",
+[?2004l[?2004h>                "slope at x = ", round(x_t, 6), " (", round(z_t, 6),
+[?2004l[?2004h>                ") is not greater than at x = ", round(anchor, 6), " (",
+[?2004l[?2004h>                round(z_a, 6), ")")
+[?2004l[?2004h>         if (side == "right" && z_t > z_a + p$slope_tol)
+[?2004l[?2004h>           stop("ARS: density does not appear to be log-concave: tangent ",
+[?2004l[?2004h>                "slope at x = ", round(x_t, 6), " (", round(z_t, 6),
+[?2004li[?2004h>                ") is not smaller than at x = ", round(anchor, 6), " (",
+[?2004l[?2004h>                round(z_a, 6), ")")
+[?2004lx,[?2004h>         need_pos <- (side == "left" && z_t > p$slope_tol)
+[?2004l[?2004h>         need_neg <- (side == "right" && z_t < -p$slope_tol)
+[?2004l[?2004h>         if (need_pos || need_neg) return(x_t)
+[?2004l[?2004h>       }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     s <- s * 1.6
+[?2004l| [?2004h>   }
+[?2004l!is.[?2004h>   stop("ARS: could not anchor the ", side, " tail: the density does not ",
+[?2004lre[?2004h>        "appear to decay to zero there (not integrable)")
+[?2004lx)[?2004h> }
+[?2004l[?2004h> 
+[?2004l [?2004h> ars_initialize <- function(h, domain) {
+[?2004la[?2004h>   a <- domain[1]; b <- domain[2]
+[?2004l[?2004h>   if (is.finite(a) && is.finite(b)) {
+[?2004l[?2004h>     span <- b - a
+[?2004l[?2004h>     cand <- a + span * c(0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9)
+[?2004l[?2004h>     ok <- which(is.finite(h(cand)))
+[?2004l[?2004h>     if (length(ok) < 2L)
+[?2004l[?2004h>       stop("ARS: the density is zero at every candidate starting point in ",
+[?2004l[?2004h>            "the finite domain (", a, ", ", b, ")")
+[?2004l[?2004h>     x0 <- cand[c(ok[1L], ok[length(ok)])]
+[?2004l[?2004h>   } else if (a == -Inf && is.finite(b)) {
+[?2004l[?2004h>     anchor <- b - 1
+[?2004l[?2004h>     guard <- 0L
+[?2004l--[?2004h>     while (!is.finite(h(anchor)) && guard < 1e4) { anchor <- anchor - 1; guard <- guard + 1L }
+[?2004l[?2004h>     if (!is.finite(h(anchor))) stop("ARS: density is zero near the finite end of the domain")
+[?2004l[?2004h>     x0 <- c(ars_probe_end(h, anchor, "left"), anchor)
+[?2004l[?2004h>   } else if (is.finite(a) && b == Inf) {
+[?2004l[?2004h>     anchor <- a + 1
+[?2004l[?2004h>     guard <- 0L
+[?2004l[?2004h>     while (!is.finite(h(anchor)) && guard < 1e4) { anchor <- anchor + 1; guard <- guard + 1L }
+[?2004l[?2004h>     if (!is.finite(h(anchor))) stop("ARS: density is zero near the finite end of the domain")
+[?2004l[?2004h>     x0 <- c(anchor, ars_probe_end(h, anchor, "right"))
+[?2004l[?2004h>   } else {
+[?2004le[?2004h>     anchor <- 0; guard <- 0L
+[?2004ls[?2004h>     while (!is.finite(h(anchor)) && guard < 1e4) { anchor <- anchor + 1; guard <- guard + 1L }
+[?2004l[?2004h>     if (!is.finite(h(anchor))) stop("ARS: density is zero at every probed starting point")
+[?2004l[?2004h>     x0 <- c(ars_probe_end(h, anchor, "left"), anchor, ars_probe_end(h, anchor, "right"))
+[?2004l[?2004h>   }
+[?2004l[?2004h>   ars_make_envelope(h, a, b, x0)
+[?2004l[?2004h> }
+[?2004l--[?2004h> 
+[?2004l-[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # 5. Sampling machinery
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Log of the integral of exp(u(x)) on each piece (stable form).
+[?2004l[?2004h> ars_log_piece_weights <- function(env) {
+[?2004l[?2004h>   tol <- ars_params$slope_tol
+[?2004l[?2004h>   k <- length(env$z)
+[?2004l[?2004h>   u <- env$u; z <- env$z; cpt <- env$intercept
+[?2004l[?2004h>   vapply(seq_len(k), function(t) {
+[?2004l[?2004h>     l <- u[t]; r <- u[t + 1L]
+[?2004l[?2004h>     if (z[t] > tol) {
+[?2004lc[?2004h>       if (!is.infinite(l)) stop("ARS: internal error: ascending tangent outside left tail")
+[?2004l[?2004h>       cpt[t] + z[t] * r - log(z[t])
+[?2004l[?2004h>     } else if (z[t] < -tol) {
+[?2004l[?2004h>       if (is.infinite(l)) stop("ARS: internal error: descending tangent on left tail")
+[?2004l[?2004h>       if (is.infinite(r)) cpt[t] + z[t] * l - log(-z[t])
+[?2004la[?2004h>       else cpt[t] + log(-expm1(z[t] * (r - l))) - log(-z[t])
+[?2004l[?2004h>     } else {
+[?2004l[?2004h>       if (is.infinite(l) || is.infinite(r)) stop("ARS: internal error: flat tangent over infinite interval")
+[?2004l  [?2004h>       cpt[t] + log(r - l)
+[?2004l""[?2004h>     }
+[?2004l[?2004h>   }, numeric(1))
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004lL[?2004h> # Draw a proposal from the piecewise-exponential upper hull.
+[?2004l<- f[?2004h> ars_sample_envelope <- function(env) {
+[?2004lon[?2004h>   tol <- ars_params$slope_tol
+[?2004lut[?2004h>   lw <- ars_log_piece_weights(env)
+[?2004l[?2004h>   w <- exp(lw - max(lw)); w <- w / sum(w)
+[?2004l[?2004h>   t <- sample.int(length(w), 1L, prob = w)
+[?2004l[?2004h>   l <- env$u[t]; r <- env$u[t + 1L]; zt <- env$z[t]
+[?2004ls[?2004h>   W <- min(max(runif(1L), 1e-12), 1 - 1e-12)   # avoid log(0)
+[?2004lu[?2004h>   if (zt >= tol) {
+[?2004l [?2004h>     x <- r + log(W) / zt                          # ascending left tail
+[?2004l,[?2004h>   } else if (zt <= -tol) {
+[?2004l[?2004h>     if (is.infinite(r)) x <- l + log1p(-W) / zt   # descending right tail
+[?2004l[?2004h>     else {
+[?2004l[?2004h>       em <- exp(zt * (r - l))                     # descending finite piece
+[?2004l[?2004h>       x <- l + log(W * em + (1 - W)) / zt
+[?2004l[?2004h>     }
+[?2004l[?2004h>   } else {
+[?2004l[?2004h>     x <- l + W * (r - l)                          # flat piece
+[?2004l[?2004h>   }
+[?2004l[?2004h>   x
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004lt[?2004h> # Upper hull value u(x*).
+[?2004le[?2004h> ars_upper_hull <- function(env, x) {
+[?2004l[?2004h>   idx <- length(env$u) - sum(env$u > x)
+[?2004l[?2004h>   idx <- max(1L, min(idx, length(env$z)))
+[?2004l [?2004h>   env$z[idx] * (x - env$x[idx]) + env$h[idx]
+[?2004l[?2004h> }
+[?2004lnf[?2004h> 
+[?2004l[?2004h> # Lower hull (squeeze) value l(x*); -Inf outside the support-point span.
+[?2004l[?2004h> ars_lower_hull <- function(env, x) {
+[?2004l[?2004h>   k <- length(env$x)
+[?2004l[?2004h>   if (x <= env$x[1L] || x >= env$x[k]) return(-Inf)
+[?2004l [?2004h>   i <- sum(env$x < x)        # env$x[i] < x < env$x[i+1]
+[?2004l[?2004h>   w <- (x - env$x[i]) / (env$x[i + 1L] - env$x[i])
+[?2004l[?2004h>   env$h[i] + w * (env$h[i + 1L] - env$h[i])
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004lN[?2004h> # Fold an accepted point (x, h(x), h'(x)) into the envelope and re-verify all
+[?2004l[?2004h> # invariants (this is where log-concavity is checked during sampling).
+[?2004l[?2004h> ars_update <- function(env, x, h_val, z_val) {
+[?2004le[?2004h>   if (!is.finite(h_val) || !is.finite(z_val)) return(env)
+[?2004l[?2004h>   if (length(env$x) >= ars_params$max_points) return(env)
+[?2004l[?2004h>   if (x <= env$x[1L] || x > env$x[length(env$x)]) return(env)
+[?2004l[?2004h>   if (any(abs(env$x - x) < ars_params$min_sep * max(1, abs(x)))) return(env)
+[?2004l[?2004h>   at <- sum(env$x < x) + 1L
+[?2004l[?2004h>   env$x <- append(env$x, x, after = at - 1L)
+[?2004l[?2004h>   env$h <- append(env$h, h_val, after = at - 1L)
+[?2004l[?2004h>   env$z <- append(env$z, z_val, after = at - 1L)
+[?2004l[?2004h>   env$intercept <- env$h - env$z * env$x
+[?2004l[?2004h>   env <- ars_check_concavity(env)
+[?2004lnf[?2004h>   env <- ars_compute_u(env)
+[?2004l[?2004h>   env
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l [?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # 6. Main driver
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l  [?2004h> ars <- function(density_function, domain = c(-Inf, Inf), n = 1000) {
+[?2004l[?2004h>   ars_validate_inputs(density_function, domain, n)
+[?2004l[?2004h>   n <- as.integer(n)
+[?2004l-[?2004h>   h <- ars_make_log_density(density_function)
+[?2004l[?2004h>   env <- ars_initialize(h, domain)
+[?2004l[?2004h>   out <- numeric(n)
+[?2004l)[?2004h>   i <- 0L
+[?2004l[?2004h>   while (i < n) {
+[?2004l[?2004h>     x_star <- ars_sample_envelope(env)
+[?2004l[?2004h>     log_r <- log(runif(1L))
+[?2004l[?2004h>     u_val <- ars_upper_hull(env, x_star)
+[?2004l[?2004h>     h_val <- h(x_star)                    # evaluated on acceptance (adapt.)
+[?2004l[?2004h>     accept_squeeze <- log_r <= ars_lower_hull(env, x_star) - u_val
+[?2004lU[?2004h>     accepted <- accept_squeeze || (is.finite(h_val) && log_r <= h_val - u_val)
+[?2004l[?2004h>     if (accepted) {
+[?2004l[?2004h>       i <- i + 1L
+[?2004l[?2004h>       out[i] <- x_star
+[?2004l[?2004h>       if (accept_squeeze) h_val <- h(x_star)
+[?2004l[?2004h>       env <- ars_update(env, x_star, h_val, ars_derivative(h, x_star))
+[?2004l[?2004h>     }
+[?2004l  [?2004h>   }
+[?2004l[?2004h>   out
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l [?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # 7. Test suite (formal testing against known truths)
+[?2004l [?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Because the output is stochastic the tests combine three safeguards:
+[?2004l[?2004h> #   (a) mean/sd within ~5+ standard errors of the known moments,
+[?2004l[?2004h> #   (b) a Kolmogorov-Smirnov test against the known CDF (continuous truth),
+[?2004l[?2004h> #   (c) deterministic checks of the modular components.
+[?2004l[?2004h> # Each test prints "TEST_NAME: PASS|FAIL  [statistics]".
+[?2004l> [?2004h> test <- function() {
+[?2004l[?2004h>   cat("================================================================\n")
+[?2004l[?2004h>   cat("ARS (Gilks & Wild 1992) - formal test suite\n")
+[?2004l[?2004h>   cat("================================================================\n")
+[?2004l[?2004h>   set.seed(20240115)
+[?2004l[?2004h>   passed <- 0L; failed <- 0L; total <- 0L
+[?2004l[?2004h>   report <- function(name, ok, detail = "") {
+[?2004lF[?2004h>     status <- if (isTRUE(ok)) "PASS" else "FAIL"
+[?2004l[?2004h>     line <- sprintf("%s: %s", name, status)
+[?2004l[?2004h>     if (nzchar(detail)) line <- paste0(line, "  [", detail, "]")
+[?2004l[?2004h>     cat(line, "\n", sep = "")
+[?2004l[?2004h>     total <<- total + 1L
+[?2004l[?2004h>     if (isTRUE(ok)) passed <<- passed + 1L else failed <<- failed + 1L
+[?2004l[?2004h>   }
+[?2004l[%s][?2004h> 
+[?2004l [?2004h>   # -- overall-function tests against known distributions -----------------
+[?2004l[?2004h>   dist_test <- function(name, f, dom, n, exp_mean, exp_sd, cdf_fn, tol) {
+[?2004l[?2004h>     tryCatch({
+[?2004l [?2004h>       s <- ars(f, dom, n = n)
+[?2004leck[?2004h>       m <- mean(s); s0 <- sd(s)
+[?2004l))[?2004h>       p <- suppressWarnings(stats::ks.test(s, cdf_fn)$p.value)
+[?2004l[?2004h>       detail <- sprintf("n = %d, mean = %.4f (expected %.2f), sd = %.4f (expected %.2f), KS p-value = %.4g",
+[?2004l[?2004h>                         n, m, exp_mean, s0, exp_sd, p)
+[?2004l[?2004h>       ok <- abs(m - exp_mean) < tol && abs(s0 - exp_sd) < tol && p > 1e-4
+[?2004l[?2004h>       report(name, ok, detail)
+[?2004llo[?2004h>     }, error = function(e) report(name, FALSE, paste("ERROR:", conditionMessage(e))))
+[?2004l[?2004h>   }
+[?2004ltd, [?2004h> 
+[?2004l[?2004h>   cat("-- Overall function: samples vs known distributions \n\n")
+[?2004l[?2004h>   dist_test("TEST_NORMAL_STANDARD", dnorm, c(-Inf, Inf), 5000, 0, 1, pnorm, 0.08)
+[?2004l[?2004h>   dist_test("TEST_NORMAL_SHIFTED",
+[?2004l[?2004h>             function(x) dnorm(x, mean = 3, sd = 2), c(-Inf, Inf), 5000,
+[?2004lSE [?2004h>             3, 2, function(q) pnorm(q, 3, 2), 0.2)
+[?2004ll([?2004h>   dist_test("TEST_EXPONENTIAL", dexp, c(0, Inf), 5000, 1, 1, pexp, 0.12)
+[?2004l[?2004h>   dist_test("TEST_GAMMA_SHAPE_3",
+[?2004le <= [?2004h>             function(x) dgamma(x, shape = 3, rate = 1), c(0, Inf), 5000,
+[?2004l[?2004h>             3, sqrt(3), function(q) pgamma(q, shape = 3, rate = 1), 0.35)
+[?2004ls\[?2004h>   dist_test("TEST_UNIFORM",
+[?2004l[?2004h>             function(x) dunif(x, 0, 1), c(0, 1), 5000,
+[?2004l[?2004h>             0.5, sqrt(1/12), function(q) q, 0.06)
+[?2004l[?2004h> 
+[?2004ls[?2004h>   # -- non-log-concave densities must be caught ---------------------------
+[?2004l[?2004h>   expect_error_test <- function(name, code, pattern) {
+[?2004lt[?2004h>     tryCatch({
+[?2004lLES_[?2004h>       code()
+[?2004l [?2004h>       report(name, FALSE, "expected a log-concavity/validity error but none was raised")
+[?2004l[?2004h>     }, error = function(e) {
+[?2004l_[?2004h>       msg <- conditionMessage(e)
+[?2004l[?2004h>       report(name, grepl(pattern, msg, ignore.case = TRUE),
+[?2004l[?2004h>              paste("caught:", substr(msg, 1, 100)))
+[?2004l[?2004h>     })
+[?2004l[?2004h>   }
+[?2004l[?2004h> 
+[?2004ls[?2004h>   cat("\n-- Non-log-concave densities are rejected\n")
+[?2004l[?2004h>   expect_error_test("TEST_CAUCHY_REJECTED",
+[?2004lc[?2004h>                     function() ars(dcauchy, c(-Inf, Inf), n = 2000),
+[?2004l[?2004h>                     "log-concave")
+[?2004li[?2004h>   expect_error_test("TEST_BIMODAL_REJECTED",
+[?2004l[?2004h>                     function() ars(function(x) 0.5 * dnorm(x, -4, 1) + 0.5 * dnorm(x, 4, 1),
+[?2004l[?2004h>                                    c(-Inf, Inf), n = 100),
+[?2004l[?2004h>                     "log-concave")
+[?2004l[?2004h> 
+[?2004l([?2004h>   # -- input validation ----------------------------------------------------
+[?2004l[?2004h>   cat("\n-- Input validation\n")
+[?2004l[?2004h>   expect_error_test("TEST_INPUT_NEGATIVE_N", function() ars(dnorm, c(-Inf, Inf), n = -5), "positive integer")
+[?2004l[?2004h>   expect_error_test("TEST_INPUT_ZERO_N", function() ars(dnorm, n = 0), "positive integer")
+[?2004l[?2004h>   expect_error_test("TEST_INPUT_BAD_DOMAIN", function() ars(dnorm, domain = c(2, 1)), "domain")
+[?2004l[?2004h>   expect_error_test("TEST_INPUT_NOT_FUNCTION", function() ars("dnorm"), "function")
+[?2004l[?2004h> 
+[?2004l[?2004h>   # -- modular-component tests ---------------------------------------------
+[?2004l[?2004h>   cat("\n-- Module tests\n")
+[?2004l[?2004h>   h_std <- ars_make_log_density(dnorm)
+[?2004l[?2004h>   env <- tryCatch(ars_make_envelope(h_std, -Inf, Inf, c(-2, 0, 2)),
+[?2004l[?2004h>                   error = function(e) { report("MOD_ENVELOPE_INTERSECTIONS", FALSE, conditionMessage(e)); NULL })
+[?2004l[?2004h>   if (!is.null(env)) {
+[?2004l[?2004h>     ok <- length(env$x) == 3 && abs(env$u[2] - (-1)) < 1e-6 && abs(env$u[3] - 1) < 1e-6
+[?2004l[?2004h>     report("MOD_ENVELOPE_INTERSECTIONS", ok,
+[?2004l[?2004h>            sprintf("intersection points u = (%.4f, %.4f), expected (-1, 1); 3 tangents retained",
+[?2004l[?2004h>                    env$u[2], env$u[3]))
+[?2004l[?2004h>     s_env <- replicate(20000L, ars_sample_envelope(env))
+[?2004l[?2004h>     report("MOD_ENVELOPE_SAMPLING",
+[?2004l[?2004h>            abs(mean(s_env)) < 0.1 && sd(s_env) > 0.9 && sd(s_env) < 1.15,
+[?2004l[?2004h>            sprintf("mean = %.4f, sd = %.4f (proposal from normal upper hull: symmetric, mean ~ 0, sd ~ 1.02)",
+[?2004l[?2004h>                    mean(s_env), sd(s_env)))
+[?2004l[?2004h>     env2 <- tryCatch(ars_update(env, 0.4, h_std(0.4), ars_derivative(h_std, 0.4)),
+[?2004l[?2004h>                      error = function(e) { report("MOD_ENVELOPE_UPDATE", FALSE, conditionMessage(e)); NULL })
+[?2004l[?2004h>     if (!is.null(env2)) {
+[?2004l[?2004h>       ok <- all(diff(env2$x) > 0) && all(diff(env2$z) < ars_params$slope_tol) &&
+[?2004l[?2004h>             all(diff(env2$u) > 0) && length(env2$x) == 4
+[?2004l[?2004h>       report("MOD_ENVELOPE_UPDATE", ok,
+[?2004l[?2004h>              sprintf("points = %d, slopes = [%s] (strictly decreasing = %s)",
+[?2004l[?2004h>                      length(env2$x), paste(round(env2$z, 4), collapse = ", "),
+[?2004l[?2004h>                      all(diff(env2$z) < 0)))
+[?2004l[?2004h>     }
+[?2004l[?2004h>   }
+[?2004l[?2004h>   caught <- tryCatch({ ars_check_concavity(list(z = c(2, 0, 1))); FALSE },
+[?2004l[?2004h>                      error = function(e) grepl("log-concave", conditionMessage(e)))
+[?2004l[?2004h>   clean <- tryCatch({ ars_check_concavity(list(z = c(2, 0.5, -1))); TRUE },
+[?2004l[?2004h>                     error = function(e) FALSE)
+[?2004l[?2004h>   report("MOD_LOG_CONCAVITY_DETECTOR", caught && clean,
+[?2004l[?2004h>          "slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted")
+[?2004l[?2004h>   d0 <- ars_derivative(h_std, 0); d1 <- ars_derivative(h_std, 1)
+[?2004l[?2004h>   report("MOD_NUMERICAL_DERIVATIVE", abs(d0) < 1e-4 && abs(d1 + 1) < 1e-4,
+[?2004l[?2004h>          sprintf("h'(0) = %.6f (expected 0), h'(1) = %.6f (expected -1)", d0, d1))
+[?2004l[?2004h>   caught2 <- tryCatch({ ars_check_tails(list(left = -Inf, right = 0, z = c(-0.5, 0.5))); FALSE },
+[?2004l[?2004h>                       error = function(e) grepl("integrab", conditionMessage(e)))
+[?2004l[?2004h>   report("MOD_TAIL_CHECK", caught2,
+[?2004l[?2004h>          "left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable")
+[?2004l[?2004h> 
+[?2004l[?2004h>   # -- sample files ---------------------------------------------------------
+[?2004l[?2004h>   cat("\n-- Sample files\n")
+[?2004l[?2004h>   s_norm <- ars(dnorm, c(-Inf, Inf), n = 1000)
+[?2004l[?2004h>   writeLines(sprintf("%.12f", s_norm), file.path("/app", "normal_samples.txt"))
+[?2004l[?2004h>   s_exp <- ars(dexp, c(0, Inf), n = 1000)
+[?2004l[?2004h>   writeLines(sprintf("%.12f", s_exp), file.path("/app", "exponential_samples.txt"))
+[?2004l[?2004h>   report("SAMPLE_FILES_WRITTEN",
+[?2004l[?2004h>          file.exists("/app/normal_samples.txt") && file.exists("/app/exponential_samples.txt"),
+[?2004l[?2004h>          sprintf("normal_samples.txt: n = 1000, mean = %.4f, sd = %.4f | exponential_samples.txt: n = 1000, mean = %.4f, sd = %.4f",
+[?2004l[?2004h>                  mean(s_norm), sd(s_norm), mean(s_exp), sd(s_exp)))
+[?2004l[?2004h> 
+[?2004l[?2004h>   cat("================================================================\n")
+[?2004l[?2004h>   cat(sprintf("SUMMARY: %d/%d tests passed\n", passed, passed + failed))
+[?2004l[?2004h>   invisible(c(passed = passed, failed = failed, total = passed + failed))
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> # Run the test suite automatically when the file is executed as a script
+[?2004l[?2004h> # (e.g. `Rscript /app/ars.R`), but not when merely sourced.
+[?2004l[?2004h> if (!interactive() && identical(environment(), globalenv())) test()
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript -e 'source("/app/ars.R")' && echo SOURCE_OK
+[?2004l================================================================
+ARS (Gilks & Wild 1992) - formal test suite
+================================================================
+-- Overall function: samples vs known distributions 
+
+TEST_NORMAL_STANDARD: FAIL  [ERROR: object 'iL' not found]
+TEST_NORMAL_SHIFTED: FAIL  [ERROR: object 'iL' not found]
+TEST_EXPONENTIAL: FAIL  [ERROR: object 'iL' not found]
+TEST_GAMMA_SHAPE_3: FAIL  [ERROR: object 'iL' not found]
+TEST_UNIFORM: FAIL  [ERROR: object 'iL' not found]
+
+-- Non-log-concave densities are rejected
+TEST_CAUCHY_REJECTED: FAIL  [caught: object 'iL' not found]
+TEST_BIMODAL_REJECTED: FAIL  [caught: object 'iL' not found]
+
+-- Input validation
+TEST_INPUT_NEGATIVE_N: PASS  [caught: ARS: 'n' must be a positive integer, got: -5]
+TEST_INPUT_ZERO_N: PASS  [caught: ARS: 'n' must be a positive integer, got: 0]
+TEST_INPUT_BAD_DOMAIN: PASS  [caught: ARS: invalid 'domain': lower bound (2) must be strictly less than upper bound (1)]
+TEST_INPUT_NOT_FUNCTION: PASS  [caught: ARS: 'density_function' must be a function, e.g. dnorm. Got class: character]
+
+-- Module tests
+MOD_ENVELOPE_INTERSECTIONS: FAIL  [object 'iL' not found]
+MOD_LOG_CONCAVITY_DETECTOR: PASS  [slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted]
+MOD_NUMERICAL_DERIVATIVE: PASS  [h'(0) = 0.000000 (expected 0), h'(1) = -1.000000 (expected -1)]
+MOD_TAIL_CHECK: PASS  [left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable]
+
+-- Sample files
+Error in ars_compute_u(env) : object 'iL' not found
+Calls: source ... ars_initialize -> ars_make_envelope -> ars_compute_u
+Execution halted
+[?2004hroot@a8ff99d7b1c6:/app# grep -n 'iL' /app/ars.R
+[?2004l[32m[K148[m[K[36m[K:[m[K        stack <- [01;31m[KiL[m[K
+[?2004hroot@a8ff99d7b1c6:/app# sed -i 's/stack <- iL/stack <- as.integer(i)/' /app/ars.R && grep -n 'as.integer(i)' /app/ars.R
+[?2004l[32m[K148[m[K[36m[K:[m[K        stack <- [01;31m[Kas.integer(i)[m[K
+[?2004hroot@a8ff99d7b1c6:/app# Rscript /app/ars.R
+[?2004l================================================================
+ARS (Gilks & Wild 1992) - formal test suite
+================================================================
+-- Overall function: samples vs known distributions 
+
+TEST_NORMAL_STANDARD: FAIL  [ERROR: ARS: internal error: ascending tangent outside left tail]
+TEST_NORMAL_SHIFTED: FAIL  [ERROR: ARS: internal error: ascending tangent outside left tail]
+TEST_EXPONENTIAL: PASS  [n = 5000, mean = 1.0124 (expected 1.00), sd = 0.9904 (expected 1.00), KS p-value = 0.157]
+TEST_GAMMA_SHAPE_3: FAIL  [ERROR: ARS: internal error: ascending tangent outside left tail]
+TEST_UNIFORM: PASS  [n = 5000, mean = 0.5029 (expected 0.50), sd = 0.2907 (expected 0.29), KS p-value = 0.2014]
+
+-- Non-log-concave densities are rejected
+TEST_CAUCHY_REJECTED: FAIL  [caught: ARS: internal error: ascending tangent outside left tail]
+TEST_BIMODAL_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+
+-- Input validation
+TEST_INPUT_NEGATIVE_N: PASS  [caught: ARS: 'n' must be a positive integer, got: -5]
+TEST_INPUT_ZERO_N: PASS  [caught: ARS: 'n' must be a positive integer, got: 0]
+TEST_INPUT_BAD_DOMAIN: PASS  [caught: ARS: invalid 'domain': lower bound (2) must be strictly less than upper bound (1)]
+TEST_INPUT_NOT_FUNCTION: PASS  [caught: ARS: 'density_function' must be a function, e.g. dnorm. Got class: character]
+
+-- Module tests
+MOD_ENVELOPE_INTERSECTIONS: PASS  [intersection points u = (-1.0000, 1.0000), expected (-1, 1); 3 tangents retained]
+MOD_ENVELOPE_SAMPLING: PASS  [mean = -0.0039, sd = 1.0281 (proposal from normal upper hull: symmetric, mean ~ 0, sd ~ 1.02)]
+MOD_ENVELOPE_UPDATE: PASS  [points = 4, slopes = [2, 0, -0.4, -2] (strictly decreasing = TRUE)]
+MOD_LOG_CONCAVITY_DETECTOR: PASS  [slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted]
+MOD_NUMERICAL_DERIVATIVE: PASS  [h'(0) = 0.000000 (expected 0), h'(1) = -1.000000 (expected -1)]
+MOD_TAIL_CHECK: PASS  [left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable]
+
+-- Sample files
+Error in FUN(X[[i]], ...) : 
+  ARS: internal error: ascending tangent outside left tail
+Calls: test ... ars_sample_envelope -> ars_log_piece_weights -> vapply -> FUN
+Execution halted
+[?2004hroot@a8ff99d7b1c6:/app# python3 - << 'PYEOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> src = open('/app/ars.R').read()
+[?2004l[?2004h> old = """  vapply(seq_len(k), function(t) {
+[?2004l[?2004h>     l <- u[t]; r <- u[t + 1L]
+[?2004l[?2004h>     if (z[t] > tol) {
+[?2004l[?2004h>       if (!is.infinite(l)) stop("ARS: internal error: ascending tangent outside left tail")
+[?2004l[?2004h>       cpt[t] + z[t] * r - log(z[t])
+[?2004l[?2004h>     } else if (z[t] < -tol) {
+[?2004l[?2004h>       if (is.infinite(l)) stop("ARS: internal error: descending tangent on left tail")
+[?2004l[?2004h>       if (is.infinite(r)) cpt[t] + z[t] * l - log(-z[t])
+[?2004l[?2004h>       else cpt[t] + log(-expm1(z[t] * (r - l))) - log(-z[t])
+[?2004l[?2004h>     } else {
+[?2004l[?2004h>       if (is.infinite(l) || is.infinite(r)) stop("ARS: internal error: flat tangent over infinite interval")
+[?2004l[?2004h>       cpt[t] + log(r - l)
+[?2004l[?2004h>     }
+[?2004l[?2004h>   }, numeric(1))"""
+[?2004l[?2004h> new = """  vapply(seq_len(k), function(t) {
+[?2004l[?2004h>     l <- u[t]; r <- u[t + 1L]
+[?2004l[?2004h>     if (is.infinite(l)) {
+[?2004l[?2004h>       if (z[t] <= tol) stop("ARS: internal error: non-descending left tail")
+[?2004l[?2004h>       cpt[t] + z[t] * r - log(z[t])
+[?2004l[?2004h>     } else if (is.infinite(r)) {
+[?2004l[?2004h>       if (z[t] >= -tol) stop("ARS: internal error: non-ascending right tail")
+[?2004l[?2004h>       cpt[t] + z[t] * l - log(-z[t])
+[?2004l[?2004h>     } else if (abs(z[t]) <= tol) {
+[?2004l[?2004h>       cpt[t] + log(r - l)
+[?2004l[?2004h>     } else {
+[?2004l[?2004h>       cpt[t] + z[t] * l + log(abs(expm1(z[t] * (r - l)))) - log(abs(z[t]))
+[?2004l[?2004h>     }
+[?2004l[?2004h>   }, numeric(1))"""
+[?2004l[?2004h> assert old in src, "pattern not found"
+[?2004l[?2004h> open('/app/ars.R','w').write(src.replace(old, new))
+[?2004l[?2004h> print("patched OK")
+[?2004l[?2004h> PYEOF
+[?2004lpatched OK
+[?2004hroot@a8ff99d7b1c6:/app# Rscript /app/ars.R
+[?2004l================================================================
+ARS (Gilks & Wild 1992) - formal test suite
+================================================================
+-- Overall function: samples vs known distributions 
+
+TEST_NORMAL_STANDARD: FAIL  [n = 5000, mean = -0.1869 (expected 0.00), sd = 1.3534 (expected 1.00), KS p-value = 0]
+TEST_NORMAL_SHIFTED: FAIL  [n = 5000, mean = 2.5111 (expected 3.00), sd = 2.8356 (expected 2.00), KS p-value = 0]
+TEST_EXPONENTIAL: PASS  [n = 5000, mean = 0.9894 (expected 1.00), sd = 0.9682 (expected 1.00), KS p-value = 0.8692]
+TEST_GAMMA_SHAPE_3: FAIL  [n = 5000, mean = 3.4142 (expected 3.00), sd = 1.8036 (expected 1.73), KS p-value = 0]
+TEST_UNIFORM: PASS  [n = 5000, mean = 0.4938 (expected 0.50), sd = 0.2896 (expected 0.29), KS p-value = 0.4074]
+
+-- Non-log-concave densities are rejected
+TEST_CAUCHY_REJECTED: FAIL  [expected a log-concavity/validity error but none was raised]
+TEST_BIMODAL_REJECTED: FAIL  [caught: ARS: internal error: non-descending left tail]
+
+-- Input validation
+TEST_INPUT_NEGATIVE_N: PASS  [caught: ARS: 'n' must be a positive integer, got: -5]
+TEST_INPUT_ZERO_N: PASS  [caught: ARS: 'n' must be a positive integer, got: 0]
+TEST_INPUT_BAD_DOMAIN: PASS  [caught: ARS: invalid 'domain': lower bound (2) must be strictly less than upper bound (1)]
+TEST_INPUT_NOT_FUNCTION: PASS  [caught: ARS: 'density_function' must be a function, e.g. dnorm. Got class: character]
+
+-- Module tests
+MOD_ENVELOPE_INTERSECTIONS: PASS  [intersection points u = (-1.0000, 1.0000), expected (-1, 1); 3 tangents retained]
+MOD_ENVELOPE_SAMPLING: PASS  [mean = 0.0021, sd = 1.0311 (proposal from normal upper hull: symmetric, mean ~ 0, sd ~ 1.02)]
+MOD_ENVELOPE_UPDATE: PASS  [points = 4, slopes = [2, 0, -0.4, -2] (strictly decreasing = TRUE)]
+MOD_LOG_CONCAVITY_DETECTOR: PASS  [slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted]
+MOD_NUMERICAL_DERIVATIVE: PASS  [h'(0) = 0.000000 (expected 0), h'(1) = -1.000000 (expected -1)]
+MOD_TAIL_CHECK: PASS  [left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable]
+
+-- Sample files
+SAMPLE_FILES_WRITTEN: PASS  [normal_samples.txt: n = 1000, mean = -0.1318, sd = 1.3029 | exponential_samples.txt: n = 1000, mean = 0.9768, sd = 0.9214]
+================================================================
+SUMMARY: 13/18 tests passed
+[?2004hroot@a8ff99d7b1c6:/app# python3 - << 'PYEOF'
+[?2004l[?2004h> src = open('/app/ars.R').read()
+[?2004l[?2004h> old1 = """      if (abs(z[i] - z[j]) <= ars_params$slope_tol) {
+[?2004l[?2004h>         # (nearly) parallel tangents: keep the higher one
+[?2004l[?2004h>         if (cpt[i] <= cpt[j]) done <- TRUE
+[?2004l[?2004h>         else stack <- stack[-length(stack)]
+[?2004l[?2004h>         next
+[?2004l[?2004h>       }"""
+[?2004l[?2004h> new1 = """      if (abs(z[i] - z[j]) <= ars_params$slope_tol) {
+[?2004l[?2004h>         # (nearly) parallel tangents: keep the higher one
+[?2004l[?2004h>         if (cpt[i] <= cpt[j]) done <- TRUE
+[?2004l[?2004h>         else { stack <- stack[-length(stack)]; u_list <- u_list[-length(u_list)] }
+[?2004l[?2004h>         next
+[?2004l[?2004h>       }"""
+[?2004l[?2004h> old2 = """      } else {
+[?2004l[?2004h>         stack <- stack[-length(stack)]  # previous tangent is redundant
+[?2004l[?2004h>       }"""
+[?2004l[?2004h> new2 = """      } else {
+[?2004l[?2004h>         # previous tangent is redundant
+[?2004l[?2004h>         stack <- stack[-length(stack)]
+[?2004l[?2004h>         u_list <- u_list[-length(u_list)]
+[?2004l[?2004h>       }"""
+[?2004l[?2004h> assert old1 in src and old2 in src, "pattern not found"
+[?2004l[?2004h> src = src.replace(old1, new1).replace(old2, new2)
+[?2004l[?2004h> open('/app/ars.R','w').write(src)
+[?2004l[?2004h> print("patched OK")
+[?2004l[?2004h> PYEOF
+[?2004lpatched OK
+[?2004hroot@a8ff99d7b1c6:/app# Rscript /app/ars.R
+[?2004l================================================================
+ARS (Gilks & Wild 1992) - formal test suite
+================================================================
+-- Overall function: samples vs known distributions 
+
+TEST_NORMAL_STANDARD: FAIL  [n = 5000, mean = -0.1869 (expected 0.00), sd = 1.3534 (expected 1.00), KS p-value = 0]
+TEST_NORMAL_SHIFTED: FAIL  [n = 5000, mean = 2.5111 (expected 3.00), sd = 2.8356 (expected 2.00), KS p-value = 0]
+TEST_EXPONENTIAL: PASS  [n = 5000, mean = 0.9894 (expected 1.00), sd = 0.9682 (expected 1.00), KS p-value = 0.8692]
+TEST_GAMMA_SHAPE_3: FAIL  [n = 5000, mean = 3.4097 (expected 3.00), sd = 1.8038 (expected 1.73), KS p-value = 0]
+TEST_UNIFORM: PASS  [n = 5000, mean = 0.4932 (expected 0.50), sd = 0.2896 (expected 0.29), KS p-value = 0.3324]
+
+-- Non-log-concave densities are rejected
+TEST_CAUCHY_REJECTED: FAIL  [expected a log-concavity/validity error but none was raised]
+TEST_BIMODAL_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+
+-- Input validation
+TEST_INPUT_NEGATIVE_N: PASS  [caught: ARS: 'n' must be a positive integer, got: -5]
+TEST_INPUT_ZERO_N: PASS  [caught: ARS: 'n' must be a positive integer, got: 0]
+TEST_INPUT_BAD_DOMAIN: PASS  [caught: ARS: invalid 'domain': lower bound (2) must be strictly less than upper bound (1)]
+TEST_INPUT_NOT_FUNCTION: PASS  [caught: ARS: 'density_function' must be a function, e.g. dnorm. Got class: character]
+
+-- Module tests
+MOD_ENVELOPE_INTERSECTIONS: PASS  [intersection points u = (-1.0000, 1.0000), expected (-1, 1); 3 tangents retained]
+MOD_ENVELOPE_SAMPLING: PASS  [mean = -0.0039, sd = 1.0249 (proposal from normal upper hull: symmetric, mean ~ 0, sd ~ 1.02)]
+MOD_ENVELOPE_UPDATE: PASS  [points = 4, slopes = [2, 0, -0.4, -2] (strictly decreasing = TRUE)]
+MOD_LOG_CONCAVITY_DETECTOR: PASS  [slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted]
+MOD_NUMERICAL_DERIVATIVE: PASS  [h'(0) = 0.000000 (expected 0), h'(1) = -1.000000 (expected -1)]
+MOD_TAIL_CHECK: PASS  [left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable]
+
+-- Sample files
+SAMPLE_FILES_WRITTEN: PASS  [normal_samples.txt: n = 1000, mean = -0.0455, sd = 1.3352 | exponential_samples.txt: n = 1000, mean = 0.9815, sd = 0.9258]
+================================================================
+SUMMARY: 14/18 tests passed
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/dbg.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> h <- e$ars_make_log_density(dnorm)
+[?2004l[?2004h> env <- e$ars_initialize(h, c(-Inf, Inf))
+[?2004l[?2004h> cat("init: "); print(round(cbind(x=env$x, z=env$z, u=env$u), 4))
+[?2004l[?2004h> set.seed(1)
+[?2004l[?2004h> for (it in 1:300) {
+[?2004l[?2004h>   xs <- e$ars_sample_envelope(env)
+[?2004l[?2004h>   u <- e$ars_upper_hull(env, xs)
+[?2004l[?2004h>   l <- e$ars_lower_hull(env, xs)
+[?2004l[?2004h>   r <- log(runif(1))
+[?2004l[?2004h>   hv <- h(xs)
+[?2004l[?2004h>   acc <- r <= l - u || (is.finite(hv) && r <= hv - u)
+[?2004l[?2004h>   if (acc) env <- e$ars_update(env, xs, hv, e$ars_derivative(h, xs))
+[?2004l[?2004h>   if (it %% 50 == 0) {
+[?2004l[?2004h>     cat("--- it =", it, "npts =", length(env$x), "\n")
+[?2004l[?2004h>     print(round(cbind(env$x, env$z, env$u), 4))
+[?2004l[?2004h>     xg <- seq(-6, 6, by = 0.02)
+[?2004l[?2004h>     ul <- sapply(xg, function(q) e$ars_upper_hull(env, q))
+[?2004l[?2004h>     cat("max(h - u) on grid:", round(max(h(xg) - ul), 6),
+[?2004l[?2004h>         "| u inc:", all(diff(env$u) > 0),
+[?2004l[?2004h>         "| z dec:", all(diff(env$z) < 0), "\n")
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/dbg.R
+[?2004linit:         x    z    u
+[1,] -1.6  1.6 -Inf
+[2,]  0.0  0.0 -0.8
+[3,]  1.6 -1.6  0.8
+[4,] -1.6  1.6  Inf
+Warning message:
+In cbind(x = env$x, z = env$z, u = env$u) :
+  number of rows of result is not a multiple of vector length (arg 1)
+--- it = 50 npts = 31 
+         [,1]    [,2]    [,3]
+ [1,] -1.6000  1.6000    -Inf
+ [2,] -1.5595  1.5595 -1.5798
+ [3,] -1.5228  1.5228 -1.5412
+ [4,] -1.4679  1.4679 -1.4953
+ [5,] -1.4497  1.4497 -1.4588
+ [6,] -1.3377  1.3377 -1.3937
+ [7,] -1.1612  1.1612 -1.2495
+ [8,] -1.0578  1.0578 -1.1095
+ [9,] -0.7847  0.7847 -0.9213
+[10,] -0.2046  0.2046 -0.4946
+[11,] -0.1649  0.1649 -0.1848
+[12,] -0.0534  0.0534 -0.1092
+[13,]  0.0000  0.0000 -0.0267
+[14,]  0.0836 -0.0836  0.0418
+[15,]  0.2254 -0.2254  0.1545
+[16,]  0.5570 -0.5570  0.3912
+[17,]  0.6571 -0.6571  0.6071
+[18,]  0.6585 -0.6585  0.6578
+[19,]  0.7718 -0.7718  0.7152
+[20,]  0.9226 -0.9226  0.8472
+[21,]  0.9424 -0.9424  0.9325
+[22,]  1.0194 -1.0194  0.9809
+[23,]  1.0365 -1.0365  1.0279
+[24,]  1.1316 -1.1316  1.0840
+[25,]  1.1805 -1.1805  1.1560
+[26,]  1.1986 -1.1986  1.1895
+[27,]  1.2086 -1.2086  1.2036
+[28,]  1.2187 -1.2187  1.2136
+[29,]  1.2585 -1.2585  1.2386
+[30,]  1.3192 -1.3192  1.2888
+[31,]  1.6000 -1.6000  1.4596
+[32,] -1.6000  1.6000     Inf
+max(h - u) on grid: 0 | u inc: TRUE | z dec: TRUE 
+--- it = 100 npts = 57 
+         [,1]    [,2]    [,3]
+ [1,] -1.6000  1.6000    -Inf
+ [2,] -1.5812  1.5812 -1.5906
+ [3,] -1.5595  1.5595 -1.5704
+ [4,] -1.5456  1.5456 -1.5525
+ [5,] -1.5317  1.5317 -1.5386
+ [6,] -1.5228  1.5228 -1.5273
+ [7,] -1.4904  1.4904 -1.5066
+ [8,] -1.4679  1.4679 -1.4791
+ [9,] -1.4497  1.4497 -1.4588
+[10,] -1.3377  1.3377 -1.3937
+[11,] -1.2718  1.2718 -1.3048
+[12,] -1.2403  1.2403 -1.2561
+[13,] -1.1612  1.1612 -1.2008
+[14,] -1.0578  1.0578 -1.1095
+[15,] -1.0453  1.0453 -1.0516
+[16,] -0.9997  0.9997 -1.0225
+[17,] -0.9598  0.9598 -0.9798
+[18,] -0.7847  0.7847 -0.8722
+[19,] -0.5908  0.5908 -0.6878
+[20,] -0.2757  0.2757 -0.4333
+[21,] -0.2046  0.2046 -0.2402
+[22,] -0.1649  0.1649 -0.1848
+[23,] -0.0534  0.0534 -0.1092
+[24,]  0.0000  0.0000 -0.0267
+[25,]  0.0027 -0.0027  0.0014
+[26,]  0.0836 -0.0836  0.0431
+[27,]  0.1044 -0.1044  0.0940
+[28,]  0.1616 -0.1616  0.1330
+[29,]  0.2163 -0.2163  0.1890
+[30,]  0.2254 -0.2254  0.2209
+[31,]  0.3398 -0.3398  0.2826
+[32,]  0.3978 -0.3978  0.3688
+[33,]  0.4960 -0.4960  0.4469
+[34,]  0.5570 -0.5570  0.5265
+[35,]  0.5748 -0.5748  0.5659
+[36,]  0.5968 -0.5968  0.5858
+[37,]  0.6571 -0.6571  0.6270
+[38,]  0.6585 -0.6585  0.6578
+[39,]  0.6671 -0.6671  0.6628
+[40,]  0.7718 -0.7718  0.7195
+[41,]  0.8038 -0.8038  0.7878
+[42,]  0.8634 -0.8634  0.8336
+[43,]  0.9198 -0.9198  0.8916
+[44,]  0.9226 -0.9226  0.9212
+[45,]  0.9424 -0.9424  0.9325
+[46,]  0.9503 -0.9503  0.9464
+[47,]  1.0194 -1.0194  0.9849
+[48,]  1.0365 -1.0365  1.0279
+[49,]  1.1316 -1.1316  1.0840
+[50,]  1.1805 -1.1805  1.1560
+[51,]  1.1986 -1.1986  1.1895
+[52,]  1.2086 -1.2086  1.2036
+[53,]  1.2187 -1.2187  1.2136
+[54,]  1.2585 -1.2585  1.2386
+[55,]  1.3192 -1.3192  1.2888
+[56,]  1.5923 -1.5923  1.4558
+[57,]  1.6000 -1.6000  1.5961
+[58,] -1.6000  1.6000     Inf
+max(h - u) on grid: 0 | u inc: TRUE | z dec: TRUE 
+--- it = 150 npts = 83 
+         [,1]    [,2]    [,3]
+ [1,] -1.6000  1.6000    -Inf
+ [2,] -1.5812  1.5812 -1.5906
+ [3,] -1.5595  1.5595 -1.5704
+ [4,] -1.5456  1.5456 -1.5525
+ [5,] -1.5317  1.5317 -1.5386
+ [6,] -1.5228  1.5228 -1.5273
+ [7,] -1.4904  1.4904 -1.5066
+ [8,] -1.4862  1.4862 -1.4883
+ [9,] -1.4724  1.4724 -1.4793
+[10,] -1.4679  1.4679 -1.4701
+[11,] -1.4497  1.4497 -1.4588
+[12,] -1.3377  1.3377 -1.3937
+[13,] -1.2718  1.2718 -1.3048
+[14,] -1.2403  1.2403 -1.2561
+[15,] -1.1850  1.1850 -1.2126
+[16,] -1.1612  1.1612 -1.1731
+[17,] -1.0816  1.0816 -1.1214
+[18,] -1.0578  1.0578 -1.0697
+[19,] -1.0453  1.0453 -1.0516
+[20,] -0.9997  0.9997 -1.0225
+[21,] -0.9882  0.9882 -0.9940
+[22,] -0.9598  0.9598 -0.9740
+[23,] -0.8440  0.8440 -0.9019
+[24,] -0.7847  0.7847 -0.8143
+[25,] -0.6373  0.6373 -0.7110
+[26,] -0.5908  0.5908 -0.6140
+[27,] -0.2757  0.2757 -0.4333
+[28,] -0.2046  0.2046 -0.2402
+[29,] -0.1649  0.1649 -0.1848
+[30,] -0.0534  0.0534 -0.1092
+[31,]  0.0000  0.0000 -0.0267
+[32,]  0.0027 -0.0027  0.0014
+[33,]  0.0202 -0.0202  0.0115
+[34,]  0.0510 -0.0510  0.0356
+[35,]  0.0836 -0.0836  0.0673
+[36,]  0.1044 -0.1044  0.0940
+[37,]  0.1616 -0.1616  0.1330
+[38,]  0.2119 -0.2119  0.1868
+[39,]  0.2128 -0.2128  0.2124
+[40,]  0.2163 -0.2163  0.2146
+[41,]  0.2164 -0.2164  0.2164
+[42,]  0.2254 -0.2254  0.2209
+[43,]  0.2716 -0.2716  0.2485
+[44,]  0.2849 -0.2849  0.2782
+[45,]  0.2946 -0.2946  0.2898
+[46,]  0.3398 -0.3398  0.3172
+[47,]  0.3978 -0.3978  0.3688
+[48,]  0.4591 -0.4591  0.4285
+[49,]  0.4960 -0.4960  0.4776
+[50,]  0.5570 -0.5570  0.5265
+[51,]  0.5748 -0.5748  0.5659
+[52,]  0.5968 -0.5968  0.5858
+[53,]  0.6571 -0.6571  0.6270
+[54,]  0.6585 -0.6585  0.6578
+[55,]  0.6671 -0.6671  0.6628
+[56,]  0.6681 -0.6681  0.6676
+[57,]  0.7456 -0.7456  0.7069
+[58,]  0.7718 -0.7718  0.7587
+[59,]  0.8038 -0.8038  0.7878
+[60,]  0.8046 -0.8046  0.8042
+[61,]  0.8321 -0.8321  0.8183
+[62,]  0.8634 -0.8634  0.8478
+[63,]  0.8984 -0.8984  0.8809
+[64,]  0.9198 -0.9198  0.9091
+[65,]  0.9226 -0.9226  0.9212
+[66,]  0.9424 -0.9424  0.9325
+[67,]  0.9503 -0.9503  0.9464
+[68,]  1.0194 -1.0194  0.9849
+[69,]  1.0365 -1.0365  1.0279
+[70,]  1.1316 -1.1316  1.0840
+[71,]  1.1805 -1.1805  1.1560
+[72,]  1.1986 -1.1986  1.1895
+[73,]  1.2086 -1.2086  1.2036
+[74,]  1.2167 -1.2167  1.2127
+[75,]  1.2187 -1.2187  1.2177
+[76,]  1.2585 -1.2585  1.2386
+[77,]  1.3014 -1.3014  1.2799
+[78,]  1.3192 -1.3192  1.3103
+[79,]  1.3558 -1.3558  1.3375
+[80,]  1.5096 -1.5096  1.4327
+[81,]  1.5914 -1.5914  1.5505
+[82,]  1.5923 -1.5923  1.5918
+[83,]  1.6000 -1.6000  1.5961
+[84,] -1.6000  1.6000     Inf
+max(h - u) on grid: 0 | u inc: TRUE | z dec: TRUE 
+--- it = 200 npts = 115 
+          [,1]    [,2]    [,3]
+  [1,] -1.6000  1.6000    -Inf
+  [2,] -1.5812  1.5812 -1.5906
+  [3,] -1.5595  1.5595 -1.5704
+  [4,] -1.5456  1.5456 -1.5525
+  [5,] -1.5317  1.5317 -1.5386
+  [6,] -1.5228  1.5228 -1.5273
+  [7,] -1.4904  1.4904 -1.5066
+  [8,] -1.4891  1.4891 -1.4898
+  [9,] -1.4862  1.4862 -1.4877
+ [10,] -1.4724  1.4724 -1.4793
+ [11,] -1.4679  1.4679 -1.4701
+ [12,] -1.4497  1.4497 -1.4588
+ [13,] -1.3404  1.3404 -1.3951
+ [14,] -1.3377  1.3377 -1.3391
+ [15,] -1.2881  1.2881 -1.3129
+ [16,] -1.2729  1.2729 -1.2805
+ [17,] -1.2718  1.2718 -1.2724
+ [18,] -1.2403  1.2403 -1.2561
+ [19,] -1.1850  1.1850 -1.2126
+ [20,] -1.1612  1.1612 -1.1731
+ [21,] -1.0816  1.0816 -1.1214
+ [22,] -1.0578  1.0578 -1.0697
+ [23,] -1.0453  1.0453 -1.0516
+ [24,] -0.9997  0.9997 -1.0225
+ [25,] -0.9882  0.9882 -0.9940
+ [26,] -0.9598  0.9598 -0.9740
+ [27,] -0.9341  0.9341 -0.9469
+ [28,] -0.9074  0.9074 -0.9208
+ [29,] -0.8581  0.8581 -0.8827
+ [30,] -0.8440  0.8440 -0.8510
+ [31,] -0.7847  0.7847 -0.8143
+ [32,] -0.6373  0.6373 -0.7110
+ [33,] -0.5969  0.5969 -0.6171
+ [34,] -0.5908  0.5908 -0.5939
+ [35,] -0.2757  0.2757 -0.4333
+ [36,] -0.2046  0.2046 -0.2402
+ [37,] -0.1649  0.1649 -0.1848
+ [38,] -0.0534  0.0534 -0.1092
+ [39,]  0.0000  0.0000 -0.0267
+ [40,]  0.0027 -0.0027  0.0014
+ [41,]  0.0073 -0.0073  0.0050
+ [42,]  0.0202 -0.0202  0.0138
+ [43,]  0.0510 -0.0510  0.0356
+ [44,]  0.0682 -0.0682  0.0596
+ [45,]  0.0836 -0.0836  0.0759
+ [46,]  0.1044 -0.1044  0.0940
+ [47,]  0.1325 -0.1325  0.1185
+ [48,]  0.1373 -0.1373  0.1349
+ [49,]  0.1616 -0.1616  0.1494
+ [50,]  0.2119 -0.2119  0.1868
+ [51,]  0.2128 -0.2128  0.2124
+ [52,]  0.2163 -0.2163  0.2146
+ [53,]  0.2164 -0.2164  0.2164
+ [54,]  0.2254 -0.2254  0.2209
+ [55,]  0.2286 -0.2286  0.2270
+ [56,]  0.2716 -0.2716  0.2501
+ [57,]  0.2849 -0.2849  0.2782
+ [58,]  0.2940 -0.2940  0.2895
+ [59,]  0.2946 -0.2946  0.2943
+ [60,]  0.3395 -0.3395  0.3171
+ [61,]  0.3398 -0.3398  0.3397
+ [62,]  0.3978 -0.3978  0.3688
+ [63,]  0.4258 -0.4258  0.4118
+ [64,]  0.4591 -0.4591  0.4425
+ [65,]  0.4813 -0.4813  0.4702
+ [66,]  0.4960 -0.4960  0.4886
+ [67,]  0.5029 -0.5029  0.4995
+ [68,]  0.5570 -0.5570  0.5300
+ [69,]  0.5748 -0.5748  0.5659
+ [70,]  0.5788 -0.5788  0.5768
+ [71,]  0.5968 -0.5968  0.5878
+ [72,]  0.6395 -0.6395  0.6181
+ [73,]  0.6571 -0.6571  0.6483
+ [74,]  0.6585 -0.6585  0.6578
+ [75,]  0.6671 -0.6671  0.6628
+ [76,]  0.6681 -0.6681  0.6676
+ [77,]  0.6888 -0.6888  0.6784
+ [78,]  0.7105 -0.7105  0.6996
+ [79,]  0.7456 -0.7456  0.7281
+ [80,]  0.7718 -0.7718  0.7587
+ [81,]  0.8038 -0.8038  0.7878
+ [82,]  0.8046 -0.8046  0.8042
+ [83,]  0.8200 -0.8200  0.8123
+ [84,]  0.8233 -0.8233  0.8216
+ [85,]  0.8321 -0.8321  0.8277
+ [86,]  0.8634 -0.8634  0.8478
+ [87,]  0.8984 -0.8984  0.8809
+ [88,]  0.9198 -0.9198  0.9091
+ [89,]  0.9226 -0.9226  0.9212
+ [90,]  0.9386 -0.9386  0.9306
+ [91,]  0.9404 -0.9404  0.9395
+ [92,]  0.9424 -0.9424  0.9414
+ [93,]  0.9503 -0.9503  0.9464
+ [94,]  1.0155 -1.0155  0.9829
+ [95,]  1.0194 -1.0194  1.0175
+ [96,]  1.0365 -1.0365  1.0279
+ [97,]  1.1316 -1.1316  1.0840
+ [98,]  1.1715 -1.1715  1.1516
+ [99,]  1.1805 -1.1805  1.1760
+[100,]  1.1986 -1.1986  1.1895
+[101,]  1.2086 -1.2086  1.2036
+[102,]  1.2167 -1.2167  1.2127
+[103,]  1.2187 -1.2187  1.2177
+[104,]  1.2325 -1.2325  1.2256
+[105,]  1.2585 -1.2585  1.2455
+[106,]  1.3014 -1.3014  1.2799
+[107,]  1.3192 -1.3192  1.3103
+[108,]  1.3203 -1.3203  1.3198
+[109,]  1.3297 -1.3297  1.3250
+[110,]  1.3558 -1.3558  1.3427
+[111,]  1.5096 -1.5096  1.4327
+[112,]  1.5914 -1.5914  1.5505
+[113,]  1.5923 -1.5923  1.5918
+[114,]  1.5973 -1.5973  1.5948
+[115,]  1.6000 -1.6000  1.5986
+[116,] -1.6000  1.6000     Inf
+max(h - u) on grid: 0 | u inc: TRUE | z dec: TRUE 
+--- it = 250 npts = 148 
+          [,1]    [,2]    [,3]
+  [1,] -1.6000  1.6000    -Inf
+  [2,] -1.5812  1.5812 -1.5906
+  [3,] -1.5595  1.5595 -1.5704
+  [4,] -1.5456  1.5456 -1.5525
+  [5,] -1.5317  1.5317 -1.5386
+  [6,] -1.5228  1.5228 -1.5273
+  [7,] -1.4904  1.4904 -1.5066
+  [8,] -1.4891  1.4891 -1.4898
+  [9,] -1.4862  1.4862 -1.4877
+ [10,] -1.4779  1.4779 -1.4820
+ [11,] -1.4765  1.4765 -1.4772
+ [12,] -1.4724  1.4724 -1.4745
+ [13,] -1.4713  1.4713 -1.4718
+ [14,] -1.4679  1.4679 -1.4696
+ [15,] -1.4497  1.4497 -1.4588
+ [16,] -1.3826  1.3826 -1.4161
+ [17,] -1.3732  1.3732 -1.3779
+ [18,] -1.3645  1.3645 -1.3689
+ [19,] -1.3404  1.3404 -1.3525
+ [20,] -1.3377  1.3377 -1.3391
+ [21,] -1.2881  1.2881 -1.3129
+ [22,] -1.2729  1.2729 -1.2805
+ [23,] -1.2718  1.2718 -1.2724
+ [24,] -1.2403  1.2403 -1.2561
+ [25,] -1.1850  1.1850 -1.2126
+ [26,] -1.1612  1.1612 -1.1731
+ [27,] -1.0932  1.0932 -1.1272
+ [28,] -1.0816  1.0816 -1.0874
+ [29,] -1.0578  1.0578 -1.0697
+ [30,] -1.0453  1.0453 -1.0516
+ [31,] -0.9997  0.9997 -1.0225
+ [32,] -0.9882  0.9882 -0.9940
+ [33,] -0.9598  0.9598 -0.9740
+ [34,] -0.9341  0.9341 -0.9469
+ [35,] -0.9074  0.9074 -0.9208
+ [36,] -0.8581  0.8581 -0.8827
+ [37,] -0.8440  0.8440 -0.8510
+ [38,] -0.7847  0.7847 -0.8143
+ [39,] -0.6373  0.6373 -0.7110
+ [40,] -0.5969  0.5969 -0.6171
+ [41,] -0.5908  0.5908 -0.5939
+ [42,] -0.2757  0.2757 -0.4333
+ [43,] -0.2046  0.2046 -0.2402
+ [44,] -0.1649  0.1649 -0.1848
+ [45,] -0.0534  0.0534 -0.1092
+ [46,]  0.0000  0.0000 -0.0267
+ [47,]  0.0027 -0.0027  0.0014
+ [48,]  0.0073 -0.0073  0.0050
+ [49,]  0.0202 -0.0202  0.0138
+ [50,]  0.0248 -0.0248  0.0225
+ [51,]  0.0251 -0.0251  0.0249
+ [52,]  0.0510 -0.0510  0.0380
+ [53,]  0.0619 -0.0619  0.0565
+ [54,]  0.0682 -0.0682  0.0651
+ [55,]  0.0836 -0.0836  0.0759
+ [56,]  0.1044 -0.1044  0.0940
+ [57,]  0.1325 -0.1325  0.1185
+ [58,]  0.1373 -0.1373  0.1349
+ [59,]  0.1415 -0.1415  0.1394
+ [60,]  0.1616 -0.1616  0.1515
+ [61,]  0.1643 -0.1643  0.1629
+ [62,]  0.2029 -0.2029  0.1836
+ [63,]  0.2119 -0.2119  0.2074
+ [64,]  0.2128 -0.2128  0.2124
+ [65,]  0.2163 -0.2163  0.2146
+ [66,]  0.2164 -0.2164  0.2164
+ [67,]  0.2253 -0.2253  0.2208
+ [68,]  0.2254 -0.2254  0.2253
+ [69,]  0.2286 -0.2286  0.2270
+ [70,]  0.2634 -0.2634  0.2460
+ [71,]  0.2652 -0.2652  0.2643
+ [72,]  0.2716 -0.2716  0.2684
+ [73,]  0.2796 -0.2796  0.2756
+ [74,]  0.2849 -0.2849  0.2823
+ [75,]  0.2940 -0.2940  0.2895
+ [76,]  0.2946 -0.2946  0.2943
+ [77,]  0.3147 -0.3147  0.3047
+ [78,]  0.3391 -0.3391  0.3269
+ [79,]  0.3395 -0.3395  0.3393
+ [80,]  0.3398 -0.3398  0.3397
+ [81,]  0.3610 -0.3610  0.3504
+ [82,]  0.3753 -0.3753  0.3682
+ [83,]  0.3978 -0.3978  0.3865
+ [84,]  0.4258 -0.4258  0.4118
+ [85,]  0.4451 -0.4451  0.4354
+ [86,]  0.4591 -0.4591  0.4521
+ [87,]  0.4813 -0.4813  0.4702
+ [88,]  0.4827 -0.4827  0.4820
+ [89,]  0.4960 -0.4960  0.4893
+ [90,]  0.5029 -0.5029  0.4995
+ [91,]  0.5570 -0.5570  0.5300
+ [92,]  0.5602 -0.5602  0.5586
+ [93,]  0.5681 -0.5681  0.5642
+ [94,]  0.5748 -0.5748  0.5715
+ [95,]  0.5788 -0.5788  0.5768
+ [96,]  0.5968 -0.5968  0.5878
+ [97,]  0.6395 -0.6395  0.6181
+ [98,]  0.6571 -0.6571  0.6483
+ [99,]  0.6585 -0.6585  0.6578
+[100,]  0.6671 -0.6671  0.6628
+[101,]  0.6681 -0.6681  0.6676
+[102,]  0.6888 -0.6888  0.6784
+[103,]  0.7007 -0.7007  0.6947
+[104,]  0.7105 -0.7105  0.7056
+[105,]  0.7294 -0.7294  0.7199
+[106,]  0.7298 -0.7298  0.7296
+[107,]  0.7456 -0.7456  0.7377
+[108,]  0.7718 -0.7718  0.7587
+[109,]  0.8038 -0.8038  0.7878
+[110,]  0.8046 -0.8046  0.8042
+[111,]  0.8200 -0.8200  0.8123
+[112,]  0.8233 -0.8233  0.8216
+[113,]  0.8321 -0.8321  0.8277
+[114,]  0.8634 -0.8634  0.8478
+[115,]  0.8637 -0.8637  0.8636
+[116,]  0.8984 -0.8984  0.8811
+[117,]  0.9198 -0.9198  0.9091
+[118,]  0.9226 -0.9226  0.9212
+[119,]  0.9386 -0.9386  0.9306
+[120,]  0.9404 -0.9404  0.9395
+[121,]  0.9424 -0.9424  0.9414
+[122,]  0.9503 -0.9503  0.9464
+[123,]  1.0155 -1.0155  0.9829
+[124,]  1.0194 -1.0194  1.0175
+[125,]  1.0365 -1.0365  1.0279
+[126,]  1.0517 -1.0517  1.0441
+[127,]  1.1316 -1.1316  1.0917
+[128,]  1.1603 -1.1603  1.1460
+[129,]  1.1715 -1.1715  1.1659
+[130,]  1.1805 -1.1805  1.1760
+[131,]  1.1986 -1.1986  1.1895
+[132,]  1.2086 -1.2086  1.2036
+[133,]  1.2167 -1.2167  1.2127
+[134,]  1.2187 -1.2187  1.2177
+[135,]  1.2325 -1.2325  1.2256
+[136,]  1.2585 -1.2585  1.2455
+[137,]  1.2911 -1.2911  1.2748
+[138,]  1.3014 -1.3014  1.2962
+[139,]  1.3192 -1.3192  1.3103
+[140,]  1.3203 -1.3203  1.3198
+[141,]  1.3297 -1.3297  1.3250
+[142,]  1.3437 -1.3437  1.3367
+[143,]  1.3558 -1.3558  1.3498
+[144,]  1.5096 -1.5096  1.4327
+[145,]  1.5914 -1.5914  1.5505
+[146,]  1.5923 -1.5923  1.5918
+[147,]  1.5973 -1.5973  1.5948
+[148,]  1.6000 -1.6000  1.5986
+[149,] -1.6000  1.6000     Inf
+max(h - u) on grid: 0 | u inc: TRUE | z dec: TRUE 
+--- it = 300 npts = 180 
+          [,1]    [,2]    [,3]
+  [1,] -1.6000  1.6000    -Inf
+  [2,] -1.5812  1.5812 -1.5906
+  [3,] -1.5595  1.5595 -1.5704
+  [4,] -1.5456  1.5456 -1.5525
+  [5,] -1.5317  1.5317 -1.5386
+  [6,] -1.5228  1.5228 -1.5273
+  [7,] -1.4904  1.4904 -1.5066
+  [8,] -1.4891  1.4891 -1.4898
+  [9,] -1.4862  1.4862 -1.4877
+ [10,] -1.4779  1.4779 -1.4820
+ [11,] -1.4765  1.4765 -1.4772
+ [12,] -1.4724  1.4724 -1.4745
+ [13,] -1.4713  1.4713 -1.4718
+ [14,] -1.4679  1.4679 -1.4696
+ [15,] -1.4497  1.4497 -1.4588
+ [16,] -1.3826  1.3826 -1.4161
+ [17,] -1.3732  1.3732 -1.3779
+ [18,] -1.3645  1.3645 -1.3689
+ [19,] -1.3404  1.3404 -1.3525
+ [20,] -1.3377  1.3377 -1.3391
+ [21,] -1.2881  1.2881 -1.3129
+ [22,] -1.2729  1.2729 -1.2805
+ [23,] -1.2718  1.2718 -1.2724
+ [24,] -1.2674  1.2674 -1.2696
+ [25,] -1.2546  1.2546 -1.2610
+ [26,] -1.2403  1.2403 -1.2474
+ [27,] -1.2079  1.2079 -1.2241
+ [28,] -1.1850  1.1850 -1.1964
+ [29,] -1.1805  1.1805 -1.1827
+ [30,] -1.1612  1.1612 -1.1709
+ [31,] -1.1156  1.1156 -1.1384
+ [32,] -1.0932  1.0932 -1.1044
+ [33,] -1.0816  1.0816 -1.0874
+ [34,] -1.0578  1.0578 -1.0697
+ [35,] -1.0453  1.0453 -1.0516
+ [36,] -0.9997  0.9997 -1.0225
+ [37,] -0.9882  0.9882 -0.9940
+ [38,] -0.9598  0.9598 -0.9740
+ [39,] -0.9341  0.9341 -0.9469
+ [40,] -0.9074  0.9074 -0.9208
+ [41,] -0.8581  0.8581 -0.8827
+ [42,] -0.8440  0.8440 -0.8510
+ [43,] -0.7847  0.7847 -0.8143
+ [44,] -0.6373  0.6373 -0.7110
+ [45,] -0.5969  0.5969 -0.6171
+ [46,] -0.5908  0.5908 -0.5939
+ [47,] -0.4422  0.4422 -0.5165
+ [48,] -0.3469  0.3469 -0.3946
+ [49,] -0.2757  0.2757 -0.3113
+ [50,] -0.2046  0.2046 -0.2402
+ [51,] -0.1649  0.1649 -0.1848
+ [52,] -0.0534  0.0534 -0.1092
+ [53,]  0.0000  0.0000 -0.0267
+ [54,]  0.0027 -0.0027  0.0014
+ [55,]  0.0073 -0.0073  0.0050
+ [56,]  0.0191 -0.0191  0.0132
+ [57,]  0.0200 -0.0200  0.0195
+ [58,]  0.0202 -0.0202  0.0201
+ [59,]  0.0248 -0.0248  0.0225
+ [60,]  0.0251 -0.0251  0.0249
+ [61,]  0.0434 -0.0434  0.0343
+ [62,]  0.0510 -0.0510  0.0472
+ [63,]  0.0619 -0.0619  0.0565
+ [64,]  0.0682 -0.0682  0.0651
+ [65,]  0.0738 -0.0738  0.0710
+ [66,]  0.0836 -0.0836  0.0787
+ [67,]  0.1044 -0.1044  0.0940
+ [68,]  0.1325 -0.1325  0.1185
+ [69,]  0.1373 -0.1373  0.1349
+ [70,]  0.1415 -0.1415  0.1394
+ [71,]  0.1616 -0.1616  0.1515
+ [72,]  0.1643 -0.1643  0.1629
+ [73,]  0.2029 -0.2029  0.1836
+ [74,]  0.2091 -0.2091  0.2060
+ [75,]  0.2119 -0.2119  0.2105
+ [76,]  0.2128 -0.2128  0.2124
+ [77,]  0.2131 -0.2131  0.2130
+ [78,]  0.2163 -0.2163  0.2147
+ [79,]  0.2164 -0.2164  0.2164
+ [80,]  0.2253 -0.2253  0.2208
+ [81,]  0.2254 -0.2254  0.2253
+ [82,]  0.2286 -0.2286  0.2270
+ [83,]  0.2373 -0.2373  0.2329
+ [84,]  0.2504 -0.2504  0.2438
+ [85,]  0.2634 -0.2634  0.2569
+ [86,]  0.2652 -0.2652  0.2643
+ [87,]  0.2680 -0.2680  0.2666
+ [88,]  0.2716 -0.2716  0.2698
+ [89,]  0.2796 -0.2796  0.2756
+ [90,]  0.2849 -0.2849  0.2823
+ [91,]  0.2940 -0.2940  0.2895
+ [92,]  0.2946 -0.2946  0.2943
+ [93,]  0.3147 -0.3147  0.3047
+ [94,]  0.3391 -0.3391  0.3269
+ [95,]  0.3395 -0.3395  0.3393
+ [96,]  0.3398 -0.3398  0.3397
+ [97,]  0.3610 -0.3610  0.3504
+ [98,]  0.3753 -0.3753  0.3682
+ [99,]  0.3978 -0.3978  0.3865
+[100,]  0.4258 -0.4258  0.4118
+[101,]  0.4451 -0.4451  0.4354
+[102,]  0.4591 -0.4591  0.4521
+[103,]  0.4813 -0.4813  0.4702
+[104,]  0.4827 -0.4827  0.4820
+[105,]  0.4960 -0.4960  0.4893
+[106,]  0.5029 -0.5029  0.4995
+[107,]  0.5231 -0.5231  0.5130
+[108,]  0.5570 -0.5570  0.5401
+[109,]  0.5602 -0.5602  0.5586
+[110,]  0.5681 -0.5681  0.5642
+[111,]  0.5748 -0.5748  0.5715
+[112,]  0.5788 -0.5788  0.5768
+[113,]  0.5968 -0.5968  0.5878
+[114,]  0.6130 -0.6130  0.6049
+[115,]  0.6151 -0.6151  0.6141
+[116,]  0.6395 -0.6395  0.6273
+[117,]  0.6571 -0.6571  0.6483
+[118,]  0.6574 -0.6574  0.6573
+[119,]  0.6585 -0.6585  0.6579
+[120,]  0.6671 -0.6671  0.6628
+[121,]  0.6681 -0.6681  0.6676
+[122,]  0.6888 -0.6888  0.6784
+[123,]  0.7007 -0.7007  0.6947
+[124,]  0.7058 -0.7058  0.7032
+[125,]  0.7105 -0.7105  0.7082
+[126,]  0.7294 -0.7294  0.7199
+[127,]  0.7298 -0.7298  0.7296
+[128,]  0.7456 -0.7456  0.7377
+[129,]  0.7718 -0.7718  0.7587
+[130,]  0.8038 -0.8038  0.7878
+[131,]  0.8046 -0.8046  0.8042
+[132,]  0.8200 -0.8200  0.8123
+[133,]  0.8233 -0.8233  0.8216
+[134,]  0.8321 -0.8321  0.8277
+[135,]  0.8532 -0.8532  0.8427
+[136,]  0.8634 -0.8634  0.8583
+[137,]  0.8637 -0.8637  0.8636
+[138,]  0.8984 -0.8984  0.8811
+[139,]  0.9198 -0.9198  0.9091
+[140,]  0.9226 -0.9226  0.9212
+[141,]  0.9298 -0.9298  0.9262
+[142,]  0.9386 -0.9386  0.9342
+[143,]  0.9404 -0.9404  0.9395
+[144,]  0.9424 -0.9424  0.9414
+[145,]  0.9503 -0.9503  0.9464
+[146,]  0.9635 -0.9635  0.9569
+[147,]  1.0155 -1.0155  0.9895
+[148,]  1.0194 -1.0194  1.0175
+[149,]  1.0365 -1.0365  1.0279
+[150,]  1.0517 -1.0517  1.0441
+[151,]  1.1036 -1.1036  1.0777
+[152,]  1.1274 -1.1274  1.1155
+[153,]  1.1316 -1.1316  1.1295
+[154,]  1.1603 -1.1603  1.1460
+[155,]  1.1715 -1.1715  1.1659
+[156,]  1.1805 -1.1805  1.1760
+[157,]  1.1986 -1.1986  1.1895
+[158,]  1.2071 -1.2071  1.2028
+[159,]  1.2086 -1.2086  1.2078
+[160,]  1.2167 -1.2167  1.2127
+[161,]  1.2187 -1.2187  1.2177
+[162,]  1.2296 -1.2296  1.2242
+[163,]  1.2325 -1.2325  1.2311
+[164,]  1.2386 -1.2386  1.2356
+[165,]  1.2413 -1.2413  1.2400
+[166,]  1.2585 -1.2585  1.2499
+[167,]  1.2911 -1.2911  1.2748
+[168,]  1.3014 -1.3014  1.2962
+[169,]  1.3192 -1.3192  1.3103
+[170,]  1.3203 -1.3203  1.3198
+[171,]  1.3297 -1.3297  1.3250
+[172,]  1.3412 -1.3412  1.3354
+[173,]  1.3437 -1.3437  1.3425
+[174,]  1.3558 -1.3558  1.3498
+[175,]  1.4304 -1.4304  1.3931
+[176,]  1.5096 -1.5096  1.4700
+[177,]  1.5914 -1.5914  1.5505
+[178,]  1.5923 -1.5923  1.5918
+[179,]  1.5973 -1.5973  1.5948
+[180,]  1.6000 -1.6000  1.5986
+[181,] -1.6000  1.6000     Inf
+max(h - u) on grid: 0 | u inc: TRUE | z dec: TRUE 
+Warning messages:
+1: In cbind(env$x, env$z, env$u) :
+  number of rows of result is not a multiple of vector length (arg 1)
+2: In cbind(env$x, env$z, env$u) :
+  number of rows of result is not a multiple of vector length (arg 1)
+3: In cbind(env$x, env$z, env$u) :
+  number of rows of result is not a multiple of vector length (arg 1)
+4: In cbind(env$x, env$z, env$u) :
+  number of rows of result is not a multiple of vector length (arg 1)
+5: In cbind(env$x, env$z, env$u) :
+  number of rows of result is not a multiple of vector length (arg 1)
+6: In cbind(env$x, env$z, env$u) :
+  number of rows of result is not a multiple of vector length (arg 1)
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/dbg2.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> h <- e$ars_make_log_density(dnorm)
+[?2004l[?2004h> env <- e$ars_initialize(h, c(-Inf, Inf))
+[?2004l[?2004h> set.seed(7)
+[?2004l[?2004h> acc <- numeric(0); nw <- numeric(0)
+[?2004l[?2004h> for (it in 1:500) {
+[?2004l[?2004h>   xs <- e$ars_sample_envelope(env)
+[?2004l[?2004h>   nw <- c(nw, xs)
+[?2004l[?2004h>   u <- e$ars_upper_hull(env, xs)
+[?2004l[?2004h>   l <- e$ars_lower_hull(env, xs)
+[?2004l[?2004h>   r <- log(runif(1))
+[?2004l[?2004h>   hv <- h(xs)
+[?2004l[?2004h>   if (r <= l - u || (is.finite(hv) && r <= hv - u)) {
+[?2004l[?2004h>     acc <- c(acc, xs)
+[?2004l[?2004h>     env <- e$ars_update(env, xs, hv, e$ars_derivative(h, xs))
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> cat("adaptive accepted (n=", length(acc), "): mean =", round(mean(acc),4),
+[?2004l[?2004h>     "sd =", round(sd(acc),4), "\n")
+[?2004l[?2004h> # static (frozen envelope, no adaptation)
+[?2004l[?2004h> set.seed(9)
+[?2004l[?2004h> acc2 <- numeric(0)
+[?2004l[?2004h> N <- 200000
+[?2004l[?2004h> for (it in 1:N) {
+[?2004l[?2004h>   xs <- e$ars_sample_envelope(env)
+[?2004l[?2004h>   u <- e$ars_upper_hull(env, xs)
+[?2004l[?2004h>   hv <- h(xs)
+[?2004l[?2004h>   if (is.finite(hv) && log(runif(1)) <= hv - u) acc2 <- c(acc2, xs)
+[?2004l[?2004h> }
+[?2004l[?2004h> cat("static accepted (n=", length(acc2), "): mean =", round(mean(acc2),4),
+[?2004l[?2004h>     "sd =", round(sd(acc2),4),
+[?2004l[?2004h>     "q95 =", round(quantile(acc2, .95),4), "(exact 1.645)\n")
+[?2004l[?2004h> # independent check of the proposal itself via uniform subdivision
+[?2004l[?2004h> set.seed(11); nS <- 120000; nsub <- 4000
+[?2004l[?2004h> pts <- numeric(nS); lw <- e$ars_log_piece_weights(env); W <- exp(lw - max(lw)); W <- W/sum(W)
+[?2004l[?2004h> K <- length(W)
+[?2004l[?2004h> for (s in 1:nS) {
+[?2004l[?2004h>   t <- 1 + ceiling(runif(1) * cumsum(c(0, cumsum(W)))[K + 1] - runif(1))
+[?2004l[?2004h>   t <- min(max(t, 1), K)
+[?2004l[?2004h>   l <- env$u[t]; r <- env$u[t+1]; zt <- env$z[t]
+[?2004l[?2004h>   grid <- if (is.finite(l) && is.finite(r)) seq(l, r, length.out = nsub) else stats::qnorm(seq(1e-6, 1 - 1e-6, length.out = nsub), mean = 0, sd = 3)[seq(1, nsub)]
+[?2004l[?2004h>   # crude: pick piece by exact uniform sub-integral
+[?2004l[?2004h>   wvals <- exp(zt * grid)
+[?2004l[?2004h>   pts[s] <- sample(grid, 1, prob = wvals)
+[?2004l[?2004h> }
+[?2004l[?2004h> cat("proposal (grid MC, n=", nS, "): mean =", round(mean(nw[1:N]),4), "sd =", round(sd(nw[1:N]),4),
+[?2004l[?2004h>     "\nproposal q95 =", round(quantile(nw[1:N], .95),4), "\n")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/dbg2.R
+[?2004ladaptive accepted (n= 415 ): mean = -0.291 sd = 1.3164 
+static accepted (n= 162306 ): mean = -0.1783 sd = 1.3468 q95 = 1.7349 (exact 1.645)
+Error in quantile.default(nw[1:N], 0.95) : 
+  missing values and NaN's not allowed if 'na.rm' is FALSE
+Calls: cat -> quantile -> quantile.default
+Execution halted
+[?2004hroot@a8ff99d7b1c6:/app# ^C[?2004l[?2004h[?2004l
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/dbg2.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> h <- e$ars_make_log_density(dnorm)
+[?2004l[?2004h> env <- e$ars_initialize(h, c(-Inf, Inf))
+[?2004l[?2004h> set.seed(7)
+[?2004l[?2004h> NW <- numeric(500); ACC <- numeric(500); na <- 0L
+[?2004l[?2004h> for (it in 1:500) {
+[?2004l[?2004h>   xs <- e$ars_sample_envelope(env)
+[?2004l[?2004h>   NW[it] <- xs
+[?2004l[?2004h>   u <- e$ars_upper_hull(env, xs)
+[?2004l[?2004h>   l <- e$ars_lower_hull(env, xs)
+[?2004l[?2004h>   r <- log(runif(1))
+[?2004l[?2004h>   hv <- h(xs)
+[?2004l[?2004h>   if (r <= l - u || (is.finite(hv) && r <= hv - u)) {
+[?2004l[?2004h>     na <- na + 1L; ACC[na] <- xs
+[?2004l[?2004h>     env <- e$ars_update(env, xs, hv, e$ars_derivative(h, xs))
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> cat("adaptive accepted (n=", na, "): mean =", round(mean(ACC[1:na]),4),
+[?2004l[?2004h>     "sd =", round(sd(ACC[1:na]),4), "\n")
+[?2004l[?2004h> cat("proposals (n=500): mean =", round(mean(NW),4), "sd =", round(sd(NW),4),
+[?2004l[?2004h>     " q95 =", round(quantile(NW, .95),4), "\n")
+[?2004l[?2004h> # static (frozen envelope, no adaptation)
+[?2004l[?2004h> set.seed(9)
+[?2004l[?2004h> N <- 200000; acc2 <- numeric(N); na2 <- 0L
+[?2004l[?2004h> for (it in 1:N) {
+[?2004l[?2004h>   xs <- e$ars_sample_envelope(env)
+[?2004l[?2004h>   u <- e$ars_upper_hull(env, xs)
+[?2004l[?2004h>   hv <- h(xs)
+[?2004l[?2004h>   if (is.finite(hv) && log(runif(1)) <= hv - u) { na2 <- na2 + 1L; acc2[na2] <- xs }
+[?2004l[?2004h> }
+[?2004l[?2004h> cat("static accepted (n=", na2, "): mean =", round(mean(acc2[1:na2]),4),
+[?2004l[?2004h>     "sd =", round(sd(acc2[1:na2]),4),
+[?2004l[?2004h>     " q95 =", round(quantile(acc2[1:na2], .95),4), "(exact 1.645)\n")
+[?2004l[?2004h> # proposal distribution from frozen env (exact sampling function, 100k draws)
+[?2004l[?2004h> set.seed(11); nS <- 100000
+[?2004l[?2004h> P <- numeric(nS)
+[?2004l[?2004h> for (s in 1:nS) P[s] <- e$ars_sample_envelope(env)
+[?2004l[?2004h> cat("frozen-env proposals (n=", nS, "): mean =", round(mean(P),4),
+[?2004l[?2004h>     " sd =", round(sd(P),4), " q05 =", round(quantile(P, .05),4),
+[?2004l[?2004h>     " q95 =", round(quantile(P, .95),4), "(exact +-1.645)\n")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/dbg2.R
+[?2004ladaptive accepted (n= 415 ): mean = -0.291 sd = 1.3164 
+proposals (n=500): mean = -2.2602 sd = 10.9652  q95 = 1.648 
+static accepted (n= 162306 ): mean = -0.1783 sd = 1.3468  q95 = 1.7349 (exact 1.645)
+frozen-env proposals (n= 1e+05 ): mean = -2.5223  sd = 14.1648  q05 = -9.2745  q95 = 1.781 (exact +-1.645)
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/dbg3.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> h <- e$ars_make_log_density(dnorm)
+[?2004l[?2004h> env <- e$ars_initialize(h, c(-Inf, Inf))
+[?2004l[?2004h> set.seed(7)
+[?2004l[?2004h> for (it in 1:500) {
+[?2004l[?2004h>   xs <- e$ars_sample_envelope(env)
+[?2004l[?2004h>   u <- e$ars_upper_hull(env, xs)
+[?2004l[?2004h>   l <- e$ars_lower_hull(env, xs)
+[?2004l[?2004h>   r <- log(runif(1)); hv <- h(xs)
+[?2004l[?2004h>   if (r <= l - u || (is.finite(hv) && r <= hv - u))
+[?2004l[?2004h>     env <- e$ars_update(env, xs, hv, e$ars_derivative(h, xs))
+[?2004l[?2004h> }
+[?2004l[?2004h> cat("npts =", length(env$x), "\n")
+[?2004l[?2004h> xg <- seq(-12, 12, by = 0.002)
+[?2004l[?2004h> ul <- sapply(xg, function(q) e$ars_upper_hull(env, q))
+[?2004l[?2004h> cat("max(h - u) on fine grid [-12,12]:", max(h(xg) - ul), "\n")
+[?2004l[?2004h> # per-piece weight check
+[?2004l[?2004h> K <- length(env$z); lw <- e$ars_log_piece_weights(env)
+[?2004l[?2004h> for (t in 1:K) {
+[?2004l[?2004h>   l <- env$u[t]; r <- env$u[t+1]; zt <- env$z[t]; cpt <- env$intercept[t]
+[?2004l[?2004h>   if (is.infinite(l) && is.finite(r)) {
+[?2004l[?2004h>     I <- exp(cpt + zt * r) / zt
+[?2004l[?2004h>   } else if (is.finite(l) && is.infinite(r)) {
+[?2004l[?2004h>     I <- exp(cpt + zt * l) / -zt
+[?2004l[?2004h>   } else if (is.finite(l) && is.finite(r)) {
+[?2004l[?2004h>     g <- seq(l, r, length.out = 200001)
+[?2004l[?2004h>     I <- sum(exp(cpt + zt * g)) * (r - l) / length(g)
+[?2004l[?2004h>   } else next
+[?2004l[?2004h>   est <- exp(lw[t] - max(lw))
+[?2004l[?2004h>   tru <- I / sum(sapply(1:K, function(q) { 1 })) # placeholder
+[?2004l[?2004h>   cat(sprintf("piece %2d: l=%8.4f r=%8.4f z=%8.4f  weight(log)=%.6f  I=%.6e\n",
+[?2004l[?2004h>               t, l, r, zt, lw[t], I))
+[?2004l[?2004h> }
+[?2004l[?2004h> # CDF check within-piece: sample within one middle piece directly
+[?2004l[?2004h> t <- K %/% 2
+[?2004l[?2004h> l <- env$u[t]; r <- env$u[t+1]; zt <- env$z[t]
+[?2004l[?2004h> N2 <- 100000; xs <- numeric(N2); W <- runif(N2)
+[?2004l[?2004h> if (zt < -1e-4) { em <- exp(zt * (r - l)); xs <- l + log(W * em + (1 - W)) / zt }
+[?2004l[?2004h> else if (zt > 1e-4) { xs <- l + log(1 - W * (1 - expm1(zt * (r - l)))) / zt } # ascending finite
+[?2004l[?2004h> else xs <- l + W * (r - l)
+[?2004l[?2004h> for (p in c(0.1, 0.25, 0.5, 0.75, 0.9)) {
+[?2004l[?2004h>   if (zt < 0) CDF <- (1 - exp(zt * (quantile(xs, p) - l))) / (1 - exp(zt * (r - l)))
+[?2004l[?2004h>   else if (zt > 0) CDF <- (exp(zt * (quantile(xs, p) - l)) - 1) / (exp(zt * (r - l)) - 1)
+[?2004l[?2004h>   else CDF <- (quantile(xs, p) - l) / (r - l)
+[?2004l[?2004h>   cat(sprintf("piece %d (z=%.3f) quantile p=%.2f: empirical CDF = %.4f\n", t, zt, p, CDF))
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/dbg3.R
+[?2004lnpts = 200 
+max(h - u) on fine grid [-12,12]: 0 
+piece  1: l=    -Inf r= -1.5963 z=  1.6000  weight(log)=-2.662989  I=6.973946e-02
+piece  2: l= -1.5963 r= -1.5783 z=  1.5926  weight(log)=-6.196908  I=2.035716e-03
+piece  3: l= -1.5783 r= -1.5634 z=  1.5640  weight(log)=-6.360496  I=1.728509e-03
+piece  4: l= -1.5634 r= -1.5472 z=  1.5628  weight(log)=-6.252732  I=1.925188e-03
+piece  5: l= -1.5472 r= -1.5199 z=  1.5317  weight(log)=-5.693169  I=3.368901e-03
+piece  6: l= -1.5199 r= -1.5028 z=  1.5081  weight(log)=-6.130495  I=2.175504e-03
+piece  7: l= -1.5028 r= -1.4737 z=  1.4975  weight(log)=-5.562332  I=3.839812e-03
+piece  8: l= -1.4737 r= -1.4278 z=  1.4498  weight(log)=-5.053226  I=6.388687e-03
+piece  9: l= -1.4278 r= -1.3989 z=  1.4058  weight(log)=-5.461248  I=4.248250e-03
+piece 10: l= -1.3989 r= -1.3917 z=  1.3920  weight(log)=-6.820674  I=1.090985e-03
+piece 11: l= -1.3917 r= -1.3838 z=  1.3913  weight(log)=-6.723815  I=1.201944e-03
+piece 12: l= -1.3838 r= -1.3582 z=  1.3762  weight(log)=-5.526274  I=3.980795e-03
+piece 13: l= -1.3582 r= -1.3268 z=  1.3402  weight(log)=-5.280940  I=5.087648e-03
+piece 14: l= -1.3268 r= -1.3064 z=  1.3134  weight(log)=-5.676340  I=3.426075e-03
+piece 15: l= -1.3064 r= -1.2987 z=  1.2994  weight(log)=-6.628513  I=1.322128e-03
+piece 16: l= -1.2987 r= -1.2950 z=  1.2979  weight(log)=-7.365737  I=6.325592e-04
+piece 17: l= -1.2950 r= -1.2814 z=  1.2920  weight(log)=-6.045984  I=2.367350e-03
+piece 18: l= -1.2814 r= -1.2504 z=  1.2707  weight(log)=-5.193221  I=5.554088e-03
+piece 19: l= -1.2504 r= -1.2069 z=  1.2300  weight(log)=-4.810147  I=8.146664e-03
+piece 20: l= -1.2069 r= -1.1825 z=  1.1839  weight(log)=-5.346500  I=4.764796e-03
+piece 21: l= -1.1825 r= -1.1795 z=  1.1812  weight(log)=-7.425722  I=5.957304e-04
+piece 22: l= -1.1795 r= -1.1705 z=  1.1779  weight(log)=-6.319033  I=1.801685e-03
+piece 23: l= -1.1705 r= -1.1317 z=  1.1632  weight(log)=-4.830000  I=7.986523e-03
+piece 24: l= -1.1317 r= -1.0892 z=  1.1002  weight(log)=-4.692657  I=9.162308e-03
+piece 25: l= -1.0892 r= -1.0744 z=  1.0781  weight(log)=-5.719677  I=3.280770e-03
+piece 26: l= -1.0744 r= -1.0661 z=  1.0707  weight(log)=-6.278450  I=1.876307e-03
+piece 27: l= -1.0661 r= -1.0565 z=  1.0615  weight(log)=-6.136618  I=2.162223e-03
+piece 28: l= -1.0565 r= -1.0498 z=  1.0516  weight(log)=-6.475884  I=1.540137e-03
+piece 29: l= -1.0498 r= -1.0307 z=  1.0480  weight(log)=-5.417363  I=4.438836e-03
+piece 30: l= -1.0307 r= -1.0109 z=  1.0134  weight(log)=-5.360524  I=4.698443e-03
+piece 31: l= -1.0109 r= -1.0081 z=  1.0084  weight(log)=-7.328109  I=6.568144e-04
+piece 32: l= -1.0081 r= -1.0065 z=  1.0079  weight(log)=-7.827407  I=3.986579e-04
+piece 33: l= -1.0065 r= -0.9974 z=  1.0050  weight(log)=-6.119428  I=2.199713e-03
+piece 34: l= -0.9974 r= -0.9889 z=  0.9897  weight(log)=-6.188348  I=2.053217e-03
+piece 35: l= -0.9889 r= -0.9841 z=  0.9882  weight(log)=-6.727604  I=1.197398e-03
+piece 36: l= -0.9841 r= -0.9787 z=  0.9800  weight(log)=-6.624889  I=1.326928e-03
+piece 37: l= -0.9787 r= -0.9631 z=  0.9774  weight(log)=-5.549455  I=3.889575e-03
+piece 38: l= -0.9631 r= -0.9476 z=  0.9487  weight(log)=-5.547422  I=3.897492e-03
+piece 39: l= -0.9476 r= -0.9379 z=  0.9466  weight(log)=-5.996673  I=2.487013e-03
+piece 40: l= -0.9379 r= -0.9189 z=  0.9293  weight(log)=-5.310379  I=4.940053e-03
+piece 41: l= -0.9189 r= -0.8940 z=  0.9085  weight(log)=-5.023760  I=6.579738e-03
+piece 42: l= -0.8940 r= -0.8753 z=  0.8795  weight(log)=-5.288728  I=5.048175e-03
+piece 43: l= -0.8753 r= -0.8608 z=  0.8710  weight(log)=-5.528836  I=3.970610e-03
+piece 44: l= -0.8608 r= -0.8345 z=  0.8505  weight(log)=-4.916006  I=7.328340e-03
+piece 45: l= -0.8345 r= -0.8047 z=  0.8184  weight(log)=-4.767683  I=8.500050e-03
+piece 46: l= -0.8047 r= -0.7593 z=  0.7909  weight(log)=-4.317299  I=1.333585e-02
+piece 47: l= -0.7593 r= -0.6840 z=  0.7277  weight(log)=-3.766229  I=2.313915e-02
+piece 48: l= -0.6840 r= -0.6391 z=  0.6404  weight(log)=-4.240420  I=1.440154e-02
+piece 49: l= -0.6391 r= -0.6303 z=  0.6378  weight(log)=-5.851980  I=2.874204e-03
+piece 50: l= -0.6303 r= -0.5879 z=  0.6228  weight(log)=-4.264561  I=1.405804e-02
+piece 51: l= -0.5879 r= -0.4392 z=  0.5530  weight(log)=-2.955548  I=5.205014e-02
+piece 52: l= -0.4392 r= -0.1969 z=  0.3254  weight(log)=-2.386727  I=9.193011e-02
+piece 53: l= -0.1969 r= -0.0453 z=  0.0684  weight(log)=-2.811837  I=6.009449e-02
+piece 54: l= -0.0453 r= -0.0152 z=  0.0223  weight(log)=-4.421470  I=1.201656e-02
+piece 55: l= -0.0152 r= -0.0040 z=  0.0081  weight(log)=-5.414461  I=4.451736e-03
+piece 56: l= -0.0040 r=  0.0041 z=  0.0000  weight(log)=-5.733589  I=3.235445e-03
+piece 57: l=  0.0041 r=  0.0084 z= -0.0081  weight(log)=-6.358012  I=1.732808e-03
+piece 58: l=  0.0084 r=  0.0110 z= -0.0087  weight(log)=-6.871467  I=1.036955e-03
+piece 59: l=  0.0110 r=  0.0166 z= -0.0133  weight(log)=-6.112110  I=2.215870e-03
+piece 60: l=  0.0166 r=  0.0243 z= -0.0198  weight(log)=-5.781851  I=3.083003e-03
+piece 61: l=  0.0243 r=  0.0305 z= -0.0288  weight(log)=-6.003942  I=2.468999e-03
+piece 62: l=  0.0305 r=  0.0337 z= -0.0322  weight(log)=-6.652608  I=1.290652e-03
+piece 63: l=  0.0337 r=  0.0456 z= -0.0353  weight(log)=-5.349735  I=4.749407e-03
+piece 64: l=  0.0456 r=  0.0572 z= -0.0560  weight(log)=-5.376031  I=4.626145e-03
+piece 65: l=  0.0572 r=  0.0631 z= -0.0585  weight(log)=-6.055386  I=2.345196e-03
+piece 66: l=  0.0631 r=  0.0709 z= -0.0678  weight(log)=-5.773382  I=3.109225e-03
+piece 67: l=  0.0709 r=  0.0748 z= -0.0741  weight(log)=-6.475390  I=1.540897e-03
+piece 68: l=  0.0748 r=  0.0811 z= -0.0755  weight(log)=-5.985688  I=2.514483e-03
+piece 69: l=  0.0811 r=  0.0886 z= -0.0867  weight(log)=-5.818625  I=2.971688e-03
+piece 70: l=  0.0886 r=  0.0927 z= -0.0905  weight(log)=-6.418032  I=1.631865e-03
+piece 71: l=  0.0927 r=  0.0955 z= -0.0950  weight(log)=-6.824503  I=1.086815e-03
+piece 72: l=  0.0955 r=  0.0976 z= -0.0960  weight(log)=-7.091245  I=8.323608e-04
+piece 73: l=  0.0976 r=  0.0996 z= -0.0992  weight(log)=-7.115890  I=8.120980e-04
+piece 74: l=  0.0996 r=  0.1014 z= -0.1000  weight(log)=-7.231770  I=7.232399e-04
+piece 75: l=  0.1014 r=  0.1033 z= -0.1028  weight(log)=-7.220887  I=7.311537e-04
+piece 76: l=  0.1033 r=  0.1118 z= -0.1037  weight(log)=-5.692690  I=3.370515e-03
+piece 77: l=  0.1118 r=  0.1250 z= -0.1198  weight(log)=-5.248227  I=5.256829e-03
+piece 78: l=  0.1250 r=  0.1350 z= -0.1303  weight(log)=-5.539528  I=3.928382e-03
+piece 79: l=  0.1350 r=  0.1414 z= -0.1397  weight(log)=-5.968769  I=2.557387e-03
+piece 80: l=  0.1414 r=  0.1459 z= -0.1432  weight(log)=-6.350316  I=1.746195e-03
+piece 81: l=  0.1459 r=  0.1511 z= -0.1485  weight(log)=-6.179717  I=2.071014e-03
+piece 82: l=  0.1511 r=  0.1541 z= -0.1537  weight(log)=-6.747308  I=1.174036e-03
+piece 83: l=  0.1541 r=  0.1696 z= -0.1545  weight(log)=-5.095655  I=6.123294e-03
+piece 84: l=  0.1696 r=  0.1916 z= -0.1848  weight(log)=-4.752952  I=8.626192e-03
+piece 85: l=  0.1916 r=  0.2004 z= -0.1984  weight(log)=-5.672534  I=3.439139e-03
+piece 86: l=  0.2004 r=  0.2114 z= -0.2024  weight(log)=-5.453805  I=4.279989e-03
+piece 87: l=  0.2114 r=  0.2216 z= -0.2203  weight(log)=-5.521655  I=3.999223e-03
+piece 88: l=  0.2216 r=  0.2262 z= -0.2229  weight(log)=-6.335997  I=1.771379e-03
+piece 89: l=  0.2262 r=  0.2332 z= -0.2294  weight(log)=-5.907365  I=2.719343e-03
+piece 90: l=  0.2332 r=  0.2372 z= -0.2369  weight(log)=-6.452147  I=1.577132e-03
+piece 91: l=  0.2372 r=  0.2384 z= -0.2376  weight(log)=-7.708864  I=4.488311e-04
+piece 92: l=  0.2384 r=  0.2479 z= -0.2392  weight(log)=-5.608855  I=3.665262e-03
+piece 93: l=  0.2479 r=  0.2608 z= -0.2565  weight(log)=-5.298997  I=4.996602e-03
+piece 94: l=  0.2608 r=  0.2721 z= -0.2651  weight(log)=-5.434303  I=4.364274e-03
+piece 95: l=  0.2721 r=  0.2797 z= -0.2792  weight(log)=-5.844151  I=2.896792e-03
+piece 96: l=  0.2797 r=  0.2805 z= -0.2802  weight(log)=-8.066484  I=3.138849e-04
+piece 97: l=  0.2805 r=  0.2878 z= -0.2808  weight(log)=-5.876056  I=2.805829e-03
+piece 98: l=  0.2878 r=  0.2952 z= -0.2948  weight(log)=-5.874426  I=2.810406e-03
+piece 99: l=  0.2952 r=  0.3017 z= -0.2955  weight(log)=-5.998858  I=2.481585e-03
+piece 100: l=  0.3017 r=  0.3085 z= -0.3078  weight(log)=-5.953319  I=2.597205e-03
+piece 101: l=  0.3085 r=  0.3166 z= -0.3091  weight(log)=-5.776347  I=3.100019e-03
+piece 102: l=  0.3166 r=  0.3361 z= -0.3242  weight(log)=-4.912556  I=7.353671e-03
+piece 103: l=  0.3361 r=  0.3563 z= -0.3480  weight(log)=-4.877847  I=7.613389e-03
+piece 104: l=  0.3563 r=  0.3657 z= -0.3647  weight(log)=-5.651934  I=3.510719e-03
+piece 105: l=  0.3657 r=  0.3706 z= -0.3668  weight(log)=-6.318233  I=1.803127e-03
+piece 106: l=  0.3706 r=  0.3876 z= -0.3744  weight(log)=-5.064542  I=6.316803e-03
+piece 107: l=  0.3876 r=  0.4095 z= -0.4008  weight(log)=-4.818002  I=8.082921e-03
+piece 108: l=  0.4095 r=  0.4183 z= -0.4182  weight(log)=-5.736595  I=3.225733e-03
+piece 109: l=  0.4183 r=  0.4188 z= -0.4184  weight(log)=-8.711994  I=1.645997e-04
+piece 110: l=  0.4188 r=  0.4203 z= -0.4191  weight(log)=-7.523766  I=5.400948e-04
+piece 111: l=  0.4203 r=  0.4300 z= -0.4214  weight(log)=-5.640689  I=3.550420e-03
+piece 112: l=  0.4300 r=  0.4390 z= -0.4386  weight(log)=-5.727693  I=3.254576e-03
+piece 113: l=  0.4390 r=  0.4408 z= -0.4393  weight(log)=-7.307676  I=6.703730e-04
+piece 114: l=  0.4408 r=  0.4458 z= -0.4423  weight(log)=-6.321219  I=1.797750e-03
+piece 115: l=  0.4458 r=  0.4502 z= -0.4493  weight(log)=-6.443462  I=1.590889e-03
+piece 116: l=  0.4502 r=  0.4595 z= -0.4511  weight(log)=-5.705234  I=3.328498e-03
+piece 117: l=  0.4595 r=  0.4685 z= -0.4678  weight(log)=-5.736812  I=3.225033e-03
+piece 118: l=  0.4685 r=  0.4722 z= -0.4691  weight(log)=-6.606924  I=1.350982e-03
+piece 119: l=  0.4722 r=  0.4769 z= -0.4753  weight(log)=-6.405098  I=1.653108e-03
+piece 120: l=  0.4769 r=  0.4872 z= -0.4784  weight(log)=-5.604895  I=3.679805e-03
+piece 121: l=  0.4872 r=  0.5004 z= -0.4961  weight(log)=-5.372706  I=4.641553e-03
+piece 122: l=  0.5004 r=  0.5072 z= -0.5047  weight(log)=-6.027594  I=2.411290e-03
+piece 123: l=  0.5072 r=  0.5227 z= -0.5098  weight(log)=-5.220440  I=5.404949e-03
+piece 124: l=  0.5227 r=  0.5405 z= -0.5356  weight(log)=-5.087611  I=6.172749e-03
+piece 125: l=  0.5405 r=  0.5473 z= -0.5454  weight(log)=-6.059521  I=2.335519e-03
+piece 126: l=  0.5473 r=  0.5565 z= -0.5492  weight(log)=-5.757234  I=3.159838e-03
+piece 127: l=  0.5565 r=  0.5830 z= -0.5639  weight(log)=-4.714487  I=8.964467e-03
+piece 128: l=  0.5830 r=  0.6050 z= -0.6021  weight(log)=-4.910242  I=7.370702e-03
+piece 129: l=  0.6050 r=  0.6209 z= -0.6080  weight(log)=-5.248002  I=5.258015e-03
+piece 130: l=  0.6209 r=  0.6372 z= -0.6339  weight(log)=-5.236148  I=5.320711e-03
+piece 131: l=  0.6372 r=  0.6445 z= -0.6405  weight(log)=-6.040462  I=2.380458e-03
+piece 132: l=  0.6445 r=  0.6560 z= -0.6485  weight(log)=-5.598621  I=3.702968e-03
+piece 133: l=  0.6560 r=  0.6695 z= -0.6634  weight(log)=-5.443851  I=4.322805e-03
+piece 134: l=  0.6695 r=  0.6765 z= -0.6755  weight(log)=-6.104936  I=2.231823e-03
+piece 135: l=  0.6765 r=  0.6794 z= -0.6774  weight(log)=-6.975073  I=9.348985e-04
+piece 136: l=  0.6794 r=  0.6888 z= -0.6814  weight(log)=-5.818677  I=2.971534e-03
+piece 137: l=  0.6888 r=  0.7001 z= -0.6963  weight(log)=-5.646239  I=3.530770e-03
+piece 138: l=  0.7001 r=  0.7113 z= -0.7039  weight(log)=-5.656562  I=3.494510e-03
+piece 139: l=  0.7113 r=  0.7239 z= -0.7187  weight(log)=-5.555380  I=3.866597e-03
+piece 140: l=  0.7239 r=  0.7430 z= -0.7290  weight(log)=-5.144141  I=5.833482e-03
+piece 141: l=  0.7430 r=  0.7605 z= -0.7570  weight(log)=-5.247291  I=5.261753e-03
+piece 142: l=  0.7605 r=  0.7644 z= -0.7640  weight(log)=-6.757037  I=1.162669e-03
+piece 143: l=  0.7644 r=  0.7670 z= -0.7648  weight(log)=-7.165409  I=7.728627e-04
+piece 144: l=  0.7670 r=  0.7709 z= -0.7692  weight(log)=-6.765111  I=1.153320e-03
+piece 145: l=  0.7709 r=  0.7728 z= -0.7726  weight(log)=-7.458097  I=5.767526e-04
+piece 146: l=  0.7728 r=  0.7828 z= -0.7731  weight(log)=-5.834048  I=2.926209e-03
+piece 147: l=  0.7828 r=  0.7953 z= -0.7924  weight(log)=-5.609149  I=3.664186e-03
+piece 148: l=  0.7953 r=  0.8071 z= -0.7982  weight(log)=-5.675662  I=3.428399e-03
+piece 149: l=  0.8071 r=  0.8164 z= -0.8161  weight(log)=-5.935993  I=2.642597e-03
+piece 150: l=  0.8164 r=  0.8200 z= -0.8166  weight(log)=-6.868857  I=1.039665e-03
+piece 151: l=  0.8200 r=  0.8348 z= -0.8234  weight(log)=-5.473959  I=4.194595e-03
+piece 152: l=  0.8348 r=  0.8469 z= -0.8462  weight(log)=-5.688382  I=3.385066e-03
+piece 153: l=  0.8469 r=  0.8489 z= -0.8476  weight(log)=-7.484398  I=5.617815e-04
+piece 154: l=  0.8489 r=  0.8613 z= -0.8502  weight(log)=-5.674664  I=3.431821e-03
+piece 155: l=  0.8613 r=  0.8728 z= -0.8724  weight(log)=-5.761645  I=3.145931e-03
+piece 156: l=  0.8728 r=  0.8739 z= -0.8732  weight(log)=-8.060376  I=3.158079e-04
+piece 157: l=  0.8739 r=  0.8749 z= -0.8747  weight(log)=-8.276213  I=2.544992e-04
+piece 158: l=  0.8749 r=  0.8774 z= -0.8751  weight(log)=-7.298148  I=6.767909e-04
+piece 159: l=  0.8774 r=  0.8808 z= -0.8797  weight(log)=-6.983528  I=9.270264e-04
+piece 160: l=  0.8808 r=  0.8933 z= -0.8819  weight(log)=-5.692522  I=3.371081e-03
+piece 161: l=  0.8933 r=  0.9101 z= -0.9047  weight(log)=-5.410279  I=4.470394e-03
+piece 162: l=  0.9101 r=  0.9162 z= -0.9156  weight(log)=-6.447010  I=1.585256e-03
+piece 163: l=  0.9162 r=  0.9195 z= -0.9168  weight(log)=-7.038616  I=8.773403e-04
+piece 164: l=  0.9195 r=  0.9310 z= -0.9223  weight(log)=-5.815833  I=2.979998e-03
+piece 165: l=  0.9310 r=  0.9430 z= -0.9397  weight(log)=-5.780182  I=3.088153e-03
+piece 166: l=  0.9430 r=  0.9560 z= -0.9463  weight(log)=-5.714592  I=3.297497e-03
+piece 167: l=  0.9560 r=  0.9660 z= -0.9656  weight(log)=-5.985420  I=2.515158e-03
+piece 168: l=  0.9660 r=  0.9704 z= -0.9663  weight(log)=-6.807913  I=1.104997e-03
+piece 169: l=  0.9704 r=  0.9766 z= -0.9745  weight(log)=-6.476661  I=1.538941e-03
+piece 170: l=  0.9766 r=  0.9828 z= -0.9787  weight(log)=-6.478674  I=1.535846e-03
+piece 171: l=  0.9828 r=  0.9906 z= -0.9869  weight(log)=-6.265843  I=1.900110e-03
+piece 172: l=  0.9906 r=  1.0015 z= -0.9942  weight(log)=-5.929265  I=2.660437e-03
+piece 173: l=  1.0015 r=  1.0200 z= -1.0088  weight(log)=-5.417968  I=4.436150e-03
+piece 174: l=  1.0200 r=  1.0336 z= -1.0313  weight(log)=-5.746899  I=3.192666e-03
+piece 175: l=  1.0336 r=  1.0463 z= -1.0359  weight(log)=-5.825084  I=2.952555e-03
+piece 176: l=  1.0463 r=  1.0599 z= -1.0567  weight(log)=-5.771828  I=3.114059e-03
+piece 177: l=  1.0599 r=  1.0678 z= -1.0631  weight(log)=-6.330840  I=1.780537e-03
+piece 178: l=  1.0678 r=  1.0805 z= -1.0724  weight(log)=-5.858959  I=2.854213e-03
+piece 179: l=  1.0805 r=  1.0915 z= -1.0886  weight(log)=-6.019243  I=2.431509e-03
+piece 180: l=  1.0915 r=  1.0992 z= -1.0944  weight(log)=-6.388132  I=1.681394e-03
+piece 181: l=  1.0992 r=  1.1222 z= -1.1040  weight(log)=-5.307952  I=4.952060e-03
+piece 182: l=  1.1222 r=  1.1430 z= -1.1404  weight(log)=-5.429084  I=4.387113e-03
+piece 183: l=  1.1430 r=  1.1545 z= -1.1457  weight(log)=-6.046901  I=2.365181e-03
+piece 184: l=  1.1545 r=  1.1762 z= -1.1633  weight(log)=-5.429868  I=4.383676e-03
+piece 185: l=  1.1762 r=  1.1963 z= -1.1891  weight(log)=-5.526850  I=3.978500e-03
+piece 186: l=  1.1963 r=  1.2120 z= -1.2036  weight(log)=-5.799504  I=3.029056e-03
+piece 187: l=  1.2120 r=  1.2351 z= -1.2204  weight(log)=-5.435014  I=4.361173e-03
+piece 188: l=  1.2351 r=  1.2510 z= -1.2498  weight(log)=-5.835171  I=2.922923e-03
+piece 189: l=  1.2510 r=  1.2572 z= -1.2521  weight(log)=-6.791815  I=1.122929e-03
+piece 190: l=  1.2572 r=  1.2626 z= -1.2622  weight(log)=-6.923370  I=9.845070e-04
+piece 191: l=  1.2626 r=  1.2652 z= -1.2631  weight(log)=-7.699609  I=4.530043e-04
+piece 192: l=  1.2652 r=  1.2683 z= -1.2672  weight(log)=-7.483223  I=5.624418e-04
+piece 193: l=  1.2683 r=  1.2993 z= -1.2693  weight(log)=-5.216457  I=5.426524e-03
+piece 194: l=  1.2993 r=  1.3302 z= -1.3293  weight(log)=-5.261466  I=5.187692e-03
+piece 195: l=  1.3302 r=  1.3571 z= -1.3311  weight(log)=-5.436563  I=4.354424e-03
+piece 196: l=  1.3571 r=  1.3893 z= -1.3831  weight(log)=-5.296974  I=5.006720e-03
+piece 197: l=  1.3893 r=  1.4325 z= -1.3955  weight(log)=-5.055305  I=6.375424e-03
+piece 198: l=  1.4325 r=  1.4915 z= -1.4695  weight(log)=-4.817616  I=8.086038e-03
+piece 199: l=  1.4915 r=  1.5567 z= -1.5135  weight(log)=-4.809746  I=8.149931e-03
+piece 200: l=  1.5567 r=     Inf z= -1.6000  weight(log)=-2.599723  I=7.429415e-02
+Error: unexpected 'else' in "else"
+Execution halted
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/dbg4.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> h <- e$ars_make_log_density(dnorm)
+[?2004l[?2004h> env <- e$ars_initialize(h, c(-Inf, Inf))
+[?2004l[?2004h> set.seed(7)
+[?2004l[?2004h> for (it in 1:500) {
+[?2004l[?2004h>   xs <- e$ars_sample_envelope(env)
+[?2004l[?2004h>   u <- e$ars_upper_hull(env, xs)
+[?2004l[?2004h>   l <- e$ars_lower_hull(env, xs)
+[?2004l[?2004h>   r <- log(runif(1)); hv <- h(xs)
+[?2004l[?2004h>   if (r <= l - u || (is.finite(hv) && r <= hv - u))
+[?2004l[?2004h>     env <- e$ars_update(env, xs, hv, e$ars_derivative(h, xs))
+[?2004l[?2004h> }
+[?2004l[?2004h> N <- 200000
+[?2004l[?2004h> P <- numeric(N)
+[?2004l[?2004h> for (s in 1:N) P[s] <- e$ars_sample_envelope(env)
+[?2004l[?2004h> cat("proposal: mean =", round(mean(P),4), " sd =", round(sd(P),4),
+[?2004l[?2004h>     " q05 =", round(quantile(P, .05),4), " q01 =", round(quantile(P, .01),4),
+[?2004l[?2004h>     " min =", round(min(P),3), "\n")
+[?2004l[?2004h> idx <- pmin(pmax(length(env$u) - sum(sweep(env$u, P, '>')), 1), length(env$z))
+[?2004l[?2004h> cnt <- table(factor(idx, 1:length(env$z)))/N
+[?2004l[?2004h> lw <- e$ars_log_piece_weights(env); W <- exp(lw - max(lw)); W <- W/sum(W)
+[?2004l[?2004h> cat("empirical vs theoretical piece frequencies (first 5 and last 3 pieces):\n")
+[?2004l[?2004h> show <- c(1:5, (length(W) - 2):length(W))
+[?2004l[?2004h> for (t in show) cat(sprintf("  piece %3d: empirical = %.6f  theoretical = %.6f\n", t, cnt[t], W[t]))
+[?2004l[?2004h> # left tail draw check
+[?2004l[?2004h> lt <- P[idx == 1]
+[?2004l[?2004h> zt <- env$z[1]; r <- env$u[2]
+[?2004l[?2004h> cat("left-tail draws: n =", length(lt), " min =", round(min(lt),3))
+[?2004l[?2004h> for (q in c(-6, -4, -3, -2)) {
+[?2004l[?2004h>   emp <- mean(lt <= q)
+[?2004l[?2004h>   theo <- exp(zt * (q - r))
+[?2004l[?2004h>   cat(sprintf("  P(x <= %4.1f): empirical = %.3e   formula e^{z(x-r)} = %.3e\n", q, emp, theo))
+[?2004l[?2004h> }
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/dbg4.R
+[?2004lproposal: mean = -2.4707  sd = 13.7167  q05 = -9.2859  q01 = -45.4721  min = -931.511 
+Error in seq_along(dims)[-MARGIN] : 
+  only 0's may be mixed with negative subscripts
+Calls: pmin -> pmax -> sweep
+Execution halted
+[?2004hroot@a8ff99d7b1c6:/app# python3 - << 'PYEOF'
+[?2004l[?2004h> src = open('/app/ars.R').read()
+[?2004l[?2004h> old = """  if (zt >= tol) {
+[?2004l[?2004h>     x <- r + log(W) / zt                          # ascending left tail
+[?2004l[?2004h>   } else if (zt <= -tol) {"""
+[?2004l[?2004h> new = """  if (zt >= tol) {
+[?2004l[?2004h>     if (!is.infinite(l)) {                        # ascending finite piece
+[?2004l[?2004h>       x <- l + log1p(W * expm1(zt * (r - l))) / zt
+[?2004l[?2004h>     } else {
+[?2004l[?2004h>       x <- r + log(W) / zt                        # ascending left tail
+[?2004l[?2004h>     }
+[?2004l[?2004h>   } else if (zt <= -tol) {"""
+[?2004l[?2004h> assert old in src, "pattern not found"
+[?2004l[?2004h> open('/app/ars.R','w').write(src.replace(old, new))
+[?2004l[?2004h> print("patched OK")
+[?2004l[?2004h> PYEOF
+[?2004lpatched OK
+[?2004hroot@a8ff99d7b1c6:/app# Rscript /app/ars.R
+[?2004l================================================================
+ARS (Gilks & Wild 1992) - formal test suite
+================================================================
+-- Overall function: samples vs known distributions 
+
+TEST_NORMAL_STANDARD: PASS  [n = 5000, mean = 0.0122 (expected 0.00), sd = 0.9902 (expected 1.00), KS p-value = 0.8765]
+TEST_NORMAL_SHIFTED: PASS  [n = 5000, mean = 2.9235 (expected 3.00), sd = 1.9912 (expected 2.00), KS p-value = 0.06514]
+TEST_EXPONENTIAL: PASS  [n = 5000, mean = 0.9920 (expected 1.00), sd = 0.9666 (expected 1.00), KS p-value = 0.8757]
+TEST_GAMMA_SHAPE_3: PASS  [n = 5000, mean = 2.9843 (expected 3.00), sd = 1.7457 (expected 1.73), KS p-value = 0.06338]
+TEST_UNIFORM: PASS  [n = 5000, mean = 0.4978 (expected 0.50), sd = 0.2897 (expected 0.29), KS p-value = 0.6491]
+
+-- Non-log-concave densities are rejected
+TEST_CAUCHY_REJECTED: FAIL  [expected a log-concavity/validity error but none was raised]
+TEST_BIMODAL_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+
+-- Input validation
+TEST_INPUT_NEGATIVE_N: PASS  [caught: ARS: 'n' must be a positive integer, got: -5]
+TEST_INPUT_ZERO_N: PASS  [caught: ARS: 'n' must be a positive integer, got: 0]
+TEST_INPUT_BAD_DOMAIN: PASS  [caught: ARS: invalid 'domain': lower bound (2) must be strictly less than upper bound (1)]
+TEST_INPUT_NOT_FUNCTION: PASS  [caught: ARS: 'density_function' must be a function, e.g. dnorm. Got class: character]
+
+-- Module tests
+MOD_ENVELOPE_INTERSECTIONS: PASS  [intersection points u = (-1.0000, 1.0000), expected (-1, 1); 3 tangents retained]
+MOD_ENVELOPE_SAMPLING: PASS  [mean = -0.0012, sd = 1.0314 (proposal from normal upper hull: symmetric, mean ~ 0, sd ~ 1.02)]
+MOD_ENVELOPE_UPDATE: PASS  [points = 4, slopes = [2, 0, -0.4, -2] (strictly decreasing = TRUE)]
+MOD_LOG_CONCAVITY_DETECTOR: PASS  [slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted]
+MOD_NUMERICAL_DERIVATIVE: PASS  [h'(0) = 0.000000 (expected 0), h'(1) = -1.000000 (expected -1)]
+MOD_TAIL_CHECK: PASS  [left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable]
+
+-- Sample files
+SAMPLE_FILES_WRITTEN: PASS  [normal_samples.txt: n = 1000, mean = 0.0208, sd = 0.9989 | exponential_samples.txt: n = 1000, mean = 0.9868, sd = 0.9960]
+================================================================
+SUMMARY: 17/18 tests passed
+[?2004hroot@a8ff99d7b1c6:/app# python3 - << 'PYEOF'
+[?2004l[?2004h> src = open('/app/ars.R').read()
+[?2004l[?2004h> old = """  if (!is.finite(h_val) || !is.finite(z_val)) return(env)
+[?2004l[?2004h>   if (length(env$x) >= ars_params$max_points) return(env)
+[?2004l[?2004h>   if (x <= env$x[1L] || x > env$x[length(env$x)]) return(env)
+[?2004l[?2004h>   if (any(abs(env$x - x) < ars_params$min_sep * max(1, abs(x)))) return(env)
+[?2004l[?2004h>   at <- sum(env$x < x) + 1L
+[?2004l[?2004h>   env$x <- append(env$x, x, after = at - 1L)
+[?2004l[?2004h>   env$h <- append(env$h, h_val, after = at - 1L)
+[?2004l[?2004h>   env$z <- append(env$z, z_val, after = at - 1L)
+[?2004l[?2004h>   env$intercept <- env$h - env$z * env$x
+[?2004l[?2004h>   env <- ars_check_concavity(env)
+[?2004l[?2004h>   env <- ars_compute_u(env)
+[?2004l[?2004h>   env"""
+[?2004l[?2004h> new = """  if (!is.finite(h_val) || !is.finite(z_val)) return(env)
+[?2004l[?2004h>   if (length(env$x) >= ars_params$max_points) return(env)
+[?2004l[?2004h>   if (any(abs(env$x - x) < ars_params$min_sep * max(1, abs(x)))) return(env)
+[?2004l[?2004h>   # accepted tail points are folded in too: their tangents must obey the
+[?2004l[?2004h>   # same monotone-slope (log-concavity) invariant as interior ones
+[?2004l[?2004h>   at <- sum(env$x < x) + 1L
+[?2004l[?2004h>   env$x <- append(env$x, x, after = at - 1L)
+[?2004l[?2004h>   env$h <- append(env$h, h_val, after = at - 1L)
+[?2004l[?2004h>   env$z <- append(env$z, z_val, after = at - 1L)
+[?2004l[?2004h>   env$intercept <- env$h - env$z * env$x
+[?2004l[?2004h>   env <- ars_check_concavity(env)
+[?2004l[?2004h>   env <- ars_check_tails(env)
+[?2004l[?2004h>   env <- ars_compute_u(env)
+[?2004l[?2004h>   env"""
+[?2004l[?2004h> assert old in src, "pattern not found"
+[?2004l[?2004h> open('/app/ars.R','w').write(src.replace(old, new))
+[?2004l[?2004h> print("patched OK")
+[?2004l[?2004h> PYEOF
+[?2004lpatched OK
+[?2004hroot@a8ff99d7b1c6:/app# Rscript /app/ars.R
+[?2004l================================================================
+ARS (Gilks & Wild 1992) - formal test suite
+================================================================
+-- Overall function: samples vs known distributions 
+
+TEST_NORMAL_STANDARD: PASS  [n = 5000, mean = -0.0166 (expected 0.00), sd = 0.9974 (expected 1.00), KS p-value = 0.4314]
+TEST_NORMAL_SHIFTED: PASS  [n = 5000, mean = 2.9973 (expected 3.00), sd = 2.0141 (expected 2.00), KS p-value = 0.6786]
+TEST_EXPONENTIAL: FAIL  [ERROR: ARS: internal error: non-descending left tail]
+TEST_GAMMA_SHAPE_3: PASS  [n = 5000, mean = 3.0087 (expected 3.00), sd = 1.7569 (expected 1.73), KS p-value = 0.6982]
+TEST_UNIFORM: PASS  [n = 5000, mean = 0.4961 (expected 0.50), sd = 0.2911 (expected 0.29), KS p-value = 0.3475]
+
+-- Non-log-concave densities are rejected
+TEST_CAUCHY_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+TEST_BIMODAL_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+
+-- Input validation
+TEST_INPUT_NEGATIVE_N: PASS  [caught: ARS: 'n' must be a positive integer, got: -5]
+TEST_INPUT_ZERO_N: PASS  [caught: ARS: 'n' must be a positive integer, got: 0]
+TEST_INPUT_BAD_DOMAIN: PASS  [caught: ARS: invalid 'domain': lower bound (2) must be strictly less than upper bound (1)]
+TEST_INPUT_NOT_FUNCTION: PASS  [caught: ARS: 'density_function' must be a function, e.g. dnorm. Got class: character]
+
+-- Module tests
+MOD_ENVELOPE_INTERSECTIONS: PASS  [intersection points u = (-1.0000, 1.0000), expected (-1, 1); 3 tangents retained]
+MOD_ENVELOPE_SAMPLING: PASS  [mean = -0.0028, sd = 1.0234 (proposal from normal upper hull: symmetric, mean ~ 0, sd ~ 1.02)]
+MOD_ENVELOPE_UPDATE: PASS  [points = 4, slopes = [2, 0, -0.4, -2] (strictly decreasing = TRUE)]
+MOD_LOG_CONCAVITY_DETECTOR: PASS  [slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted]
+MOD_NUMERICAL_DERIVATIVE: PASS  [h'(0) = 0.000000 (expected 0), h'(1) = -1.000000 (expected -1)]
+MOD_TAIL_CHECK: PASS  [left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable]
+
+-- Sample files
+Error in FUN(X[[i]], ...) : ARS: internal error: non-descending left tail
+Calls: test ... ars_sample_envelope -> ars_log_piece_weights -> vapply -> FUN
+Execution halted
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/dbg5.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> h <- e$ars_make_log_density(dexp)
+[?2004l[?2004h> env <- e$ars_initialize(h, c(0, Inf))
+[?2004l[?2004h> cat("init x=", env$x, "z=", env$z, "u=", env$u, "\n")
+[?2004l[?2004h> set.seed(123)
+[?2004l[?2004h> for (it in 1:5000) {
+[?2004l[?2004h>   rw <- tryCatch(e$ars_sample_envelope(env),
+[?2004l[?2004h>                  error = function(err) { stop("iter ", it, ": ", conditionMessage(err),
+[?2004l[?2004h>                     "\n left = ", env$left, " u[1] = ", env$u[1],
+[?2004l[?2004h>                     " npts = ", length(env$x),
+[?2004l[?2004h>                     " first x/z = ", env$x[1], "/", env$z[1],
+[?2004l[?2004h>                     " last x/z = ", env$x[length(env$x)], "/", env$z[length(env$z)]) })
+[?2004l[?2004h>   u <- e$ars_upper_hull(env, rw)
+[?2004l[?2004h>   l <- e$ars_lower_hull(env, rw)
+[?2004l[?2004h>   r <- log(runif(1)); hv <- h(rw)
+[?2004l[?2004h>   if (r <= l - u || (is.finite(hv) && r <= hv - u)) {
+[?2004l[?2004h>     res <- tryCatch({ env <- e$ars_update(env, rw, hv, e$ars_derivative(h, rw)); "ok" },
+[?2004l[?2004h>                     error = function(err) stop("update at iter ", it, " x=", rw, ": ", conditionMessage(err)))
+[?2004l[?2004h>     if (it %% 500 == 0) cat("it", it, "npts", length(env$x), "x1..x3:", round(head(env$x, 3),4),
+[?2004l[?2004h>                             "z1..z3:", round(head(env$z, 3),5), "u1..u3:", round(head(env$u, 3),4), "\n")
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> cat("finished 5000 iters OK, npts =", length(env$x), "\n")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/dbg5.R
+[?2004linit x= 1 z= -1 u= 0 Inf 
+Error in value[[3L]](cond) : 
+  iter 2: ARS: internal error: non-descending left tail
+ left = 0 u[1] = Inf npts = 1 first x/z = 1.55260935929616/-1.00000000000313 last x/z = 1.55260935929616/-1.00000000000313
+Calls: tryCatch -> tryCatchList -> tryCatchOne -> <Anonymous>
+Execution halted
+[?2004hroot@a8ff99d7b1c6:/app# python3 - << 'PYEOF'
+[?2004l[?2004h> src = open('/app/ars.R').read()
+[?2004l[?2004h> old1 = """        if (cpt[i] <= cpt[j]) done <- TRUE
+[?2004l[?2004h>         else { stack <- stack[-length(stack)]; u_list <- u_list[-length(u_list)] }
+[?2004l[?2004h>         next"""
+[?2004l[?2004h> new1 = """        if (cpt[i] <= cpt[j]) done <- TRUE
+[?2004l[?2004h>         else {
+[?2004l[?2004h>           stack <- stack[-length(stack)]
+[?2004l[?2004h>           u_list <- if (length(stack) == 0L) env$left else u_list[-length(u_list)]
+[?2004l[?2004h>         }
+[?2004l[?2004h>         next"""
+[?2004l[?2004h> old2 = """      } else {
+[?2004l[?2004h>         # previous tangent is redundant
+[?2004l[?2004h>         stack <- stack[-length(stack)]
+[?2004l[?2004h>         u_list <- u_list[-length(u_list)]
+[?2004l[?2004h>       }"""
+[?2004l[?2004h> new2 = """      } else {
+[?2004l[?2004h>         # previous tangent is redundant
+[?2004l[?2004h>         stack <- stack[-length(stack)]
+[?2004l[?2004h>         u_list <- if (length(stack) == 0L) env$left else u_list[-length(u_list)]
+[?2004l[?2004h>       }"""
+[?2004l[?2004h> assert old1 in src and old2 in src, "pattern not found"
+[?2004l[?2004h> open('/app/ars.R','w').write(src.replace(old1, new1).replace(old2, new2))
+[?2004l[?2004h> print("patched OK")
+[?2004l[?2004h> PYEOF
+[?2004lpatched OK
+[?2004hroot@a8ff99d7b1c6:/app# Rscript /app/ars.R
+[?2004l================================================================
+ARS (Gilks & Wild 1992) - formal test suite
+================================================================
+-- Overall function: samples vs known distributions 
+
+TEST_NORMAL_STANDARD: PASS  [n = 5000, mean = -0.0166 (expected 0.00), sd = 0.9974 (expected 1.00), KS p-value = 0.4314]
+TEST_NORMAL_SHIFTED: PASS  [n = 5000, mean = 2.9973 (expected 3.00), sd = 2.0141 (expected 2.00), KS p-value = 0.6786]
+TEST_EXPONENTIAL: PASS  [n = 5000, mean = 0.9843 (expected 1.00), sd = 0.9587 (expected 1.00), KS p-value = 0.8643]
+TEST_GAMMA_SHAPE_3: PASS  [n = 5000, mean = 2.9879 (expected 3.00), sd = 1.7394 (expected 1.73), KS p-value = 0.3313]
+TEST_UNIFORM: PASS  [n = 5000, mean = 0.4991 (expected 0.50), sd = 0.2887 (expected 0.29), KS p-value = 0.9335]
+
+-- Non-log-concave densities are rejected
+TEST_CAUCHY_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+TEST_BIMODAL_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+
+-- Input validation
+TEST_INPUT_NEGATIVE_N: PASS  [caught: ARS: 'n' must be a positive integer, got: -5]
+TEST_INPUT_ZERO_N: PASS  [caught: ARS: 'n' must be a positive integer, got: 0]
+TEST_INPUT_BAD_DOMAIN: PASS  [caught: ARS: invalid 'domain': lower bound (2) must be strictly less than upper bound (1)]
+TEST_INPUT_NOT_FUNCTION: PASS  [caught: ARS: 'density_function' must be a function, e.g. dnorm. Got class: character]
+
+-- Module tests
+MOD_ENVELOPE_INTERSECTIONS: PASS  [intersection points u = (-1.0000, 1.0000), expected (-1, 1); 3 tangents retained]
+MOD_ENVELOPE_SAMPLING: PASS  [mean = -0.0020, sd = 1.0349 (proposal from normal upper hull: symmetric, mean ~ 0, sd ~ 1.02)]
+MOD_ENVELOPE_UPDATE: PASS  [points = 4, slopes = [2, 0, -0.4, -2] (strictly decreasing = TRUE)]
+MOD_LOG_CONCAVITY_DETECTOR: PASS  [slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted]
+MOD_NUMERICAL_DERIVATIVE: PASS  [h'(0) = 0.000000 (expected 0), h'(1) = -1.000000 (expected -1)]
+MOD_TAIL_CHECK: PASS  [left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable]
+
+-- Sample files
+SAMPLE_FILES_WRITTEN: PASS  [normal_samples.txt: n = 1000, mean = 0.0080, sd = 0.9871 | exponential_samples.txt: n = 1000, mean = 1.0196, sd = 0.9877]
+================================================================
+SUMMARY: 18/18 tests passed
+[?2004hroot@a8ff99d7b1c6:/app# wc -l /app/normal_samples.txt /app/exponential_samples.txt && head -3 /app/normal_samples.txt && head -3 /app/exponential_samples.txt && Rscript -e 'x <- scan("/app/normal_samples.txt"); y <- scan("/app/exponential_samples.txt"); cat("normal:", length(x), abs(mean(x)), sd(x), range(x), "\nexp:", length(y), abs(mean(y)), sd(y), range(y), "\n")'
+[?2004l 1000 /app/normal_samples.txt
+ 1000 /app/exponential_samples.txt
+ 2000 total
+0.120496473461
+-1.019546559176
+0.688740590726
+1.363757547013
+3.769986484968
+0.277780230456
+Read 1000 items
+Read 1000 items
+normal: 1000 0.007968322 0.9871305 -2.845366 3.266476 
+exp: 1000 1.019617 0.9876791 0.0003819664 8.07293 
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/robust.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> ars <- e$ars
+[?2004l[?2004h> check <- function(tag, f, dom, n, em, esd, cdf, tol) {
+[?2004l[?2004h>   ok <- TRUE
+[?2004l[?2004h>   for (seed in c(1L, 2L, 3L)) {
+[?2004l[?2004h>     set.seed(seed)
+[?2004l[?2004h>     s <- ars(f, dom, n = n)
+[?2004l[?2004h>     m <- mean(s); s0 <- sd(s)
+[?2004l[?2004h>     p <- suppressWarnings(ks.test(s, cdf)$p.value)
+[?2004l[?2004h>     fine <- abs(m - em) < tol && abs(s0 - esd) < tol && p > 1e-4
+[?2004l[?2004h>     ok <- ok && fine
+[?2004l[?2004h>     cat(sprintf("%s seed=%d: mean=%.4f sd=%.4f KS p=%.3g  %s\n",
+[?2004l[?2004h>                 tag, seed, m, s0, p, if (fine) "ok" else "OUT-OF-TOLERANCE"))
+[?2004l[?2004h>   }
+[?2004l[?2004h>   ok
+[?2004l[?2004h> }
+[?2004l[?2004h> res <- c(
+[?2004l[?2004h>   check("normal01",   dnorm, c(-Inf, Inf), 5000, 0,   1,        pnorm, 0.08),
+[?2004l[?2004h>   check("normal32",   function(x) dnorm(x, 3, 2), c(-Inf, Inf), 5000, 3, 2, function(q) pnorm(q, 3, 2), 0.2),
+[?2004l[?2004h>   check("exponential",dexp, c(0, Inf), 5000, 1, 1, pexp, 0.12),
+[?2004l[?2004h>   check("gamma3",     function(x) dgamma(x, 3, 1), c(0, Inf), 5000, 3, sqrt(3), function(q) pgamma(q, 3), 0.35),
+[?2004l[?2004h>   check("uniform",    function(x) dunif(x, 0, 1), c(0, 1), 5000, 0.5, sqrt(1/12), function(q) q, 0.06),
+[?2004l[?2004h>   check("lognormal",  dlnorm, c(0, Inf), 5000, exp(0.5), sqrt((exp(1)-1)*exp(1)), function(q) plnorm(q, 0, 1), 0.45),
+[?2004l[?2004h>   check("beta25",     function(x) dbeta(x, 2, 5), c(0, 1), 5000, 2/7, sqrt(10/7^2/21), function(q) pbeta(q, 2, 5), 0.05),
+[?2004l[?2004h>   check("truncnorm",  dnorm, c(0, Inf), 5000, 0.7979, 0.6028, function(q) (pnorm(q) - 0.5), 0.1)
+[?2004l[?2004h> )
+[?2004l[?2004h> cat("\nROBUSTNESS: ", if (all(res)) "ALL SEEDS WITHIN TOLERANCE" else "SOME OUT-OF-TOLERANCE", "\n")
+[?2004l[?2004h> # negative-mean truncated normal (mode outside support: exercises left-tail anchor)
+[?2004l[?2004h> set.seed(42); s <- ars(function(x) dnorm(x, -2, 1), c(0, Inf), n = 3000)
+[?2004l[?2004h> cat("truncnorm(m=-2) on (0,Inf): mean =", round(mean(s),4), "(exact 0.3085), sd =", round(sd(s),4), "(exact 0.4756)\n")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/robust.R
+[?2004lnormal01 seed=1: mean=-0.0209 sd=0.9843 KS p=0.114  ok
+normal01 seed=2: mean=-0.0147 sd=0.9979 KS p=0.454  ok
+normal01 seed=3: mean=-0.0030 sd=0.9956 KS p=0.963  ok
+normal32 seed=1: mean=3.0008 sd=1.9910 KS p=0.823  ok
+normal32 seed=2: mean=3.0404 sd=1.9854 KS p=0.131  ok
+normal32 seed=3: mean=3.0340 sd=2.0373 KS p=0.187  ok
+exponential seed=1: mean=1.0166 sd=1.0215 KS p=0.352  ok
+exponential seed=2: mean=1.0013 sd=1.0257 KS p=0.626  ok
+exponential seed=3: mean=0.9964 sd=1.0158 KS p=0.198  ok
+gamma3 seed=1: mean=2.9379 sd=1.7283 KS p=0.00212  ok
+gamma3 seed=2: mean=2.9950 sd=1.7073 KS p=0.67  ok
+gamma3 seed=3: mean=3.0047 sd=1.7360 KS p=0.986  ok
+uniform seed=1: mean=0.5014 sd=0.2929 KS p=0.352  ok
+uniform seed=2: mean=0.4970 sd=0.2900 KS p=0.626  ok
+uniform seed=3: mean=0.4955 sd=0.2916 KS p=0.198  ok
+Error in ars_probe_end(h, anchor, "right") : 
+  ARS: density does not appear to be log-concave: tangent slope at x = 2 (-0.846574) is not smaller than at x = 1 (-1)
+Calls: check -> ars -> ars_initialize -> ars_probe_end
+Execution halted
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/dbg6.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> h <- e$ars_make_log_density(dlnorm)
+[?2004l[?2004h> cat("h(1) =", h(1), " h(2) =", h(2), " h(3) =", h(3), "\n")
+[?2004l[?2004h> cat("deriv(1) =", e$ars_derivative(h, 1), "(exact -2)\n")
+[?2004l[?2004h> cat("deriv(2) =", e$ars_derivative(h, 2), "(exact -2.5)\n")
+[?2004l[?2004h> cat("deriv(1.5) =", e$ars_derivative(h, 1.5), "(exact -2.1667)\n")
+[?2004l[?2004h> cat("manual: (h(1+d)-h(1-d))/(2d), d=1e-6:", (h(1+1e-6) - h(1-1e-6))/(2e-6), "\n")
+[?2004l[?2004h> cat("dlnorm(1) =", dlnorm(1), " log =", log(dlnorm(1)), "\n")
+[?2004l[?2004h> cat("h(c(1,2)) =", h(c(1,2)), "\n")
+[?2004l[?2004h> res <- tryCatch(e$ars_initialize(h, c(0, Inf)), error = function(err) conditionMessage(err))
+[?2004l[?2004h> print(res)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/dbg6.R
+[?2004lh(1) = -0.9189385  h(2) = -1.852312  h(3) = -2.621025 
+deriv(1) = -1 (exact -2)
+deriv(2) = -0.8465736 (exact -2.5)
+deriv(1.5) = -0.9369767 (exact -2.1667)
+manual: (h(1+d)-h(1-d))/(2d), d=1e-6: -1 
+dlnorm(1) = 0.3989423  log = -0.9189385 
+h(c(1,2)) = -0.9189385 -1.852312 
+[1] "ARS: density does not appear to be log-concave: tangent slope at x = 2 (-0.846574) is not smaller than at x = 1 (-1)"
+[?2004hroot@a8ff99d7b1c6:/app# python3 - << 'PYEOF'
+[?2004l[?2004h> src = open('/app/ars.R').read()
+[?2004l[?2004h> old = """  expect_error_test("TEST_BIMODAL_REJECTED",
+[?2004l[?2004h>                     function() ars(function(x) 0.5 * dnorm(x, -4, 1) + 0.5 * dnorm(x, 4, 1),
+[?2004l[?2004h>                                    c(-Inf, Inf), n = 100),
+[?2004l[?2004h>                     "log-concave")
+[?2004l[?2004h> """
+[?2004l[?2004h> new = """  expect_error_test("TEST_BIMODAL_REJECTED",
+[?2004l[?2004h>                     function() ars(function(x) 0.5 * dnorm(x, -4, 1) + 0.5 * dnorm(x, 4, 1),
+[?2004l[?2004h>                                    c(-Inf, Inf), n = 100),
+[?2004l[?2004h>                     "log-concave")
+[?2004l[?2004h>   expect_error_test("TEST_LOGNORMAL_REJECTED",
+[?2004l[?2004h>                     function() ars(dlnorm, c(0, Inf), n = 100),
+[?2004l[?2004h>                     "log-concave")
+[?2004l[?2004h> """
+[?2004l[?2004h> assert old in src, "pattern not found"
+[?2004l[?2004h> open('/app/ars.R','w').write(src.replace(old, new))
+[?2004l[?2004h> print("patched OK")
+[?2004l[?2004h> PYEOF
+[?2004lpatched OK
+[?2004hroot@a8ff99d7b1c6:/app# Rscript /app/ars.R
+[?2004l================================================================
+ARS (Gilks & Wild 1992) - formal test suite
+================================================================
+-- Overall function: samples vs known distributions 
+
+TEST_NORMAL_STANDARD: PASS  [n = 5000, mean = -0.0166 (expected 0.00), sd = 0.9974 (expected 1.00), KS p-value = 0.4314]
+TEST_NORMAL_SHIFTED: PASS  [n = 5000, mean = 2.9973 (expected 3.00), sd = 2.0141 (expected 2.00), KS p-value = 0.6786]
+TEST_EXPONENTIAL: PASS  [n = 5000, mean = 0.9843 (expected 1.00), sd = 0.9587 (expected 1.00), KS p-value = 0.8643]
+TEST_GAMMA_SHAPE_3: PASS  [n = 5000, mean = 2.9879 (expected 3.00), sd = 1.7394 (expected 1.73), KS p-value = 0.3313]
+TEST_UNIFORM: PASS  [n = 5000, mean = 0.4991 (expected 0.50), sd = 0.2887 (expected 0.29), KS p-value = 0.9335]
+
+-- Non-log-concave densities are rejected
+TEST_CAUCHY_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+TEST_BIMODAL_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: adjacent tangent slopes are not decreasing (recent s]
+TEST_LOGNORMAL_REJECTED: PASS  [caught: ARS: density does not appear to be log-concave: tangent slope at x = 2 (-0.846574) is not smaller th]
+
+-- Input validation
+TEST_INPUT_NEGATIVE_N: PASS  [caught: ARS: 'n' must be a positive integer, got: -5]
+TEST_INPUT_ZERO_N: PASS  [caught: ARS: 'n' must be a positive integer, got: 0]
+TEST_INPUT_BAD_DOMAIN: PASS  [caught: ARS: invalid 'domain': lower bound (2) must be strictly less than upper bound (1)]
+TEST_INPUT_NOT_FUNCTION: PASS  [caught: ARS: 'density_function' must be a function, e.g. dnorm. Got class: character]
+
+-- Module tests
+MOD_ENVELOPE_INTERSECTIONS: PASS  [intersection points u = (-1.0000, 1.0000), expected (-1, 1); 3 tangents retained]
+MOD_ENVELOPE_SAMPLING: PASS  [mean = -0.0020, sd = 1.0349 (proposal from normal upper hull: symmetric, mean ~ 0, sd ~ 1.02)]
+MOD_ENVELOPE_UPDATE: PASS  [points = 4, slopes = [2, 0, -0.4, -2] (strictly decreasing = TRUE)]
+MOD_LOG_CONCAVITY_DETECTOR: PASS  [slopes (2, 0, 1) flagged as non-log-concave; slopes (2, 0.5, -1) accepted]
+MOD_NUMERICAL_DERIVATIVE: PASS  [h'(0) = 0.000000 (expected 0), h'(1) = -1.000000 (expected -1)]
+MOD_TAIL_CHECK: PASS  [left tangent with slope <= 0 on (-Inf, .) flagged as non-integrable]
+
+-- Sample files
+SAMPLE_FILES_WRITTEN: PASS  [normal_samples.txt: n = 1000, mean = 0.0080, sd = 0.9871 | exponential_samples.txt: n = 1000, mean = 1.0196, sd = 0.9877]
+================================================================
+SUMMARY: 19/19 tests passed
+[?2004hroot@a8ff99d7b1c6:/app# cat > /tmp/robust.R << 'EOF'
+[?2004l[?2004h> e <- new.env(); sys.source('/app/ars.R', envir = e)
+[?2004l[?2004h> ars <- e$ars
+[?2004l[?2004h> check <- function(tag, f, dom, n, em, esd, cdf, tol) {
+[?2004l[?2004h>   ok <- TRUE
+[?2004l[?2004h>   for (seed in c(1L, 2L, 3L)) {
+[?2004l[?2004h>     set.seed(seed)
+[?2004l[?2004h>     s <- ars(f, dom, n = n)
+[?2004l[?2004h>     m <- mean(s); s0 <- sd(s)
+[?2004l[?2004h>     p <- suppressWarnings(ks.test(s, cdf)$p.value)
+[?2004l[?2004h>     fine <- abs(m - em) < tol && abs(s0 - esd) < tol && p > 1e-4
+[?2004l[?2004h>     ok <- ok && fine
+[?2004l[?2004h>     cat(sprintf("%s seed=%d: mean=%.4f sd=%.4f KS p=%.3g  %s\n",
+[?2004l[?2004h>                 tag, seed, m, s0, p, if (fine) "ok" else "OUT-OF-TOLERANCE"))
+[?2004l[?2004h>   }
+[?2004l[?2004h>   ok
+[?2004l[?2004h> }
+[?2004l[?2004h> res <- c(
+[?2004l[?2004h>   check("normal01",   dnorm, c(-Inf, Inf), 5000, 0,   1,        pnorm, 0.08),
+[?2004l[?2004h>   check("normal32",   function(x) dnorm(x, 3, 2), c(-Inf, Inf), 5000, 3, 2, function(q) pnorm(q, 3, 2), 0.2),
+[?2004l[?2004h>   check("exponential",dexp, c(0, Inf), 5000, 1, 1, pexp, 0.12),
+[?2004l[?2004h>   check("gamma3",     function(x) dgamma(x, 3, 1), c(0, Inf), 5000, 3, sqrt(3), function(q) pgamma(q, 3), 0.35),
+[?2004l[?2004h>   check("uniform",    function(x) dunif(x, 0, 1), c(0, 1), 5000, 0.5, sqrt(1/12), function(q) q, 0.06),
+[?2004l[?2004h>   check("beta52",     function(x) dbeta(x, 5, 2), c(0, 1), 5000, 5/7, sqrt(10/392), function(q) pbeta(q, 5, 2), 0.05),
+[?2004l[?2004h>   check("truncnorm",  dnorm, c(0, Inf), 5000, 0.7979, 0.6028, function(q) (pnorm(q) - 0.5), 0.1)
+[?2004l[?2004h> )
+[?2004l[?2004h> set.seed(11); lnk <- tryCatch({ ars(dlnorm, c(0, Inf), n = 100); FALSE },
+[?2004l[?2004h>                               error = function(er) grepl("log-concave", conditionMessage(er)))
+[?2004l[?2004h> cat("lognormal correctly rejected:", isTRUE(lnk), "\n")
+[?2004l[?2004h> cat("\nROBUSTNESS: ", if (all(res) && isTRUE(lnk)) "ALL CHECKS PASSED" else "SOME FAILED", "\n")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a8ff99d7b1c6:/app# Rscript /tmp/robust.R
+[?2004lnormal01 seed=1: mean=-0.0209 sd=0.9843 KS p=0.114  ok
+normal01 seed=2: mean=-0.0147 sd=0.9979 KS p=0.454  ok
+normal01 seed=3: mean=-0.0030 sd=0.9956 KS p=0.963  ok
+normal32 seed=1: mean=3.0008 sd=1.9910 KS p=0.823  ok
+normal32 seed=2: mean=3.0404 sd=1.9854 KS p=0.131  ok
+normal32 seed=3: mean=3.0340 sd=2.0373 KS p=0.187  ok
+exponential seed=1: mean=1.0166 sd=1.0215 KS p=0.352  ok
+exponential seed=2: mean=1.0013 sd=1.0257 KS p=0.626  ok
+exponential seed=3: mean=0.9964 sd=1.0158 KS p=0.198  ok
+gamma3 seed=1: mean=2.9379 sd=1.7283 KS p=0.00212  ok
+gamma3 seed=2: mean=2.9950 sd=1.7073 KS p=0.67  ok
+gamma3 seed=3: mean=3.0047 sd=1.7360 KS p=0.986  ok
+uniform seed=1: mean=0.5014 sd=0.2929 KS p=0.352  ok
+uniform seed=2: mean=0.4970 sd=0.2900 KS p=0.626  ok
+uniform seed=3: mean=0.4955 sd=0.2916 KS p=0.198  ok
+beta52 seed=1: mean=0.7120 sd=0.1608 KS p=0.527  ok
+beta52 seed=2: mean=0.7154 sd=0.1589 KS p=0.771  ok
+beta52 seed=3: mean=0.7166 sd=0.1590 KS p=0.621  ok
+truncnorm seed=1: mean=0.8119 sd=0.6058 KS p=0  OUT-OF-TOLERANCE
+truncnorm seed=2: mean=0.7791 sd=0.6071 KS p=0  OUT-OF-TOLERANCE
+truncnorm seed=3: mean=0.8009 sd=0.6101 KS p=0  OUT-OF-TOLERANCE
+lognormal correctly rejected: TRUE 
+
+ROBUSTNESS:  SOME FAILED 
+[?2004hroot@a8ff99d7b1c6:/app# Rscript -e 'e <- new.env(); sys.source("/app/ars.R", envir = e)
+[?2004l[?2004h> for (seed in 1:3) { set.seed(seed); s <- e$ars(dnorm, c(0, Inf), n = 5000)
+[?2004l[?2004h> p <- suppressWarnings(ks.test(s, function(q) 2 * (pnorm(q) - 0.5))$p.value)
+[?2004l[?2004h> cat("truncnorm correct-cdf seed=", seed, ": mean=", round(mean(s),4), " sd=", round(sd(s),4), " KS p=", format(p), "\n") }'
+[?2004ltruncnorm correct-cdf seed= 1 : mean= 0.8119  sd= 0.6058  KS p= 0.07689568 
+truncnorm correct-cdf seed= 2 : mean= 0.7791  sd= 0.6071  KS p= 0.004640818 
+truncnorm correct-cdf seed= 3 : mean= 0.8009  sd= 0.6101  KS p= 0.7903643 
+[?2004hroot@a8ff99d7b1c6:/app# ls -la /app && echo '---' && wc -l /app/ars.R /app/normal_samples.txt /app/exponential_samples.txt
+[?2004ltotal 56
+drwxr-xr-x 1 root root    92 Sep  7 01:06 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   132 Sep  7 00:22 [01;34m..[0m
+-rw-r--r-- 1 root root 23441 Sep  7 02:19 ars.R
+-rw-r--r-- 1 root root 15000 Sep  7 02:19 exponential_samples.txt
+-rw-r--r-- 1 root root 15495 Sep  7 02:19 normal_samples.txt
+---
+  515 /app/ars.R
+ 1000 /app/normal_samples.txt
+ 1000 /app/exponential_samples.txt
+ 2515 total
+[?2004hroot@a8ff99d7b1c6:/app# sed -n '/^# 5. Sampling machinery/,/^ars <- function/p' /app/ars.R | head -120
+[?2004l# 5. Sampling machinery
+# ---------------------------------------------------------------------------
+# Log of the integral of exp(u(x)) on each piece (stable form).
+ars_log_piece_weights <- function(env) {
+  tol <- ars_params$slope_tol
+  k <- length(env$z)
+  u <- env$u; z <- env$z; cpt <- env$intercept
+  vapply(seq_len(k), function(t) {
+    l <- u[t]; r <- u[t + 1L]
+    if (is.infinite(l)) {
+      if (z[t] <= tol) stop("ARS: internal error: non-descending left tail")
+      cpt[t] + z[t] * r - log(z[t])
+    } else if (is.infinite(r)) {
+      if (z[t] >= -tol) stop("ARS: internal error: non-ascending right tail")
+      cpt[t] + z[t] * l - log(-z[t])
+    } else if (abs(z[t]) <= tol) {
+      cpt[t] + log(r - l)
+    } else {
+      cpt[t] + z[t] * l + log(abs(expm1(z[t] * (r - l)))) - log(abs(z[t]))
+    }
+  }, numeric(1))
+}
+
+# Draw a proposal from the piecewise-exponential upper hull.
+ars_sample_envelope <- function(env) {
+  tol <- ars_params$slope_tol
+  lw <- ars_log_piece_weights(env)
+  w <- exp(lw - max(lw)); w <- w / sum(w)
+  t <- sample.int(length(w), 1L, prob = w)
+  l <- env$u[t]; r <- env$u[t + 1L]; zt <- env$z[t]
+  W <- min(max(runif(1L), 1e-12), 1 - 1e-12)   # avoid log(0)
+  if (zt >= tol) {
+    if (!is.infinite(l)) {                        # ascending finite piece
+      x <- l + log1p(W * expm1(zt * (r - l))) / zt
+    } else {
+      x <- r + log(W) / zt                        # ascending left tail
+    }
+  } else if (zt <= -tol) {
+    if (is.infinite(r)) x <- l + log1p(-W) / zt   # descending right tail
+    else {
+      em <- exp(zt * (r - l))                     # descending finite piece
+      x <- l + log(W * em + (1 - W)) / zt
+    }
+  } else {
+    x <- l + W * (r - l)                          # flat piece
+  }
+  x
+}
+
+# Upper hull value u(x*).
+ars_upper_hull <- function(env, x) {
+  idx <- length(env$u) - sum(env$u > x)
+  idx <- max(1L, min(idx, length(env$z)))
+  env$z[idx] * (x - env$x[idx]) + env$h[idx]
+}
+
+# Lower hull (squeeze) value l(x*); -Inf outside the support-point span.
+ars_lower_hull <- function(env, x) {
+  k <- length(env$x)
+  if (x <= env$x[1L] || x >= env$x[k]) return(-Inf)
+  i <- sum(env$x < x)        # env$x[i] < x < env$x[i+1]
+  w <- (x - env$x[i]) / (env$x[i + 1L] - env$x[i])
+  env$h[i] + w * (env$h[i + 1L] - env$h[i])
+}
+
+# Fold an accepted point (x, h(x), h'(x)) into the envelope and re-verify all
+# invariants (this is where log-concavity is checked during sampling).
+ars_update <- function(env, x, h_val, z_val) {
+  if (!is.finite(h_val) || !is.finite(z_val)) return(env)
+  if (length(env$x) >= ars_params$max_points) return(env)
+  if (any(abs(env$x - x) < ars_params$min_sep * max(1, abs(x)))) return(env)
+  # accepted tail points are folded in too: their tangents must obey the
+  # same monotone-slope (log-concavity) invariant as interior ones
+  at <- sum(env$x < x) + 1L
+  env$x <- append(env$x, x, after = at - 1L)
+  env$h <- append(env$h, h_val, after = at - 1L)
+  env$z <- append(env$z, z_val, after = at - 1L)
+  env$intercept <- env$h - env$z * env$x
+  env <- ars_check_concavity(env)
+  env <- ars_check_tails(env)
+  env <- ars_compute_u(env)
+  env
+}
+
+# ---------------------------------------------------------------------------
+# 6. Main driver
+# ---------------------------------------------------------------------------
+ars <- function(density_function, domain = c(-Inf, Inf), n = 1000) {
+[?2004hroot@a8ff99d7b1c6:/app# Rscript /app/ars.R > /tmp/final_run.log 2>&1; echo "exit code: $?"; tail -4 /tmp/final_run.log
+[?2004lexit code: 0
+-- Sample files
+SAMPLE_FILES_WRITTEN: PASS  [normal_samples.txt: n = 1000, mean = 0.0080, sd = 0.9871 | exponential_samples.txt: n = 1000, mean = 1.0196, sd = 0.9877]
+================================================================
+SUMMARY: 19/19 tests passed
+[?2004hroot@a8ff99d7b1c6:/app# grep -n '^ars <- function\|^test <- function' /app/ars.R && echo '---' && head -2 /app/normal_samples.txt && head -2 /app/exponential_samples.txt && wc -l /app/normal_samples.txt /app/exponential_samples.txt
+[?2004l[32m[K353[m[K[36m[K:[m[K[01;31m[Kars <- function[m[K(density_function, domain = c(-Inf, Inf), n = 1000) {
+[32m[K385[m[K[36m[K:[m[K[01;31m[Ktest <- function[m[K() {
+---
+0.120496473461
+-1.019546559176
+1.363757547013
+3.769986484968
+ 1000 /app/normal_samples.txt
+ 1000 /app/exponential_samples.txt
+ 2000 total
+[?2004hroot@a8ff99d7b1c6:/app# 

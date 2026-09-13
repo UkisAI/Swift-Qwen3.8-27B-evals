@@ -1,0 +1,448 @@
+[?2004hroot@940a2b1c936e:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@940a2b1c936e:/app# clear
+[?2004l[H[J[3J[?2004hroot@940a2b1c936e:/app# python3 --version
+[?2004lPython 3.13.7
+[?2004hroot@940a2b1c936e:/app# cd /app && ls -la
+[?2004ltotal 0
+drwxr-xr-x 2 root root   6 Aug 22  2025 .
+drwxr-xr-x 1 root root 102 Sep  7 00:53 ..
+[?2004hroot@940a2b1c936e:/app# cat > /app/run.py <<'PYEOF'
+[?2004l[?2004h> """Run async jobs with bounded concurrency and Ctrl+C-safe cleanup.
+[?2004l[?2004h> 
+[?2004l [?2004h> Public API
+[?2004lce[?2004h> ----------
+[?2004l[?2004h> run_tasks(tasks, max_concurrent)
+[?2004l[?2004h>     Async function: run ``tasks`` with at most ``max_concurrent`` running
+[?2004l[?2004h>     at the same time. ``tasks`` is an iterable of zero-argument callables,
+[?2004l[?2004h>     each returning an awaitable.
+[?2004l[?2004h> 
+[?2004l,[?2004h> main(tasks=None, max_concurrent=5) -> int
+[?2004l[?2004h>     Synchronous driver that runs ``run_tasks`` under ``asyncio`` and treats
+[?2004l[?2004h>     Ctrl+C (SIGINT) as a graceful stop: in-flight tasks are cancelled and
+[?2004l[?2004h>     awaited (so their ``finally`` / ``async with`` cleanup runs) before the
+[?2004l[?2004h>     process exits with status 130.
+[?2004l[?2004h> 
+[?2004l[?2004h> Running this file directly demos it:
+[?2004l[?2004h>     python3 run.py --tasks 12 --max-concurrent 4
+[?2004l[?2004h> """
+[?2004l[?2004h> 
+[?2004l[?2004h> from __future__ import annotations
+[?2004l[?2004h> 
+[?2004l [?2004h> import argparse
+[?2004l[?2004h> import asyncio
+[?2004l>[?2004h> import os
+[?2004l[?2004h> import random
+[?2004l[?2004h> import signal
+[?2004lt[?2004h> import sys
+[?2004l[?2004h> import time
+[?2004l[?2004h> from typing import Awaitable, Callable, List, Optional, Sequence
+[?2004l[?2004h> 
+[?2004l[?2004h> #: A zero-argument callable that returns an awaitable.
+[?2004l[?2004h> TaskFactory = Callable[[], Awaitable[None]]
+[?2004lr[?2004h> 
+[?2004l[?2004h> 
+[?2004ln[?2004h> async def run_tasks(tasks: list[Callable[[], Awaitable[None]]], max_concurrent: int) -> None:
+[?2004l[?2004h>     """Run ``tasks`` with at most ``max_concurrent`` running concurrently.
+[?2004l[?2004h> 
+[?2004l [?2004h>     Each element of ``tasks`` is a zero-argument callable that returns an
+[?2004l[?2004h>     awaitable (usually a coroutine).  Tasks are dispatched as slots free
+[?2004l[?2004h>     up, and this function returns once every task has finished.
+[?2004l[?2004h> 
+[?2004lG[?2004h>     Failure / interruption semantics (important for Ctrl+C):
+[?2004l[?2004h>       * If one of the tasks raises, the other unfinished tasks are
+[?2004l[?2004h>         cancelled and *awaited* (so their ``finally`` / ``async with``
+[?2004l[?2004h>         cleanup code gets to run) before the first exception is re-raised.
+[?2004l[?2004h>       * If ``run_tasks`` itself is cancelled (e.g. because of Ctrl+C or an
+[?2004l[?2004h>         explicit ``task.cancel()``), its in-flight tasks get the same
+[?2004lt[?2004h>         treatment before the cancellation propagates.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     if max_concurrent < 1:
+[?2004l[?2004h>         raise ValueError("max_concurrent must be >= 1")
+[?2004l[?2004h> 
+[?2004lm[?2004h>     semaphore = asyncio.Semaphore(max_concurrent)
+[?2004l[?2004h> 
+[?2004l+[?2004h>     async def _run(task: TaskFactory) -> None:
+[?2004l[?2004h>         async with semaphore:
+[?2004l[?2004h>             await task()
+[?2004l[?2004h> 
+[?2004l[?2004h>     jobs: List["asyncio.Task[None]"] = [
+[?2004l[?2004h>         asyncio.create_task(_run(task), name="run-tasks job %d" % i)
+[?2004l[?2004h>         for i, task in enumerate(tasks)
+[?2004l[?2004h>     ]
+[?2004l[?2004h> 
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await asyncio.gather(*jobs)
+[?2004l[?2004h>     except BaseException:
+[?2004l[?2004h>         # A task failed, or run_tasks itself got cancelled (Ctrl+C): stop
+[?2004l[?2004h>         # every job and *wait* for all of them, so that each one's cleanup
+[?2004l[?2004h>         # code gets a chance to run before the error propagates.
+[?2004l[?2004h>         for job in jobs:
+[?2004l[?2004h>             job.cancel()
+[?2004l[?2004h>         await asyncio.gather(*jobs, return_exceptions=True)
+[?2004l[?2004h>         raise
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _make_demo_jobs(n: int, duration: float) -> List[TaskFactory]:
+[?2004l[?2004h>     """Build ``n`` demo jobs with visible work and a cleanup step."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     def make(i: int) -> TaskFactory:
+[?2004l[?2004h>         async def job() -> None:
+[?2004l[?2004h>             started = time.monotonic()
+[?2004l[?2004h>             print("[job %d] start" % i, flush=True)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 await asyncio.sleep(duration + random.random() * 0.5)
+[?2004l[?2004h>                 print("[job %d] done (%.2f s)"
+[?2004l[?2004h>                       % (i, time.monotonic() - started), flush=True)
+[?2004l[?2004h>             finally:
+[?2004l[?2004h>                 print("[job %d] cleanup" % i, flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h>         return job
+[?2004l[?2004h> 
+[?2004l[?2004h>     return [make(i) for i in range(n)]
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> async def _supervised(tasks: Sequence[TaskFactory],
+[?2004l[?2004h>                       max_concurrent: int) -> bool:
+[?2004l[?2004h>     """Run ``run_tasks`` with a polite first-press SIGINT handler.
+[?2004l[?2004h> 
+[?2004l[?2004h>     First Ctrl+C  -> cancel the run; ``run_tasks`` lets every in-flight
+[?2004l[?2004h>                       task finish its cleanup, and we return True.
+[?2004l[?2004h>     Second Ctrl+C -> restore the default disposition and die immediately.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     loop = asyncio.get_running_loop()
+[?2004l[?2004h>     top = asyncio.current_task()
+[?2004l[?2004h>     state = {"interrupted": False}
+[?2004l[?2004h>     supports = hasattr(loop, "add_signal_handler")  # not on Windows
+[?2004l[?2004h> 
+[?2004l[?2004h>     def _on_sigint() -> None:
+[?2004l[?2004h>         if not state["interrupted"]:
+[?2004l[?2004h>             state["interrupted"] = True
+[?2004l[?2004h>             print("\n[run.py] interrupted - finishing in-flight tasks' "
+[?2004l[?2004h>                   "cleanup...", file=sys.stderr, flush=True)
+[?2004l[?2004h>             assert top is not None
+[?2004l[?2004h>             top.cancel()
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             print("\n[run.py] second interrupt - stopping immediately.",
+[?2004l[?2004h>                   file=sys.stderr, flush=True)
+[?2004l[?2004h>             signal.signal(signal.SIGINT, signal.SIG_DFL)
+[?2004l[?2004h>             os.kill(os.getpid(), signal.SIGINT)
+[?2004l[?2004h> 
+[?2004l[?2004h>     if supports:
+[?2004l[?2004h>         loop.add_signal_handler(signal.SIGINT, _on_sigint)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await run_tasks(list(tasks), max_concurrent)
+[?2004l[?2004h>     except asyncio.CancelledError:
+[?2004l[?2004h>         return True  # graceful interrupt; cleanups are already complete
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         if supports:
+[?2004l[?2004h>             loop.remove_signal_handler(signal.SIGINT)
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def main(tasks: Optional[Sequence[TaskFactory]] = None,
+[?2004l[?2004h>          max_concurrent: int = 5) -> int:
+[?2004l[?2004h>     """Run ``tasks`` and make Ctrl+C a graceful stop.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Convenience wrapper around ``asyncio.run(run_tasks(...))``: if the
+[?2004l[?2004h>     user presses Ctrl+C, in-flight tasks are cancelled and awaited so
+[?2004l[?2004h>     their cleanup code runs, and the process then exits with status 130.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Returns the process exit code (0 on success, 130 after Ctrl+C); if a
+[?2004l[?2004h>     task raises, the exception propagates to the caller.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     if tasks is None:
+[?2004l[?2004h>         tasks = _make_demo_jobs(8, 1.5)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         interrupted = asyncio.run(_supervised(tasks, max_concurrent))
+[?2004l[?2004h>     except KeyboardInterrupt:
+[?2004l[?2004h>         # No per-loop SIGINT handler (e.g. on Windows): when Ctrl+C
+[?2004l[?2004h>         # happens, ``asyncio.run`` cancels every unfinished task and runs
+[?2004l[?2004h>         # the loop until they are done on its way out, so all cleanup
+[?2004l[?2004h>         # code has run by the time we get here.
+[?2004l[?2004h>         print("\n[run.py] interrupted - in-flight tasks' cleanup has run.",
+[?2004l[?2004h>               file=sys.stderr, flush=True)
+[?2004l[?2004h>         return 130
+[?2004l[?2004h>     if interrupted:
+[?2004l[?2004h>         return 130
+[?2004l[?2004h>     return 0
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _cli(argv: Optional[List[str]] = None) -> int:
+[?2004l[?2004h>     parser = argparse.ArgumentParser(
+[?2004l[?2004h>         description="Demo: run N async jobs, at most M at a time "
+[?2004l[?2004h>                     "(press Ctrl+C to see graceful cleanup)")
+[?2004l[?2004h>     parser.add_argument("-n", "--tasks", type=int, default=8,
+[?2004l[?2004h>                         help="number of demo jobs [default: 8]")
+[?2004l[?2004h>     parser.add_argument("-m", "--max-concurrent", type=int, default=3,
+[?2004l[?2004h>                         help="max concurrent jobs [default: 3]")
+[?2004l[?2004h>     parser.add_argument("-t", "--duration", type=float, default=1.5,
+[?2004l[?2004h>                         help="approx. duration of each job [default: 1.5]")
+[?2004l[?2004h>     args = parser.parse_args(argv)
+[?2004l[?2004h>     return main(_make_demo_jobs(args.tasks, args.duration),
+[?2004l[?2004h>                 args.max_concurrent)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == "__main__":
+[?2004l[?2004h>     sys.exit(_cli())
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@940a2b1c936e:/app# python3 -m py_compile /app/run.py && echo COMPILE_OK
+[?2004lCOMPILE_OK
+[?2004hroot@940a2b1c936e:/app# cd /app && python3 -c "from run import run_tasks, main; import inspect; print('importable, is coroutine fn:', inspect.iscoroutinefunction(run_tasks)); print(inspect.signature(run_tasks))"
+[?2004limportable, is coroutine fn: True
+(tasks: 'list[Callable[[], Awaitable[None]]]', max_concurrent: 'int') -> 'None'
+[?2004hroot@940a2b1c936e:/app# cd /app && python3 - <<'EOF'
+[?2004l[?2004h> import asyncio
+[?2004l[?2004h> from run import run_tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> # T1: concurrency cap + all tasks complete
+[?2004l[?2004h> peak = [0]; cur = [0]; done = [0]
+[?2004l[?2004h> 
+[?2004l[?2004h> async def job():
+[?2004l[?2004h>     cur[0] += 1
+[?2004l[?2004h>     peak[0] = max(peak[0], cur[0])
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await asyncio.sleep(0.02)
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         done[0] += 1
+[?2004l[?2004h>         cur[0] -= 1
+[?2004l[?2004h> 
+[?2004l[?2004h> async def t1():
+[?2004l[?2004h>     await run_tasks([lambda: job() for _ in range(25)], 4)
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(t1())
+[?2004l[?2004h> assert done[0] == 25, done
+[?2004l[?2004h> assert 1 < peak[0] <= 4, peak
+[?2004l[?2004h> print("T1 OK: all 25 tasks ran, peak concurrency =", peak[0], "of 4")
+[?2004l[?2004h> 
+[?2004l[?2004h> # T2: task failure -> others cancelled, cleanups awaited, exc re-raised
+[?2004l[?2004h> events = []
+[?2004l[?2004h> def ok(i):
+[?2004l[?2004h>     async def _job():
+[?2004l[?2004h>         events.append("start %d" % i)
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await asyncio.sleep(30)
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             await asyncio.sleep(0.05)
+[?2004l[?2004h>             events.append("cleanup %d" % i)
+[?2004l[?2004h>     return _job
+[?2004l[?2004h> async def bad():
+[?2004l[?2004h>     events.append("boom")
+[?2004l[?2004h>     raise RuntimeError("boom")
+[?2004l[?2004h> 
+[?2004l[?2004h> async def t2():
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await run_tasks([lambda: ok(1), lambda: bad(), lambda: ok(2)], 3)
+[?2004l[?2004h>         raise AssertionError("should have raised")
+[?2004l[?2004h>     except RuntimeError as e:
+[?2004l[?2004h>         assert str(e) == "boom", e
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(t2())
+[?2004l[?2004h> assert "cleanup 1" in events and "cleanup 2" in events, events
+[?2004l[?2004h> print("T2 OK: events =", events)
+[?2004l[?2004h> 
+[?2004l[?2004h> # T3: edge cases
+[?2004l[?2004h> asyncio.run(run_tasks([], 3))
+[?2004l[?2004h> try:
+[?2004l[?2004h>     asyncio.run(run_tasks([lambda: bad()], 0))
+[?2004l[?2004h>     raise AssertionError("should have raised ValueError")
+[?2004l[?2004h> except ValueError:
+[?2004l[?2004h>     pass
+[?2004l[?2004h> print("T3 OK: empty list fine, max_concurrent=0 rejected")
+[?2004l[?2004h> EOF
+[?2004lT1 OK: all 25 tasks ran, peak concurrency = 4 of 4
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m46[0m, in [35m<module>[0m
+  File [35m"/usr/local/lib/python3.13/asyncio/runners.py"[0m, line [35m195[0m, in [35mrun[0m
+    return [31mrunner.run[0m[1;31m(main)[0m
+           [31m~~~~~~~~~~[0m[1;31m^^^^^^[0m
+  File [35m"/usr/local/lib/python3.13/asyncio/runners.py"[0m, line [35m118[0m, in [35mrun[0m
+    return [31mself._loop.run_until_complete[0m[1;31m(task)[0m
+           [31m~~~~~~~~~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^^^^^^[0m
+  File [35m"/usr/local/lib/python3.13/asyncio/base_events.py"[0m, line [35m725[0m, in [35mrun_until_complete[0m
+    return [31mfuture.result[0m[1;31m()[0m
+           [31m~~~~~~~~~~~~~[0m[1;31m^^[0m
+  File [35m"<stdin>"[0m, line [35m41[0m, in [35mt2[0m
+  File [35m"/app/run.py"[0m, line [35m65[0m, in [35mrun_tasks[0m
+    await asyncio.gather(*jobs)
+  File [35m"/app/run.py"[0m, line [35m57[0m, in [35m_run[0m
+    await task()
+[1;35mTypeError[0m: [35mobject function can't be used in 'await' expression[0m
+[?2004hroot@940a2b1c936e:/app# cd /app && python3 run.py -n 6 -m 2 -t 0.3; echo "demo_exit=$?"
+[?2004l[job 0] start
+[job 1] start
+[job 0] done (0.38 s)
+[job 0] cleanup
+[job 2] start
+[job 1] done (0.58 s)
+[job 1] cleanup
+[job 3] start
+[job 2] done (0.37 s)
+[job 2] cleanup
+[job 4] start
+[job 3] done (0.50 s)
+[job 3] cleanup
+[job 5] start
+[job 4] done (0.58 s)
+[job 4] cleanup
+[job 5] done (0.55 s)
+[job 5] cleanup
+demo_exit=0
+[?2004hroot@940a2b1c936e:/app# cd /app && python3 - <<'EOF'
+[?2004l[?2004h> import signal, subprocess, sys, time
+[?2004l[?2004h> 
+[?2004l[?2004h> p = subprocess.Popen([sys.executable, "run.py", "-n", "8", "-m", "3", "-t", "5"],
+[?2004l[?2004h>                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+[?2004l[?2004h>                      text=True, cwd="-app".replace("-app", "/app"))
+[?2004l[?2004h> time.sleep(1.5)
+[?2004l[?2004h> p.send_signal(signal.SIGINT)
+[?2004l[?2004h> out, _ = p.communicate(timeout=20)
+[?2004l[?2004h> print(out)
+[?2004l[?2004h> print("exit code:", p.returncode)
+[?2004l[?2004h> assert p.returncode == 130, p.returncode
+[?2004l[?2004h> assert "Traceback" not in out, out
+[?2004l[?2004h> starts   = sum(1 for l in out.splitlines() if l.startswith("[job") and "start" in l)
+[?2004l[?2004h> cleanups = sum(1 for l in out.splitlines() if l.startswith("[job") and "cleanup" in l)
+[?2004l[?2004h> print("tasks started:", starts, "| cleanups ran:", cleanups)
+[?2004l[?2004h> assert 1 <= starts <= 3 and starts == cleanups
+[?2004l[?2004h> print("T4 OK: Ctrl+C -> every started job ran its cleanup, exit 130")
+[?2004l[?2004h> EOF
+[?2004l[job 0] start
+[job 1] start
+[job 2] start
+
+[run.py] interrupted - finishing in-flight tasks' cleanup...
+[job 0] cleanup
+[job 1] cleanup
+[job 2] cleanup
+
+exit code: 130
+tasks started: 3 | cleanups ran: 3
+T4 OK: Ctrl+C -> every started job ran its cleanup, exit 130
+[?2004hroot@940a2b1c936e:/app# cd /app && python3 - <<'EOF'
+[?2004l[?2004h> import signal, subprocess, sys, time
+[?2004l[?2004h> 
+[?2004l[?2004h> code = (
+[?2004l[?2004h>     "import asyncio, sys\n"
+[?2004l[?2004h>     "from run import _supervised\n"
+[?2004l[?2004h>     "async def job(i):\n"
+[?2004l[?2004h>     "    try:\n"
+[?2004l[?2004h>     "        await asyncio.sleep(30)\n"
+[?2004l[?2004h>     "    finally:\n"
+[?2004l[?2004h>     "        print('cleanup started', i, flush=True)\n"
+[?2004l[?2004h>     "        await asyncio.sleep(10)\n"
+[?2004l[?2004h>     "async def amain():\n"
+[?2004l[?2004h>     "    await _supervised([lambda i=i: job(i) for i in range(4)], 4)\n"
+[?2004l[?2004h>     "try:\n"
+[?2004l[?2004h>     "    sys.exit(asyncio.run(amain()))\n"
+[?2004l[?2004h>     "except KeyboardInterrupt:\n"
+[?2004l[?2004h>     "    print('KBI raised', flush=True)\n"
+[?2004l[?2004h>     "    sys.exit(130)\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> p = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+[?2004l[?2004h>                      stderr=subprocess.STDOUT, text=True, cwd="/app")
+[?2004l[?2004h> time.sleep(1.0)
+[?2004l[?2004h> p.send_signal(signal.SIGINT)    # 1st: graceful
+[?2004l[?2004h> time.sleep(0.3)
+[?2004l[?2004h> p.send_signal(signal.SIGINT)    # 2nd: hard stop mid-cleanup
+[?2004l[?2004h> t0 = time.time()
+[?2004l[?2004h> out, _ = p.communicate(timeout=10)
+[?2004l[?2004h> dt = time.time() - t0
+[?2004l[?2004h> print(out)
+[?2004l[?2004h> assert p.returncode == -signal.SIGINT, p.returncode
+[?2004l[?2004h> assert dt < 2.0, dt
+[?2004l[?2004h> print("T5 OK: second Ctrl+C force-stopped the process after %.2fs" % dt)
+[?2004l[?2004h> EOF
+[?2004l
+[run.py] interrupted - finishing in-flight tasks' cleanup...
+cleanup started 0
+cleanup started 1
+cleanup started 2
+cleanup started 3
+
+[run.py] second interrupt - stopping immediately.
+
+T5 OK: second Ctrl+C force-stopped the process after 0.00s
+[?2004hroot@940a2b1c936e:/app# cd /app && python3 - <<'EOF'
+[?2004l[?2004h> import asyncio
+[?2004l[?2004h> from run import run_tasks
+[?2004l[?2004h> 
+[?2004l[?2004h> # T2 (fixed): task failure -> others cancelled, cleanups awaited, exc re-raised
+[?2004l[?2004h> events = []
+[?2004l[?2004h> def ok(i):
+[?2004l[?2004h>     async def _job():
+[?2004l[?2004h>         events.append("start %d" % i)
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             await asyncio.sleep(30)
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             await asyncio.sleep(0.05)
+[?2004l[?2004h>             events.append("cleanup %d" % i)
+[?2004l[?2004h>     return _job
+[?2004l[?2004h> async def bad():
+[?2004l[?2004h>     events.append("boom")
+[?2004l[?2004h>     raise RuntimeError("boom")
+[?2004l[?2004h> 
+[?2004l[?2004h> async def t2():
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await run_tasks([lambda: ok(1)(), lambda: bad(), lambda: ok(2)()], 3)
+[?2004l[?2004h>         raise AssertionError("should have raised")
+[?2004l[?2004h>     except RuntimeError as e:
+[?2004l[?2004h>         assert str(e) == "boom", e
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(t2())
+[?2004l[?2004h> assert "cleanup 1" in events and "cleanup 2" in events, events
+[?2004l[?2004h> print("T2 OK: events =", events)
+[?2004l[?2004h> 
+[?2004l[?2004h> # T2b: cancellation of run_tasks itself -> cleanups still run (e.g. external cancel)
+[?2004l[?2004h> events2 = []
+[?2004l[?2004h> async def long_job():
+[?2004l[?2004h>     events2.append("start")
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await asyncio.sleep(30)
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         await asyncio.sleep(0.05)
+[?2004l[?2004h>         events2.append("cleanup")
+[?2004l[?2004h> 
+[?2004l[?2004h> async def t2b():
+[?2004l[?2004h>     runner = asyncio.create_task(run_tasks([lambda: long_job()], 2))
+[?2004l[?2004h>     await asyncio.sleep(0.2)
+[?2004l[?2004h>     runner.cancel()
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         await runner
+[?2004l[?2004h>     except asyncio.CancelledError:
+[?2004l[?2004h>         pass
+[?2004l[?2004h> 
+[?2004l[?2004h> asyncio.run(t2b())
+[?2004l[?2004h> assert "cleanup" in events2, events2
+[?2004l[?2004h> print("T2b OK: run_tasks cancelled externally, in-flight cleanup ran:", events2)
+[?2004l[?2004h> 
+[?2004l[?2004h> # T3: edge cases
+[?2004l[?2004h> asyncio.run(run_tasks([], 3))
+[?2004l[?2004h> try:
+[?2004l[?2004h>     asyncio.run(run_tasks([lambda: bad()], 0))
+[?2004l[?2004h>     raise AssertionError("should have raised ValueError")
+[?2004l[?2004h> except ValueError:
+[?2004l[?2004h>     pass
+[?2004l[?2004h> print("T3 OK: empty list fine, max_concurrent=0 rejected")
+[?2004l[?2004h> 
+[?2004l[?2004h> # T6: more tasks than slots, all cleanups run on normal completion
+[?2004l[?2004h> count = [0]
+[?2004l[?2004h> def make(i):
+[?2004l[?2004h>     async def job():
+[?2004l[?2004h>         count[0] += 1
+[?2004l[?2004h>     return job
+[?2004l[?2004h> async def t6():
+[?2004l[?2004h>     await run_tasks([make(i) for i in range(50)], 7)
+[?2004l[?2004h> asyncio.run(t6())
+[?2004l[?2004h> assert count[0] == 50
+[?2004l[?2004h> print("T6 OK: 50 tasks, 7 slots, all completed")
+[?2004l[?2004h> EOF
+[?2004lT2 OK: events = ['start 1', 'boom', 'start 2', 'cleanup 1', 'cleanup 2']
+T2b OK: run_tasks cancelled externally, in-flight cleanup ran: ['start', 'cleanup']
+T3 OK: empty list fine, max_concurrent=0 rejected
+T6 OK: 50 tasks, 7 slots, all completed
+[?2004hroot@940a2b1c936e:/app# cd /app && python3 -c "from run import run_tasks; import inspect; print('OK', inspect.iscoroutinefunction(run_tasks), inspect.signature(run_tasks))" && ls -la /app/run.py
+[?2004lOK True (tasks: 'list[Callable[[], Awaitable[None]]]', max_concurrent: 'int') -> 'None'
+-rw-r--r-- 1 root root 6709 Sep  7 01:22 /app/run.py
+[?2004hroot@940a2b1c936e:/app# 

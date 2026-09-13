@@ -1,0 +1,2762 @@
+[?2004hroot@9107947ed3db:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@9107947ed3db:/app# clear
+[?2004l[H[J[3J[?2004hroot@9107947ed3db:/app# ls -la /app
+[?2004ltotal 28
+drwxr-xr-x 1 root root    32 Oct 31  2025 [0m[01;34m.[0m
+drwxr-xr-x 1 root root   102 Sep  6 11:53 [01;34m..[0m
+-rw-r--r-- 1 root root  3984 Oct 24  2025 gp_rstan.R
+-rw-r--r-- 1 root root    47 Oct 24  2025 meta_public.json
+-rw-r--r-- 1 root root   300 Oct 24  2025 test_X.csv
+-rw-r--r-- 1 root root 11671 Oct 24  2025 train_X.csv
+-rw-r--r-- 1 root root  3869 Oct 24  2025 train_y.csv
+[?2004hroot@9107947ed3db:/app# cat /app/gp_rstan.R
+[?2004llibrary(readr)
+library(rstan)
+library(posterior)
+library(jsonlite)
+
+stan_code <- "
+functions {
+  matrix cov_ard_sqexp(matrix X, vector rho, real alpha, real jitter) {
+    int N = rows(X);
+    int D = cols(X);
+    matrix[N, N] K;
+
+    for (i in 1:N) {
+      K[i, i] = square(alpha) + jitter;
+      for (j in (i + 1):N) {
+        real s = 0;
+        for (d in 1:D) {
+          real t = (X[i, d] - X[j, d]) / rho[d];
+          s += t * t;
+        }
+        K[i, j] = square(alpha) * exp(-0.5 * s);
+        K[j, i] = K[i, j];
+      }
+    }
+    return K;
+  }
+
+  matrix cross_cov_ard(matrix X, matrix X_new, vector rho, real alpha) {
+    int N = rows(X);
+    int M = rows(X_new);
+    int D = cols(X); // == cols(X_new)
+    matrix[N, M] Kx;
+    for (i in 1:N) {
+      for (j in 1:M) {
+        real s = 0;
+        for (d in 1:D) {
+          real t = (X[i, d] - X_new[j, d]) / rho[d];
+          s += t * t;
+        }
+        Kx[i, j] = square(alpha) * exp(-0.5 * s);
+      }
+    }
+    return Kx;
+  }
+}
+
+data {
+  int<lower=1> N;
+  int<lower=1> D;
+  matrix[N, D] X;
+  int<lower=1> P;
+  matrix[N, P] H;
+  vector[N] y;
+  real<lower=0> jitter;
+
+  int<lower=0> N_new;
+  matrix[N_new, D] X_new;
+  matrix[N_new, P] H_new;
+}
+
+parameters {
+  vector[P] beta;
+  real<lower=0> alpha;
+  vector<lower=0>[D] rho;
+  real<lower=0> sigma;
+}
+
+transformed parameters {
+  vector[N] mu = H * beta;
+  matrix[N, N] K = cov_ard_sqexp(X, rho, alpha, jitter)
+                   + diag_matrix(rep_vector(square(sigma), N));
+  matrix[N, N] L_K = cholesky_decompose(K);
+}
+
+model {
+  beta  ~ normal(0, 1);
+  alpha ~ normal(0, 1.5);
+  rho   ~ lognormal(0, 1);
+  sigma ~ normal(0, 0.5);
+  y ~ multi_normal_cholesky(mu, L_K);
+}
+
+generated quantities {
+  vector[N_new] y_new;
+  if (N_new > 0) {
+    matrix[N, N_new] K_x_xnew = cross_cov_ard(X, X_new, rho, alpha);
+    matrix[N_new, N_new] K_new = cov_ard_sqexp(X_new, rho, alpha, jitter);
+    vector[N] resid = y - (H * beta);
+
+    vector[N] alpha_vec = mdivide_left_tri_low(L_K, resid);
+    alpha_vec = mdivide_left_tri_low(L_K', alpha_vec);
+
+    vector[N_new] f_mean = (K_x_xnew' * alpha_vec);
+    matrix[N, N_new] v = mdivide_left_tri_low(L_K, K_x_xnew);
+    vector[N_new] f_var = to_vector(diagonal(K_new)) - to_vector(columns_dot_self(v));
+    for (m in 1:N_new) {
+      real m_mean = (H_new[m] * beta) + f_mean[m];
+      real m_sd   = sqrt(f_var[m] + square(sigma));
+      y_new[m] = normal_rng(m_mean, m_sd);
+    }
+  }
+}
+"
+
+writeLines(stan_code, "gp_ard_regression.stan")
+
+meta_pub <- jsonlite::fromJSON("meta_public.json")
+train_X <- read_csv("train_X.csv")
+test_X <- read_csv("test_X.csv")
+train_y <- read_csv("train_y.csv")
+train_X <- as.matrix(train_X)
+test_X <- as.matrix(test_X)
+train_y <- train_y$y
+
+P <- as.integer(meta_pub$P)
+jitter <- as.numeric(meta_pub$jitter)
+
+N <- nrow(train_X); D <- ncol(train_X)
+N_new <- nrow(test_X)
+
+H <- cbind(1, train_X[,1], train_X[,2])
+H_new <- if (N_new > 0) cbind(1, test_X[,1], test_X[,2]) else matrix(0, 0, P)
+
+data_list <- list(
+  N = N, D = D, X = train_X,
+  P = P, H = H, y = train_y,
+  jitter = jitter,
+  N_new = N_new,
+  X_new = if (N_new > 0) test_X else matrix(0, 0, D),
+  H_new = if (N_new > 0) H_new else matrix(0, 0, P)
+)
+
+sm <- stan_model("gp_ard_regression.stan")
+fit <- sampling(
+  sm, data = data_list,
+  chains = 4, iter = 2000, warmup = 1000, thin = 2,
+  seed = 1,
+  control = list(
+    adapt_delta = 0.93,
+    max_treedepth = 14,
+    adapt_gamma = 0.05,
+    adapt_kappa = 0.75,
+    adapt_t0 = 10,
+    adapt_init_buffer = 100,
+    adapt_term_buffer = 50,
+    adapt_window = 25
+  ),
+  init_r = 0.1,
+  save_warmup = FALSE,
+  refresh = 200
+)
+
+post <- rstan::extract(fit)
+alpha_post <- mean(post$alpha)
+sigma_post <- mean(post$sigma)
+rho_post <- colMeans(post$rho)
+beta_post <- colMeans(post$beta)
+
+cat("Posterior means:\n")
+cat("alpha:", alpha_post, "\n")
+cat("sigma:", sigma_post, "\n")
+cat("rho:  ", paste(round(rho_post, 6), collapse = " "), "\n")
+cat("beta: ", paste(round(beta_post, 6), collapse = " "), "\n")
+[?2004hroot@9107947ed3db:/app# python3 --version && pip --version
+[?2004lPython 3.12.3
+pip 24.0 from /usr/lib/python3/dist-packages/pip (python 3.12)
+[?2004hroot@9107947ed3db:/app# cat /app/meta_public.json
+[?2004l{
+  "seed": 2025,
+  "P": 3,
+  "jitter": 1e-06
+}[?2004hroot@9107947ed3db:/app# head -3 /app/train_X.csv; echo '---'; head -3 /app/train_y.csv; echo '---'; head -3 /app/test_X.csv
+[?2004lx1,x2,x3
+1.9778312206710433,-0.4719610363314093,1.308592051224399
+1.3490211047599585,1.903236040627828,-1.6910998845601268
+---
+y
+-0.360908907599927
+0.6466784506809128
+---
+x1,x2,x3
+-0.5699562780133505,-1.2559273449949329,-1.4336584647468387
+-1.7086052392256397,1.7970342283702947,-0.8313958385399594
+[?2004hroot@9107947ed3db:/app# which g++ gcc clang make; g++ --version 2>&1 | head -1
+[?2004lbash: g++: command not found
+[?2004hroot@9107947ed3db:/app# wc -l /app/train_X.csv /app/train_y.csv /app/test_X.csv
+[?2004l  201 /app/train_X.csv
+  201 /app/train_y.csv
+    6 /app/test_X.csv
+  408 total
+[?2004hroot@9107947ed3db:/app# ls /usr/bin/ | grep -iE 'g\+\+|gcc|clang|cc1plus' ; echo '==='; ls /usr/bin/*cc* 2>/dev/null; echo '==='; apt-get --version | head -1
+[?2004l===
+===
+apt 2.8.3 (amd64)
+[?2004hroot@9107947ed3db:/app# cat /etc/os-release | head -3
+[?2004lPRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+[?2004hroot@9107947ed3db:/app# pip index versions pystan 2>&1 | head -5
+[?2004lWARNING: pip index is currently an experimental command. It may be removed/changed in a future release without prior warning.
+pystan (3.10.1)
+Available versions: 3.10.1, 3.10.0, 3.9.1, 3.9.0, 3.8.0, 3.7.0, 3.6.0, 3.5.0, 3.4.0, 3.3.0, 3.2.0, 3.1.1, 3.1.0, 3.0.2, 3.0.1, 3.0.0, 2.19.1.1, 2.19.0.0, 2.18.1.0, 2.18.0.0, 2.17.1.0, 2.17.0.0, 2.16.0.0, 2.15.0.1, 2.15.0.0, 2.14.0.0, 2.12.0.0, 2.11.0.0, 2.10.0.0, 2.9.0.0, 2.8.0.2, 2.8.0.1, 2.8.0.0, 2.7.0.1, 2.7.0.0, 2.6.3.0, 2.6.0.0, 2.5.0.2, 2.5.0.1, 2.5.0.0, 2.4.0.3, 2.4.0.2, 2.4.0.1, 2.4.0.0, 2.3.0.0, 2.2.0.1, 2.2.0.0, 2.1.0.1, 2.1.0.0, 2.0.1.3, 2.0.1.2, 2.0.1.1, 2.0.1.0, 2.0.0.1, 2.0.0.0, 0.2.2, 0.2.1, 0.2.0, 0.1.1
+WARNING: Skipping /usr/lib/python3.12/dist-packages/asciinema-2.4.0.dist-info due to invalid metadata entry 'name'
+[?2004hroot@9107947ed3db:/app# apt-get update 2>&1 | tail -5
+[?2004lHit:1 http://security.ubuntu.com/ubuntu noble-security InRelease
+Hit:2 http://archive.ubuntu.com/ubuntu noble InRelease
+Hit:3 http://archive.ubuntu.com/ubuntu noble-updates InRelease
+Hit:4 http://archive.ubuntu.com/ubuntu noble-backports InRelease
+Reading package lists...
+[?2004hroot@9107947ed3db:/app# DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential python3-dev 2>&1 | tail -8
+[?2004lupdate-alternatives: warning: skip creation of /usr/share/man/man1/c++.1.gz because associated file /usr/share/man/man1/g++.1.gz (of link group c++) doesn't exist
+Setting up build-essential (12.10ubuntu1) ...
+Setting up libheif1:amd64 (1.17.6-1ubuntu4.8) ...
+Setting up libgd3:amd64 (2.3.3-9ubuntu5) ...
+Setting up libc-devtools (2.39-0ubuntu8.8) ...
+Setting up libheif-plugin-aomdec:amd64 (1.17.6-1ubuntu4.8) ...
+Setting up libheif-plugin-aomenc:amd64 (1.17.6-1ubuntu4.8) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.8) ...
+[?2004hroot@9107947ed3db:/app# g++ --version | head -1
+[?2004lg++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+[?2004hroot@9107947ed3db:/app# pip install --break-system-packages pystan==3.10.0 2>&1 | tail -20
+[?2004l   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 51.0/51.0 kB 8.8 MB/s eta 0:00:00
+Downloading multidict-6.7.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (256 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 256.3/256.3 kB 44.0 MB/s eta 0:00:00
+Downloading pastel-0.2.1-py2.py3-none-any.whl (6.0 kB)
+Downloading propcache-0.5.2-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (61 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 61.6/61.6 kB 11.9 MB/s eta 0:00:00
+Downloading pylev-1.4.0-py2.py3-none-any.whl (6.1 kB)
+Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 45.6/45.6 kB 6.1 MB/s eta 0:00:00
+Downloading webargs-8.7.1-py3-none-any.whl (32 kB)
+Downloading yarl-1.24.5-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (109 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 109.8/109.8 kB 24.4 MB/s eta 0:00:00
+Downloading idna-3.19-py3-none-any.whl (68 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 68.5/68.5 kB 12.4 MB/s eta 0:00:00
+Downloading packaging-26.3-py3-none-any.whl (129 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 130.0/130.0 kB 22.5 MB/s eta 0:00:00
+WARNING: Skipping /usr/lib/python3.12/dist-packages/asciinema-2.4.0.dist-info due to invalid metadata entry 'name'
+Installing collected packages: pylev, appdirs, typing_extensions, pysimdjson, propcache, pastel, packaging, numpy, multidict, idna, frozenlist, crashtest, attrs, aiohappyeyeballs, yarl, marshmallow, clikit, aiosignal, webargs, aiohttp, httpstan, pystan
+Successfully installed aiohappyeyeballs-2.7.1 aiohttp-3.14.3 aiosignal-1.4.0 appdirs-1.4.4 attrs-26.1.0 clikit-0.6.2 crashtest-0.3.1 frozenlist-1.8.0 httpstan-4.13.0 idna-3.19 marshmallow-3.26.2 multidict-6.7.1 numpy-2.5.2 packaging-26.3 pastel-0.2.1 propcache-0.5.2 pylev-1.4.0 pysimdjson-6.0.2 pystan-3.10.0 typing_extensions-4.16.0 webargs-8.7.1 yarl-1.24.5
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+[?2004hroot@9107947ed3db:/app# python3 -c "import stan, inspect; print('FILE:', stan.__file__); print('BUILD:', inspect.signature(stan.build))"
+[?2004lFILE: /usr/local/lib/python3.12/dist-packages/stan/__init__.py
+BUILD: (program_code: str, data: Dict[str, Union[int, float, Sequence[Union[int, float]]]] = {}, random_seed: Optional[int] = None) -> stan.model.Model
+[?2004hroot@9107947ed3db:/app# python3 - <<'PY'
+[?2004l[?2004h> import stan, inspect
+[?2004l[?2004h> src_file = None
+[?2004l[?2004h> try:
+[?2004l[?2004h>     import pystan
+[?2004l[?2004h>     print('pystan module:', pystan.__file__)
+[?2004l[?2004h> except Exception as e:
+[?2004l[?2004h>     print('no pystan module:', e)
+[?2004l[?2004h> print('--- build doc ---')
+[?2004l[?2004h> print(stan.build.__doc__)
+[?2004l[?2004h> PY
+[?2004lno pystan module: No module named 'pystan'
+--- build doc ---
+Build (compile) a Stan program.
+
+    Arguments:
+        program_code: Stan program code describing a Stan model.
+        data: A Python dictionary or mapping providing the data for the
+            model. Variable names are the keys and the values are their
+            associated values. Default is an empty dictionary, suitable
+            for Stan programs with no `data` block.
+        random_seed: Random seed, a positive integer for random number
+            generation. Used to make sure that results can be reproduced.
+
+    Returns:
+        Model: an instance of Model
+
+    Notes:
+        C++ reserved words and Stan reserved words may not be used for
+        variable names; see the Stan User's Guide for a complete list.
+
+    
+[?2004hroot@9107947ed3db:/app# cat /usr/local/lib/python3.12/dist-packages/stan/model.py
+[?2004limport asyncio
+import dataclasses
+import json
+import re
+import time
+from typing import Dict, List, Optional, Sequence, Tuple, Union, cast
+
+import httpstan.models
+import httpstan.schemas
+import httpstan.services.arguments as arguments
+import httpstan.utils
+import numpy as np
+import simdjson
+from clikit.io import ConsoleIO
+
+import stan.common
+import stan.fit
+import stan.plugins
+
+Data = Dict[str, Union[int, float, Sequence[Union[int, float]]]]
+
+
+class DataJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        # numpy.ndarray is *unofficially* supported as there is no easy way to
+        # construct tabular data using the Python standard library.
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        # unofficially support np.int64, np.int32, etc.
+        if hasattr(obj, "dtype") and np.issubdtype(obj.dtype, np.integer):
+            return int(obj)
+        return json.JSONEncoder.default(self, obj)
+
+
+# superficial frozendict implementation. Only used for function signatures
+class frozendict(dict):
+    def __setitem__(self, key, value):
+        raise TypeError("'frozendict' object is immutable.")
+
+
+@dataclasses.dataclass(frozen=True)
+class Model:
+    """Stores data associated with and proxies calls to a Stan model.
+
+    Returned by ``build``. Users will not instantiate this class directly.
+
+    """
+
+    model_name: str
+    program_code: str
+    data: Data
+    param_names: Tuple[str, ...]
+    constrained_param_names: Tuple[str, ...]
+    dims: Tuple[Tuple[int, ...]]
+    random_seed: Optional[int]
+
+    def __post_init__(self):
+        if self.model_name != httpstan.models.calculate_model_name(self.program_code):
+            raise ValueError("`model_name` does not match `program_code`.")
+
+    def sample(self, *, num_chains=4, **kwargs) -> stan.fit.Fit:
+        """Draw samples from the model.
+
+        Parameters in ``kwargs`` will be passed to the default sample function.
+        The default sample function is currently
+        ``stan::services::sample::hmc_nuts_diag_e_adapt``.  Parameter names are
+        identical to those used in CmdStan.  See the CmdStan documentation for
+        parameter descriptions and default values.
+
+        There is one exception:  `num_chains`. `num_chains` is a
+        PyStan-specific keyword argument. It indicates the number of
+        independent processes to use when drawing samples.
+
+
+        Returns:
+            Fit: instance of Fit allowing access to draws.
+
+        Examples:
+            User-defined initial values for parameters must be provided
+            for each chain. Typically they will be the same for each chain.
+            The following example shows how user-defined initial parameters
+            are provided:
+
+            >>> program_code = "parameters {real y;} model {y ~ normal(0,1);}"
+            >>> posterior = stan.build(program_code)
+            >>> fit = posterior.sample(num_chains=2, init=[{"y": 3}, {"y": 3}])
+
+        """
+        return self.hmc_nuts_diag_e_adapt(num_chains=num_chains, **kwargs)
+
+    def hmc_nuts_diag_e_adapt(self, *, num_chains=4, **kwargs) -> stan.fit.Fit:
+        """Draw samples from the model using ``stan::services::sample::hmc_nuts_diag_e_adapt``.
+
+        Parameters in ``kwargs`` will be passed to the (Python wrapper of)
+        ``stan::services::sample::hmc_nuts_diag_e_adapt``. Parameter names are
+        identical to those used in CmdStan.  See the CmdStan documentation for
+        parameter descriptions and default values.
+
+        There is one exception:  `num_chains`. `num_chains` is a
+        PyStan-specific keyword argument. It indicates the number of
+        independent processes to use when drawing samples.
+
+        Returns:
+            Fit: instance of Fit allowing access to draws.
+
+        """
+        function = "stan::services::sample::hmc_nuts_diag_e_adapt"
+        return self._create_fit(function=function, num_chains=num_chains, **kwargs)
+
+    def fixed_param(self, *, num_chains=4, **kwargs) -> stan.fit.Fit:
+        """Draw samples from the model using ``stan::services::sample::fixed_param``.
+
+        Parameters in ``kwargs`` will be passed to the (Python wrapper of)
+        ``stan::services::sample::fixed_param``. Parameter names are
+        identical to those used in CmdStan.  See the CmdStan documentation for
+        parameter descriptions and default values.
+
+        There is one exception:  `num_chains`. `num_chains` is a
+        PyStan-specific keyword argument. It indicates the number of
+        independent processes to use when drawing samples.
+
+        Returns:
+            Fit: instance of Fit allowing access to draws.
+
+        """
+        function = "stan::services::sample::fixed_param"
+        return self._create_fit(function=function, num_chains=num_chains, **kwargs)
+
+    def _create_fit(self, *, function, num_chains, **kwargs) -> stan.fit.Fit:
+        """Make a request to httpstan's ``create_fit`` endpoint and process results.
+
+        Users should not use this function.
+
+        Parameters in ``kwargs`` will be passed to the (Python wrapper of)
+        `function`. Parameter names are identical to those used in CmdStan.
+        See the CmdStan documentation for parameter descriptions and default
+        values.
+
+        Returns:
+            Fit: instance of Fit allowing access to draws.
+
+        """
+        assert "chain" not in kwargs, "`chain` id is set automatically."
+        assert "data" not in kwargs, "`data` is set in `build`."
+        assert "random_seed" not in kwargs, "`random_seed` is set in `build`."
+
+        # copy kwargs and verify everything is JSON-encodable
+        kwargs = json.loads(DataJSONEncoder().encode(kwargs))
+
+        # FIXME: special handling here for `init`, consistent with PyStan 2 but needs docs
+        init: List[Data] = kwargs.pop("init", [dict() for _ in range(num_chains)])
+        if len(init) != num_chains:
+            raise ValueError("Initial values must be provided for each chain.")
+
+        payloads = []
+        for chain in range(1, num_chains + 1):
+            payload = kwargs.copy()
+            payload["function"] = function
+            payload["chain"] = chain  # type: ignore
+            payload["data"] = self.data  # type: ignore
+            payload["init"] = init.pop(0)
+            if self.random_seed is not None:
+                payload["random_seed"] = self.random_seed  # type: ignore
+
+            # fit needs to know num_samples, num_warmup, num_thin, save_warmup
+            # progress reporting needs to know some of these
+            num_warmup = payload.get("num_warmup", arguments.lookup_default(arguments.Method["SAMPLE"], "num_warmup"))
+            num_samples = payload.get(
+                "num_samples",
+                arguments.lookup_default(arguments.Method["SAMPLE"], "num_samples"),
+            )
+            num_thin = payload.get("num_thin", arguments.lookup_default(arguments.Method["SAMPLE"], "num_thin"))
+            save_warmup = payload.get(
+                "save_warmup",
+                arguments.lookup_default(arguments.Method["SAMPLE"], "save_warmup"),
+            )
+            payloads.append(payload)
+
+        async def go():
+            io = ConsoleIO()
+            sampling_output = io.section().error_output
+            percent_complete = 0
+            sampling_output.write_line(f"<comment>Sampling:</comment> {percent_complete:3.0f}%")
+
+            current_and_max_iterations_re = re.compile(r"Iteration:\s+(\d+)\s+/\s+(\d+)")
+            async with stan.common.HttpstanClient() as client:
+                operations = []
+                for payload in payloads:
+                    resp = await client.post(f"/{self.model_name}/fits", json=payload)
+                    if resp.status == 422:
+                        raise ValueError(str(resp.json()))
+                    elif resp.status != 201:
+                        raise RuntimeError(resp.json()["message"])
+                    assert resp.status == 201
+                    operations.append(resp.json())
+
+                # poll to get progress for each chain until all chains finished
+                current_iterations = {}
+                while not all(operation["done"] for operation in operations):
+                    for operation in operations:
+                        if operation["done"]:
+                            continue
+                        resp = await client.get(f"/{operation['name']}")
+                        assert resp.status != 404
+                        operation.update(resp.json())
+                        progress_message = operation["metadata"].get("progress")
+                        if not progress_message:
+                            continue
+                        iteration, iteration_max = map(
+                            int, current_and_max_iterations_re.findall(progress_message).pop(0)
+                        )
+                        if current_iterations.get(operation["name"]) == iteration:
+                            continue
+                        current_iterations[operation["name"]] = iteration
+                        iterations_count = sum(current_iterations.values())
+                        total_iterations = iteration_max * num_chains
+                        percent_complete = 100 * iterations_count / total_iterations
+                        sampling_output.clear() if io.supports_ansi() else sampling_output.write("\n")
+                        sampling_output.write_line(
+                            f"<comment>Sampling:</comment> {round(percent_complete):3.0f}% ({iterations_count}/{total_iterations})"
+                        )
+                    await asyncio.sleep(0.05)
+
+                fit_in_cache = len(current_iterations) < num_chains
+
+                stan_outputs = []
+                for operation in operations:
+                    fit_name = operation["result"].get("name")
+                    if fit_name is None:  # operation["result"] is an error
+                        assert not str(operation["result"]["code"]).startswith("2"), operation
+                        message = operation["result"]["message"]
+                        if """ValueError('Initialization failed.')""" in message:
+                            sampling_output.clear()
+                            sampling_output.write_line("<info>Sampling:</info> <error>Initialization failed.</error>")
+                            raise RuntimeError("Initialization failed.")
+                        raise RuntimeError(message)
+
+                    resp = await client.get(f"/{fit_name}")
+                    if resp.status != 200:
+                        raise RuntimeError((resp.json())["message"])
+                    stan_outputs.append(resp.content)
+
+                    # clean up after ourselves when fit is uncacheable (no random seed)
+                    if self.random_seed is None:
+                        resp = await client.delete(f"/{fit_name}")
+                        if resp.status not in {200, 202, 204}:
+                            raise RuntimeError((resp.json())["message"])
+
+                sampling_output.clear() if io.supports_ansi() else sampling_output.write("\n")
+                sampling_output.write_line(
+                    "<info>Sampling:</info> 100%, done."
+                    if fit_in_cache
+                    else f"<info>Sampling:</info> {percent_complete:3.0f}% ({iterations_count}/{total_iterations}), done."
+                )
+                if not io.supports_ansi():
+                    sampling_output.write("\n")
+
+            stan_outputs = tuple(stan_outputs)  # Fit constructor expects a tuple.
+
+            def is_nonempty_logger_message(msg: simdjson.Object):
+                return msg["topic"] == "logger" and msg["values"][0] != "info:"  # type: ignore
+
+            def is_iteration_or_elapsed_time_logger_message(msg: simdjson.Object):
+                # Assumes `msg` is a message with topic `logger`.
+                text = msg["values"][0]  # type: ignore
+                text = cast(str, text)
+                return (
+                    text.startswith("info:Iteration:")
+                    or text.startswith("info: Elapsed Time:")
+                    # this detects lines following "Elapsed Time:", part of a multi-line Stan message
+                    or text.startswith("info:" + " " * 15)
+                )
+
+            parser = simdjson.Parser()
+            nonstandard_logger_messages = []
+            for stan_output in stan_outputs:
+                for line in stan_output.splitlines():
+                    # Do not attempt to parse non-logger messages. Draws could contain nan or inf values.
+                    # simdjson cannot parse lines containing such values.
+                    if b'"logger"' not in line:
+                        continue
+                    msg = parser.parse(line)
+                    if is_nonempty_logger_message(msg) and not is_iteration_or_elapsed_time_logger_message(msg):
+                        nonstandard_logger_messages.append(msg.as_dict())
+                    del msg
+            del parser  # simdjson.Parser is no longer used at this point.
+
+            if nonstandard_logger_messages:
+                io.error_line("<comment>Messages received during sampling:</comment>")
+                for msg in nonstandard_logger_messages:
+                    text = msg["values"][0].replace("info:", "  ").replace("error:", "  ")
+                    if text.strip():
+                        io.error_line(f"{text}")
+
+            fit = stan.fit.Fit(
+                stan_outputs,
+                num_chains,
+                self.param_names,
+                self.constrained_param_names,
+                self.dims,
+                num_warmup,
+                num_samples,
+                num_thin,
+                save_warmup,
+            )
+
+            for entry_point in stan.plugins.get_plugins():
+                Plugin = entry_point.load()
+                fit = Plugin().on_post_sample(fit)
+            return fit
+
+        try:
+            return asyncio.run(go())
+        except KeyboardInterrupt:
+            return  # type: ignore
+
+    def constrain_pars(
+        self, unconstrained_parameters: Sequence[float], include_tparams: bool = True, include_gqs: bool = True
+    ) -> Sequence[float]:
+        """Transform a sequence of unconstrained parameters to their defined support,
+           optionally including transformed parameters and generated quantities.
+
+        Arguments:
+            unconstrained_parameters: A sequence of unconstrained parameters.
+            include_tparams: Boolean to control whether we include transformed parameters.
+            include_gqs: Boolean to control whether we include generated quantities.
+
+        Returns:
+            A sequence of constrained parameters, optionally including transformed parameters.
+
+        Note:
+            The unconstrained parameters are passed to the `write_array` method of the `model_base`
+            instance. See `model_base.hpp` in the Stan C++ library for details.
+        """
+        payload = {
+            "data": self.data,
+            "unconstrained_parameters": unconstrained_parameters,
+            "include_tparams": include_tparams,
+            "include_gqs": include_gqs,
+        }
+
+        async def go():
+            async with stan.common.HttpstanClient() as client:
+                resp = await client.post(f"/{self.model_name}/write_array", json=payload)
+                if resp.status != 200:
+                    raise RuntimeError(resp.json())
+                return resp.json()["params_r_constrained"]
+
+        return asyncio.run(go())
+
+    def unconstrain_pars(self, constrained_parameters: Sequence[float]) -> Sequence[float]:
+        """Reads constrained parameter values from their specified context and returns a
+           sequence of unconstrained parameter values.
+
+        Arguments:
+            constrained_parameters: Constrained parameter values and their specified context
+
+        Returns:
+            A sequence of unconstrained parameters.
+
+        Note:
+            The unconstrained parameters are passed to the `transform_inits` method of the
+            `model_base` instance. See `model_base.hpp` in the Stan C++ library for details.
+        """
+        payload = {"data": self.data, "constrained_parameters": constrained_parameters}
+
+        async def go():
+            async with stan.common.HttpstanClient() as client:
+                resp = await client.post(f"/{self.model_name}/transform_inits", json=payload)
+                if resp.status != 200:
+                    raise RuntimeError(resp.json())
+                return resp.json()["params_r_unconstrained"]
+
+        return asyncio.run(go())
+
+    def log_prob(self, unconstrained_parameters: Sequence[float], adjust_transform: bool = True) -> float:
+        """Calculate the log probability of a set of unconstrained parameters.
+
+        Arguments:
+            unconstrained_parameters: A sequence of unconstrained parameters.
+            adjust_transform: Apply jacobian adjust transform.
+
+        Returns:
+            The log probability of the unconstrained parameters.
+
+        Notes:
+            The unconstrained parameters are passed to the log_prob
+            function in stan::model.
+
+        """
+        payload = {
+            "data": self.data,
+            "unconstrained_parameters": unconstrained_parameters,
+            "adjust_transform": adjust_transform,
+        }
+
+        async def go():
+            async with stan.common.HttpstanClient() as client:
+                resp = await client.post(f"/{self.model_name}/log_prob", json=payload)
+                if resp.status != 200:
+                    raise RuntimeError(resp.json())
+                return resp.json()["log_prob"]
+
+        return asyncio.run(go())
+
+    def grad_log_prob(self, unconstrained_parameters: Sequence[float]) -> float:
+        """Calculate the gradient of the log posterior evaluated at
+           the unconstrained parameters.
+
+        Arguments:
+            unconstrained_parameters: A sequence of unconstrained parameters.
+
+        Returns:
+            The gradient of the log posterior evaluated at the
+            unconstrained parameters.
+
+        Notes:
+            The unconstrained parameters are passed to the log_prob_grad
+            function in stan::model.
+        """
+        payload = {
+            "data": self.data,
+            "unconstrained_parameters": unconstrained_parameters,
+        }
+
+        async def go():
+            async with stan.common.HttpstanClient() as client:
+                resp = await client.post(f"/{self.model_name}/log_prob_grad", json=payload)
+                if resp.status != 200:
+                    raise RuntimeError(resp.json())
+                return resp.json()["log_prob_grad"]
+
+        return asyncio.run(go())
+
+
+def build(program_code: str, data: Data = frozendict(), random_seed: Optional[int] = None) -> Model:
+    """Build (compile) a Stan program.
+
+    Arguments:
+        program_code: Stan program code describing a Stan model.
+        data: A Python dictionary or mapping providing the data for the
+            model. Variable names are the keys and the values are their
+            associated values. Default is an empty dictionary, suitable
+            for Stan programs with no `data` block.
+        random_seed: Random seed, a positive integer for random number
+            generation. Used to make sure that results can be reproduced.
+
+    Returns:
+        Model: an instance of Model
+
+    Notes:
+        C++ reserved words and Stan reserved words may not be used for
+        variable names; see the Stan User's Guide for a complete list.
+
+    """
+    # `data` must be JSON-serializable in order to send to httpstan
+    data = json.loads(DataJSONEncoder().encode(data))
+
+    async def go():
+        io = ConsoleIO()
+        # hack: use stdout instead of stderr because httpstan silences stderr during compilation
+        building_output = io.section().output
+        if not io.supports_ansi():
+            building_output.write("<comment>Building...</comment>")
+        async with stan.common.HttpstanClient() as client:
+            # Check to see if model is in cache.
+            model_name = httpstan.models.calculate_model_name(program_code)
+            resp = await client.post(f"/{model_name}/params", json={"data": data})
+            model_in_cache = resp.status != 404
+
+            task = asyncio.create_task(client.post("/models", json={"program_code": program_code}))
+            start = time.time()
+            while True:
+                done, pending = await asyncio.wait({task}, timeout=0.1)
+                if done:
+                    break
+                if io.supports_ansi():
+                    building_output.clear()
+                    building_output.write(f"<comment>Building:</comment> {time.time() - start:0.1f}s")
+            building_output.clear() if io.supports_ansi() else building_output.write("\n")
+            # now that httpstan has released stderr, we can use error_output again
+            building_output = io.section().error_output
+            resp = task.result()
+
+            if resp.status != 201:
+                match = re.search(r"""ValueError\(['"](.*)['"]\)""", resp.json()["message"])
+                if not match:  # unknown error, should not happen
+                    raise RuntimeError(resp.json()["message"])
+                exception_body = match.group(1).encode().decode("unicode_escape")
+                error_type_match = re.match(r"(Semantic|Syntax) error", exception_body)
+                if error_type_match:
+                    error_type = error_type_match.group(0)
+                    exception_body_without_first_line = exception_body.split("\n", 1)[1]
+                    building_output.write_line(f"<info>Building:</info> <error>{error_type}:</error>")
+                    building_output.write_line(f"<error>{exception_body_without_first_line}</error>")
+                    raise ValueError(error_type)
+                else:
+                    raise RuntimeError(exception_body)
+            building_output.clear() if io.supports_ansi() else building_output.write("\n")
+            if model_in_cache:
+                building_output.write("<info>Building:</info> found in cache, done.")
+            else:
+                building_output.write(f"<info>Building:</info> {time.time() - start:0.1f}s, done.")
+            assert model_name == resp.json()["name"]
+            if resp.json().get("stanc_warnings"):
+                io.error_line("<comment>Messages from <fg=cyan;options=bold>stanc</>:</comment>")
+                io.error_line(resp.json()["stanc_warnings"])
+
+            resp = await client.post(f"/{model_name}/params", json={"data": data})
+            if resp.status != 200:
+                raise RuntimeError(resp.json()["message"])
+            params_list = resp.json()["params"]
+            assert len({param["name"] for param in params_list}) == len(params_list)
+            param_names, dims = zip(*((param["name"], param["dims"]) for param in params_list))
+            constrained_param_names = sum((tuple(param["constrained_names"]) for param in params_list), ())
+            return Model(model_name, program_code, data, param_names, constrained_param_names, dims, random_seed)
+
+    try:
+        return asyncio.run(go())
+    except KeyboardInterrupt:
+        return  # type: ignore
+[?2004hroot@9107947ed3db:/app# grep -n "_create_fit" /usr/local/lib/python3.12/dist-packages/stan/model.py
+[?2004l[32m[K108[m[K[36m[K:[m[K        return self.[01;31m[K_create_fit[m[K(function=function, num_chains=num_chains, **kwargs)
+[32m[K127[m[K[36m[K:[m[K        return self.[01;31m[K_create_fit[m[K(function=function, num_chains=num_chains, **kwargs)
+[32m[K129[m[K[36m[K:[m[K    def [01;31m[K_create_fit[m[K(self, *, function, num_chains, **kwargs) -> stan.fit.Fit:
+[?2004hroot@9107947ed3db:/app# sed -n '120,220p' /usr/local/lib/python3.12/dist-packages/stan/model.py
+[?2004l        independent processes to use when drawing samples.
+
+        Returns:
+            Fit: instance of Fit allowing access to draws.
+
+        """
+        function = "stan::services::sample::fixed_param"
+        return self._create_fit(function=function, num_chains=num_chains, **kwargs)
+
+    def _create_fit(self, *, function, num_chains, **kwargs) -> stan.fit.Fit:
+        """Make a request to httpstan's ``create_fit`` endpoint and process results.
+
+        Users should not use this function.
+
+        Parameters in ``kwargs`` will be passed to the (Python wrapper of)
+        `function`. Parameter names are identical to those used in CmdStan.
+        See the CmdStan documentation for parameter descriptions and default
+        values.
+
+        Returns:
+            Fit: instance of Fit allowing access to draws.
+
+        """
+        assert "chain" not in kwargs, "`chain` id is set automatically."
+        assert "data" not in kwargs, "`data` is set in `build`."
+        assert "random_seed" not in kwargs, "`random_seed` is set in `build`."
+
+        # copy kwargs and verify everything is JSON-encodable
+        kwargs = json.loads(DataJSONEncoder().encode(kwargs))
+
+        # FIXME: special handling here for `init`, consistent with PyStan 2 but needs docs
+        init: List[Data] = kwargs.pop("init", [dict() for _ in range(num_chains)])
+        if len(init) != num_chains:
+            raise ValueError("Initial values must be provided for each chain.")
+
+        payloads = []
+        for chain in range(1, num_chains + 1):
+            payload = kwargs.copy()
+            payload["function"] = function
+            payload["chain"] = chain  # type: ignore
+            payload["data"] = self.data  # type: ignore
+            payload["init"] = init.pop(0)
+            if self.random_seed is not None:
+                payload["random_seed"] = self.random_seed  # type: ignore
+
+            # fit needs to know num_samples, num_warmup, num_thin, save_warmup
+            # progress reporting needs to know some of these
+            num_warmup = payload.get("num_warmup", arguments.lookup_default(arguments.Method["SAMPLE"], "num_warmup"))
+            num_samples = payload.get(
+                "num_samples",
+                arguments.lookup_default(arguments.Method["SAMPLE"], "num_samples"),
+            )
+            num_thin = payload.get("num_thin", arguments.lookup_default(arguments.Method["SAMPLE"], "num_thin"))
+            save_warmup = payload.get(
+                "save_warmup",
+                arguments.lookup_default(arguments.Method["SAMPLE"], "save_warmup"),
+            )
+            payloads.append(payload)
+
+        async def go():
+            io = ConsoleIO()
+            sampling_output = io.section().error_output
+            percent_complete = 0
+            sampling_output.write_line(f"<comment>Sampling:</comment> {percent_complete:3.0f}%")
+
+            current_and_max_iterations_re = re.compile(r"Iteration:\s+(\d+)\s+/\s+(\d+)")
+            async with stan.common.HttpstanClient() as client:
+                operations = []
+                for payload in payloads:
+                    resp = await client.post(f"/{self.model_name}/fits", json=payload)
+                    if resp.status == 422:
+                        raise ValueError(str(resp.json()))
+                    elif resp.status != 201:
+                        raise RuntimeError(resp.json()["message"])
+                    assert resp.status == 201
+                    operations.append(resp.json())
+
+                # poll to get progress for each chain until all chains finished
+                current_iterations = {}
+                while not all(operation["done"] for operation in operations):
+                    for operation in operations:
+                        if operation["done"]:
+                            continue
+                        resp = await client.get(f"/{operation['name']}")
+                        assert resp.status != 404
+                        operation.update(resp.json())
+                        progress_message = operation["metadata"].get("progress")
+                        if not progress_message:
+                            continue
+                        iteration, iteration_max = map(
+                            int, current_and_max_iterations_re.findall(progress_message).pop(0)
+                        )
+                        if current_iterations.get(operation["name"]) == iteration:
+                            continue
+                        current_iterations[operation["name"]] = iteration
+                        iterations_count = sum(current_iterations.values())
+                        total_iterations = iteration_max * num_chains
+                        percent_complete = 100 * iterations_count / total_iterations
+                        sampling_output.clear() if io.supports_ansi() else sampling_output.write("\n")
+                        sampling_output.write_line(
+                            f"<comment>Sampling:</comment> {round(percent_complete):3.0f}% ({iterations_count}/{total_iterations})"
+[?2004hroot@9107947ed3db:/app# find /usr/local/lib/python3.12/dist-packages/httpstan -name '*.py' | head -40
+[?2004l/usr/local/lib/python3.12/dist-packages/httpstan/views.py
+/usr/local/lib/python3.12/dist-packages/httpstan/build_ext.py
+/usr/local/lib/python3.12/dist-packages/httpstan/utils.py
+/usr/local/lib/python3.12/dist-packages/httpstan/__main__.py
+/usr/local/lib/python3.12/dist-packages/httpstan/app.py
+/usr/local/lib/python3.12/dist-packages/httpstan/__init__.py
+/usr/local/lib/python3.12/dist-packages/httpstan/routes.py
+/usr/local/lib/python3.12/dist-packages/httpstan/openapi.py
+/usr/local/lib/python3.12/dist-packages/httpstan/config.py
+/usr/local/lib/python3.12/dist-packages/httpstan/schemas.py
+/usr/local/lib/python3.12/dist-packages/httpstan/fits.py
+/usr/local/lib/python3.12/dist-packages/httpstan/models.py
+/usr/local/lib/python3.12/dist-packages/httpstan/cache.py
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py
+/usr/local/lib/python3.12/dist-packages/httpstan/compile.py
+/usr/local/lib/python3.12/dist-packages/httpstan/include/boost/outcome/outcome.gdb.py
+/usr/local/lib/python3.12/dist-packages/httpstan/services/arguments.py
+/usr/local/lib/python3.12/dist-packages/httpstan/services/__init__.py
+[?2004hroot@9107947ed3db:/app# find /usr/local/lib/python3.12/dist-packages/httpstan -path '*services*arguments*'
+[?2004l/usr/local/lib/python3.12/dist-packages/httpstan/services/arguments.py
+/usr/local/lib/python3.12/dist-packages/httpstan/services/__pycache__/arguments.cpython-312.pyc
+[?2004hroot@9107947ed3db:/app# cat /usr/local/lib/python3.12/dist-packages/httpstan/services/arguments.py
+[?2004l"""Lookup arguments and argument default values for stan::services functions."""
+import enum
+import functools
+import importlib.resources
+import json
+import re
+import time
+import types
+import typing
+
+Method = enum.Enum("Method", "SAMPLE OPTIMIZE VARIATIONAL DIAGNOSE")
+DEFAULTS_LOOKUP = None  # lazy loaded by lookup_default
+
+
+def _pythonize_cmdstan_type(type_name: str) -> type:
+    """Turn CmdStan C++ type name into Python type.
+
+    For example, "double" becomes ``float`` (the type).
+
+    """
+    if type_name == "double":
+        return float
+    if type_name in {"int", "unsigned int"}:
+        return int
+    if type_name.startswith("bool"):
+        return bool
+    if type_name == "list element":
+        raise NotImplementedError(f"Cannot convert CmdStan `{type_name}` to Python type.")
+    if type_name == "string":
+        return str
+    raise ValueError(f"Cannot convert CmdStan `{type_name}` to Python type.")
+
+
+@functools.lru_cache()
+def lookup_default(method: Method, arg: str) -> typing.Union[float, int]:
+    """Fetch default for named argument in a stan:services `function`.
+
+    Uses defaults from CmdStan. The file ``cmdstan-help-all.json`` is generated
+    with the script ``scripts/parse_cmdstan_help.py`` from the output of running
+    a CmdStan binary with the argument ``help-all`` (e.g., ``
+    examples/bernoulli/bernoulli help-all``)
+
+    """
+    global DEFAULTS_LOOKUP
+    if DEFAULTS_LOOKUP is None:
+        DEFAULTS_LOOKUP = json.loads(importlib.resources.read_text(__package__, "cmdstan-help-all.json"))
+    # special handling for random_seed, argument name differs from CmdStan name
+    if arg == "random_seed":
+        # CmdStan generates an unsigned integer using boost::posix_time (line 80 of command.hpp)
+        return int(time.time())
+    # special handling for chain, argument name differs from CmdStan name
+    if arg == "chain":
+        return 1
+    # special handling for ``num_thin``, since argument name differs from CmdStan name
+    if arg == "num_thin":
+        arg = "thin"
+    # special handling for ``refresh`` since the choice is up to httpstan, value
+    # determines how often messages are sent to callback logger
+    if arg == "refresh":
+        return 100
+    # special handling for init_radius. There is an interaction with 'init'.
+    if arg == "init_radius":
+        return 2
+    defaults_for_method = DEFAULTS_LOOKUP["method"][method.name.lower()]
+    try:
+        item = next(filter(lambda item: item["name"] == arg, defaults_for_method))
+    except StopIteration:
+        raise ValueError(f"No argument `{arg}` is associated with `{method}`.")
+    python_type = _pythonize_cmdstan_type(item["type"])
+    if python_type == bool:
+        # bool needs special handling because bool("0") == True
+        return int(item["default"] != "0")
+    assert python_type in {int, float}
+    return typing.cast(typing.Union[float, int], python_type(item["default"]))
+
+
+def function_arguments(function_name: str, services_module: types.ModuleType) -> typing.List[str]:
+    """Get function arguments for stan::services `function_name`.
+
+    This function parses a function's docstring to get argument names. This is
+    an inferior method to using `inspect.Signature.from_callable(function)`.
+    Unfortunately, pybind11 does not support this use of `inspect`.
+
+    A compiled `services_module` is required for the lookup. Only simple function
+    arguments are returned. For example, callback writers and var_context
+    arguments are dropped.
+
+    Arguments:
+        function_name: Name of the function.
+        services_module (module): Compiled model-specific services extension module.
+
+    Returns:
+        Argument names for `function_name`.
+
+    """
+    function = getattr(services_module, f"{function_name}_wrapper")
+    docstring = function.__doc__
+    # first line look something like this: function_name(arg1: int, arg2: int, ...) -> int
+    function_name_with_arguments = docstring.split(" -> ", 1).pop(0)
+    parameters = re.findall(r"(\w+): \w+", function_name_with_arguments)
+    # remove arguments which are specific to the wrapper
+    arguments_exclude = {"socket_filename"}
+    return list(filter(lambda arg: arg not in arguments_exclude, parameters))
+[?2004hroot@9107947ed3db:/app# python3 - <<'PY'
+[?2004l[?2004h> import json, importlib.resources
+[?2004l[?2004h> pkg = "httpstan.services"
+[?2004l[?2004h> data = json.loads(importlib.resources.read_text(pkg, "cmdstan-help-all.json"))
+[?2004l[?2004h> for a in data["method"]["sample"]:
+[?2004l[?2004h>     print(f"{a['name']:22s} {a['type']:12s} default={a['default']}")
+[?2004l[?2004h> PY
+[?2004l<stdin>:3: DeprecationWarning: read_text is deprecated. Use files() instead. Refer to https://importlib-resources.readthedocs.io/en/latest/using.html#migrating-from-legacy for migration advice.
+num_samples            int          default=1000
+num_warmup             int          default=1000
+save_warmup            boolean      default=0
+thin                   int          default=1
+engaged                boolean      default=1
+gamma                  double       default=0.05
+delta                  double       default=0.8
+kappa                  double       default=0.75
+t0                     double       default=10
+init_buffer            unsigned int default=75
+term_buffer            unsigned int default=50
+window                 unsigned int default=25
+algorithm              list element default=hmc
+engine                 list element default=nuts
+int_time               double       default=2 * pi
+max_depth              int          default=10
+metric                 list element default=diag_e
+metric_file            string       default=""
+stepsize               double       default=1
+stepsize_jitter        double       default=0
+[?2004hroot@9107947ed3db:/app# cat /usr/local/lib/python3.12/dist-packages/stan/fit.py
+[?2004limport collections
+import json
+from math import ceil
+from typing import Generator, Tuple, cast
+
+import numpy as np
+import simdjson
+
+
+class Fit(collections.abc.Mapping):
+    """Stores draws from one or more chains.
+
+    Returned by methods of a ``Model``. Users will not instantiate this class directly.
+
+    A `Fit` instance works like a Python dictionary. A user-friendly views of draws
+    is available via ``to_frame``.
+
+    """
+
+    # TODO: Several possible optimizations to be made:
+    # (1) `Fit` could be built up (concurrently) one chain a time with an
+    # `append` method. This could be significantly faster.
+    # (2) `Fit` need not store full copies of the raw Stan output.
+    def __init__(
+        self,
+        stan_outputs: Tuple[bytes, ...],
+        num_chains: int,
+        param_names: Tuple[str, ...],
+        constrained_param_names: Tuple[str, ...],
+        dims: Tuple[Tuple[int, ...]],
+        num_warmup: int,
+        num_samples: int,
+        num_thin: int,
+        save_warmup: bool,
+    ) -> None:
+        self.stan_outputs = stan_outputs
+        self.num_chains = num_chains
+        assert self.num_chains == len(self.stan_outputs)
+        self.param_names, self.dims, self.constrained_param_names = (
+            param_names,
+            dims,
+            constrained_param_names,
+        )
+        self.num_warmup, self.num_samples = num_warmup, num_samples
+        if not isinstance(num_thin, int):
+            raise ValueError(f"{type(num_thin)} object cannot be interpreted as an integer: num_thin={num_thin}")
+        self.num_thin, self.save_warmup = num_thin, save_warmup
+
+        # `self.sample_and_sampler_param_names` collects the sample and sampler param names.
+        # - "sample params" include `lp__`, `accept_stat__`
+        # - "sampler params" include `stepsize__`, `treedepth__`, ...
+        # These names are gathered later in this function by inspecting the output from Stan.
+        self.sample_and_sampler_param_names: Tuple[str, ...]
+
+        num_flat_params = sum(np.prod(dims_ or 1) for dims_ in dims)  # if dims == [] then it is a scalar
+        assert num_flat_params == len(constrained_param_names)
+        num_samples_saved = ceil(self.num_samples / self.num_thin) + ceil(
+            (self.num_warmup * self.save_warmup) / self.num_thin
+        )
+
+        # self._draws holds all the draws. We cannot allocate it before looking at the draws
+        # because we do not know how many sampler-specific parameters are present. Later in this
+        # function we count them and only then allocate the array for `self._draws`.
+        #
+        # _draws is an ndarray with shape (num_sample_and_sampler_params + num_flat_params, num_draws, num_chains)
+        self._draws: np.ndarray
+
+        parser = simdjson.Parser()
+        for chain_index, stan_output in zip(range(self.num_chains), self.stan_outputs):
+            draw_index = 0
+            for line in stan_output.splitlines():
+                try:
+                    msg = cast(simdjson.Object, parser.parse(line))
+                except ValueError:
+                    # Occurs when draws contain an nan or infinity. simdjson cannot parse such values.
+                    msg = json.loads(line)
+                try:
+                    if msg["topic"] == "sample":
+                        # Ignore sample message which is mixed together with proper draws.
+                        if not isinstance(msg["values"], (simdjson.Object, dict)):
+                            continue
+
+                        # for the first draw: collect sample and sampler parameter names.
+                        if not hasattr(self, "_draws"):
+                            feature_names = cast(Tuple[str, ...], tuple(msg["values"].keys()))
+                            self.sample_and_sampler_param_names = tuple(
+                                name for name in feature_names if name.endswith("__")
+                            )
+                            num_rows = len(self.sample_and_sampler_param_names) + num_flat_params
+                            # column-major order ("F") aligns with how the draws are stored (in cols).
+                            self._draws = np.empty((num_rows, num_samples_saved, num_chains), order="F")
+                            # rudimentary check of parameter order (sample & sampler params must be first)
+                            if num_flat_params and feature_names[-1].endswith("__"):
+                                raise RuntimeError(
+                                    f"Expected last parameter name to be one declared in program code, found `{feature_names[-1]}`"
+                                )
+
+                        draw_row = tuple(msg["values"].values())  # a "row" of values from a single draw from Stan C++
+                        self._draws[:, draw_index, chain_index] = draw_row
+                        draw_index += 1
+                finally:
+                    # clean up `Object`s produced by parser, required by simdjson
+                    del msg
+            assert draw_index == num_samples_saved
+        assert self.sample_and_sampler_param_names and self._draws.size
+        self._draws.flags["WRITEABLE"] = False  # type: ignore
+
+    def __contains__(self, key):
+        return key in self.param_names
+
+    def to_frame(self):
+        """Return view of draws as a pandas DataFrame.
+
+        If pandas is not installed, a `RuntimeError` will be raised.
+
+        Returns:
+            pandas.DataFrame: DataFrame with `num_draws` rows and
+                `num_flat_params` columns.
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            raise RuntimeError("The `to_frame` method requires the Python package `pandas`.")
+        columns = self.sample_and_sampler_param_names + self.constrained_param_names
+        assert len(self._draws) == len(columns)
+        df = pd.DataFrame(self._draws.reshape(len(columns), -1).T, columns=columns)
+        df.index.name, df.columns.name = "draws", "parameters"
+        return df
+
+    def __getitem__(self, param):
+        """Returns array with shape (stan_dimensions, num_chains * num_samples)"""
+        assert param.endswith("__") or param in self.param_names, param
+        param_indexes = self._parameter_indexes(param)
+        param_dim = [] if param in self.sample_and_sampler_param_names else self.dims[self.param_names.index(param)]
+        # fmt: off
+        num_samples_saved = ceil(self.num_samples / self.num_thin) + ceil((self.num_warmup * self.save_warmup) / self.num_thin)
+        assert self._draws.shape == (len(self.sample_and_sampler_param_names) + len(self.constrained_param_names), num_samples_saved, self.num_chains)
+        # fmt: on
+        if not len(param_indexes):
+            assert 0 in param_dim
+            return np.array([]).reshape(param_dim + [num_samples_saved * self.num_chains])
+        # Stack chains together. Parameter is still stored flat.
+        view = self._draws[param_indexes, :, :].reshape(len(param_indexes), -1).view()
+        assert view.shape == (len(param_indexes), num_samples_saved * self.num_chains)
+        # reshape must yield something with least two dimensions
+        reshape_args = param_dim + [-1] if param_dim else (1, -1)
+        # reshape, recover the shape of the stan parameter
+        return view.reshape(*reshape_args, order="F")
+
+    def __iter__(self) -> Generator[str, None, None]:
+        for name in self.param_names:
+            yield name
+
+    def __len__(self) -> int:
+        return len(self.param_names)
+
+    def __repr__(self) -> str:
+        # inspired by xarray
+        parts = [f"<stan.{type(self).__name__}>"]
+
+        def summarize_param(param_name, dims):
+            return f"    {param_name}: {tuple(dims)}"
+
+        if self.param_names:
+            parts.append("Parameters:")
+        for param_name, dims in zip(self.param_names, self.dims):
+            parts.append(summarize_param(param_name, dims))
+
+        # total draws is num_draws (per-chain) times num_chains
+        parts.append(f"Draws: {self._draws.shape[-2] * self._draws.shape[-1]}")
+        return "\n".join(parts)
+
+    def _parameter_indexes(self, param: str) -> Tuple[int, ...]:
+        """Obtain indexes for values associated with `param`.
+
+        A draw from the sampler is a flat vector of values. A multi-dimensional
+        variable will be stored in this vector in column-major order. This function
+        identifies the indices which allow us to extract values associated with a
+        parameter.
+
+        Parameters
+        ----------
+        param : Parameter of interest.
+
+        Returns
+        -------
+        Indexes associated with parameter.
+
+        Note
+        ----
+
+        This function assumes that parameters appearing in the program code follow
+        the sample and sampler parameters (e.g., ``lp__``, ``stepsize__``).
+        """
+        # if `param` is a scalar, it will match one of the constrained names or it will match a
+        # sample param name (e.g., `lp__`) or a sampler param name (e.g., `stepsize__`)
+        if param in self.sample_and_sampler_param_names:
+            return (self.sample_and_sampler_param_names.index(param),)
+        sample_and_sampler_params_offset = len(self.sample_and_sampler_param_names)
+        if param in self.constrained_param_names:
+            return (sample_and_sampler_params_offset + self.constrained_param_names.index(param),)
+
+        def calculate_starts(dims: Tuple[Tuple[int, ...]]) -> Tuple[int, ...]:
+            """Calculate starting indexes given dims."""
+            s = [cast(int, np.prod(d)) for d in dims]
+            starts = np.cumsum([0] + s)[: len(dims)]
+            return tuple(int(i) for i in starts)
+
+        starts = tuple(sample_and_sampler_params_offset + i for i in calculate_starts(self.dims))
+        names_index = self.param_names.index(param)
+        flat_param_count = cast(int, np.prod(self.dims[names_index]))
+        return tuple(starts[names_index] + offset for offset in range(flat_param_count))
+[?2004hroot@9107947ed3db:/app# cat > /app/test_api.py <<'PY'
+[?2004l[?2004h> import stan, numpy as np, time
+[?2004l[?2004h> program_code = """
+[?2004l[?2004h> parameters { real<lower=0> a; real b; vector[3] v; }
+[?2004l[?2004h> model { a ~ normal(0,1); b ~ normal(0,1); v ~ normal(0,1); }
+[?2004l[?2004h> """
+[?2004l[?2004h> t0=time.time()
+[?2004l[?2004h> post = stan.build(program_code, data={}, random_seed=1)
+[?2004l[?2004h> print("BUILD OK in %.1fs" % (time.time()-t0), flush=True)
+[?2004l[?2004h> t1=time.time()
+[?2004l[?2004h> fit = post.sample(num_chains=2, num_samples=30, num_warmup=30, num_thin=2,
+[?2004l[?2004h>                   delta=0.93, max_depth=14, gamma=0.05, kappa=0.75, t0=10,
+[?2004l[?2004h>                   init_buffer=100, term_buffer=50, window=25, refresh=200,
+[?2004l[?2004h>                   save_warmup=False)
+[?2004l[?2004h> print("SAMPLE OK in %.1fs" % (time.time()-t1), flush=True)
+[?2004l[?2004h> print("params:", list(fit), flush=True)
+[?2004l[?2004h> print("dims:", fit.dims, flush=True)
+[?2004l[?2004h> print("a shape:", fit["a"].shape, "mean:", float(np.mean(fit["a"])), flush=True)
+[?2004l[?2004h> print("v shape:", fit["v"].shape, "colmean:", np.mean(fit["v"], axis=1), flush=True)
+[?2004l[?2004h> print("ALL_OK", flush=True)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@9107947ed3db:/app# echo written
+[?2004lwritten
+[?2004hroot@9107947ed3db:/app# cd /app && nohup python3 test_api.py > /app/test.log 2>&1 &
+[?2004l[1] 2863
+[?2004hroot@9107947ed3db:/app# echo "launched pid $!"
+[?2004llaunched pid 2863
+[?2004hroot@9107947ed3db:/app# sleep 20; echo '--- log ---'; cat /app/test.log
+[?2004l[1]+  Done                    cd /app && nohup python3 test_api.py > /app/test.log 2>&1
+--- log ---
+nohup: ignoring input
+Building...
+
+Building: 18.6s, done.BUILD OK in 18.6s
+Sampling:   0%
+Sampling:  50% (60/120)
+Sampling: 100% (120/120)
+Sampling: 100% (120/120), done.
+Messages received during sampling:
+  Gradient evaluation took 1.4e-05 seconds
+  1000 transitions using 10 leapfrog steps per transition would take 0.14 seconds.
+  Adjust your expectations accordingly!
+  WARNING: There aren't enough warmup iterations to fit the
+           three stages of adaptation as currently configured.
+           Reducing each adaptation stage to 15%/75%/10% of
+           the given number of warmup iterations:
+             init_buffer = 4
+             adapt_window = 23
+             term_buffer = 3
+  Gradient evaluation took 1.1e-05 seconds
+  1000 transitions using 10 leapfrog steps per transition would take 0.11 seconds.
+  Adjust your expectations accordingly!
+  WARNING: There aren't enough warmup iterations to fit the
+           three stages of adaptation as currently configured.
+           Reducing each adaptation stage to 15%/75%/10% of
+           the given number of warmup iterations:
+             init_buffer = 4
+             adapt_window = 23
+             term_buffer = 3
+SAMPLE OK in 0.4s
+params: ['a', 'b', 'v']
+dims: ([], [], [3])
+a shape: (1, 30) mean: 0.766729385593121
+v shape: (3, 30) colmean: [ 0.05854949 -0.22106986  0.00311519]
+ALL_OK
+[?2004hroot@9107947ed3db:/app# cat > /app/pystan_analysis.py <<'PY'
+[?2004l[?2004h> import json
+[?2004l[?2004h> import time
+[?2004l, adapt_gamm[?2004h> import numpy as np
+[?2004l[?2004h> import stan
+[?2004l7[?2004h> 
+[?2004l5[?2004h> t_start = time.time()
+[?2004l[?2004h> 
+[?2004l[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> # 1. Load data (same files as the R script)
+[?2004l-[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> with open("/app/meta_public.json") as f:
+[?2004lo[?2004h>     meta = json.load(f)
+[?2004l[?2004h> P = int(meta["P"])
+[?2004l[?2004h> jitter = float(meta["jitter"])
+[?2004l[?2004h> 
+[?2004l[?2004h> train_X = np.genfromtxt("/app/train_X.csv", delimiter=",", skip_header=1)
+[?2004l[?2004h> test_X = np.genfromtxt("/app/test_X.csv", delimiter=",", skip_header=1)
+[?2004l[?2004h> train_y = np.genfromtxt("/app/train_y.csv", delimiter=",", skip_header=1).ravel()
+[?2004l[?2004h> 
+[?2004ll[?2004h> N = train_X.shape[0]
+[?2004l[?2004h> D = train_X.shape[1]
+[?2004l[?2004h> N_new = test_X.shape[0]
+[?2004l[?2004h> 
+[?2004l [?2004h> # H = cbind(1, train_X[,1], train_X[,2])   (R 1-indexed -> py 0-indexed)
+[?2004l[?2004h> H = np.column_stack(np.ones(N), train_X[:, 0], train_X[:, 1])
+[?2004l[?2004h> if N_new > 0:
+[?2004l[?2004h>     X_new = test_X
+[?2004l[?2004h>     H_new = np.column_stack(np.ones(N_new), test_X[:, 0], test_X[:, 1])
+[?2004l[?2004h> else:
+[?2004lres[?2004h>     X_new = np.zeros((0, D))
+[?2004l[?2004h>     H_new = np.zeros((0, P))
+[?2004l[?2004h> 
+[?2004li[?2004h> data = {
+[?2004l[?2004h>     "N": int(N),
+[?2004l[?2004h>     "D": int(D),
+[?2004l[?2004h>     "X": train_X.tolist(),
+[?2004l[?2004h>     "P": int(P),
+[?2004l[?2004h>     "H": H.tolist(),
+[?2004l[?2004h>     "y": train_y.tolist(),
+[?2004l[?2004h>     "jitter": jitter,
+[?2004l[?2004h>     "N_new": int(N_new),
+[?2004l[?2004h>     "X_new": X_new.tolist(),
+[?2004l[?2004h>     "H_new": H_new.tolist(),
+[?2004l[?2004h> }
+[?2004l--[?2004h> print("Data: N=%d D=%d P=%d N_new=%d jitter=%g" % (N, D, P, N_new, jitter), flush=True)
+[?2004l[?2004h> 
+[?2004l
+[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> # 2. Stan model (functionally identical to /app/gp_rstan.R)
+[?2004l[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> stan_code = """
+[?2004l[?2004h> functions {
+[?2004l[?2004h>   matrix cov_ard_sqexp(matrix X, vector rho, real alpha, real jitter) {
+[?2004l[?2004h>     int N = rows(X);
+[?2004l[?2004h>     int D = cols(X);
+[?2004l[?2004h>     matrix[N, N] K;
+[?2004l[?2004h> 
+[?2004l-[?2004h>     for (i in 1:N) {
+[?2004l [?2004h>       K[i, i] = square(alpha) + jitter;
+[?2004l[?2004h>       for (j in (i + 1):N) {
+[?2004l[?2004h>         real s = 0;
+[?2004l-[?2004h>         for (d in 1:D) {
+[?2004l[?2004h>           real t = (X[i, d] - X[j, d]) / rho[d];
+[?2004l[?2004h>           s += t * t;
+[?2004l[?2004h>         }
+[?2004lp[?2004h>         K[i, j] = square(alpha) * exp(-0.5 * s);
+[?2004l[?2004h>         K[j, i] = K[i, j];
+[?2004l/r[?2004h>       }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     return K;
+[?2004l[?2004h>   }
+[?2004l[?2004h> 
+[?2004li[?2004h>   matrix cross_cov_ard(matrix X, matrix X_new, vector rho, real alpha) {
+[?2004l[?2004h>     int N = rows(X);
+[?2004l[?2004h>     int M = rows(X_new);
+[?2004l[?2004h>     int D = cols(X);
+[?2004l[?2004h>     matrix[N, M] Kx;
+[?2004l[?2004h>     for (i in 1:N) {
+[?2004l[?2004h>       for (j in 1:M) {
+[?2004l[?2004h>         real s = 0;
+[?2004l"[?2004h>         for (d in 1:D) {
+[?2004l[?2004h>           real t = (X[i, d] - X_new[j, d]) / rho[d];
+[?2004l[?2004h>           s += t * t;
+[?2004l[?2004h>         }
+[?2004l[?2004h>         Kx[i, j] = square(alpha) * exp(-0.5 * s);
+[?2004l[?2004h>       }
+[?2004l[?2004h>     }
+[?2004l[?2004h>     return Kx;
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> data {
+[?2004l[?2004h>   int<lower=1> N;
+[?2004l[?2004h>   int<lower=1> D;
+[?2004l[?2004h>   matrix[N, D] X;
+[?2004l[?2004h>   int<lower=1> P;
+[?2004l[?2004h>   matrix[N, P] H;
+[?2004l[?2004h>   vector[N] y;
+[?2004l[?2004h>   real<lower=0> jitter;
+[?2004l[?2004h> 
+[?2004l[?2004h>   int<lower=0> N_new;
+[?2004l[?2004h>   matrix[N_new, D] X_new;
+[?2004l[?2004h>   matrix[N_new, P] H_new;
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> parameters {
+[?2004l[?2004h>   vector[P] beta;
+[?2004l[?2004h>   real<lower=0> alpha;
+[?2004l[?2004h>   vector<lower=0>[D] rho;
+[?2004l[?2004h>   real<lower=0> sigma;
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> transformed parameters {
+[?2004l[?2004h>   vector[N] mu = H * beta;
+[?2004l[?2004h>   matrix[N, N] K = cov_ard_sqexp(X, rho, alpha, jitter)
+[?2004l[?2004h>                    + diag_matrix(rep_vector(square(sigma), N));
+[?2004l[?2004h>   matrix[N, N] L_K = cholesky_decompose(K);
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> model {
+[?2004l[?2004h>   beta  ~ normal(0, 1);
+[?2004l[?2004h>   alpha ~ normal(0, 1.5);
+[?2004l[?2004h>   rho   ~ lognormal(0, 1);
+[?2004l[?2004h>   sigma ~ normal(0, 0.5);
+[?2004l[?2004h>   y ~ multi_normal_cholesky(mu, L_K);
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> generated quantities {
+[?2004l[?2004h>   vector[N_new] y_new;
+[?2004l[?2004h>   if (N_new > 0) {
+[?2004l[?2004h>     matrix[N, N_new] K_x_xnew = cross_cov_ard(X, X_new, rho, alpha);
+[?2004l[?2004h>     matrix[N_new, N_new] K_new = cov_ard_sqexp(X_new, rho, alpha, jitter);
+[?2004l[?2004h>     vector[N] resid = y - (H * beta);
+[?2004l[?2004h> 
+[?2004l[?2004h>     vector[N] alpha_vec = mdivide_left_tri_low(L_K, resid);
+[?2004l[?2004h>     alpha_vec = mdivide_left_tri_low(L_K', alpha_vec);
+[?2004l[?2004h> 
+[?2004l[?2004h>     vector[N_new] f_mean = (K_x_xnew' * alpha_vec);
+[?2004l[?2004h>     matrix[N, N_new] v = mdivide_left_tri_low(L_K, K_x_xnew);
+[?2004l[?2004h>     vector[N_new] f_var = to_vector(diagonal(K_new)) - to_vector(columns_dot_self(v));
+[?2004l[?2004h>     for (m in 1:N_new) {
+[?2004l[?2004h>       real m_mean = (H_new[m] * beta) + f_mean[m];
+[?2004l[?2004h>       real m_sd   = sqrt(f_var[m] + square(sigma));
+[?2004l[?2004h>       y_new[m] = normal_rng(m_mean, m_sd);
+[?2004l[?2004h>     }
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> """
+[?2004l[?2004h> 
+[?2004l[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> # 3. Build & sample  (equivalent to RStan hyperparameters)
+[?2004l[?2004h> #    R: chains=4, iter=2000, warmup=1000, thin=2, seed=1
+[?2004l[?2004h> #       adapt_delta=0.93, max_treedepth=14, adapt_gamma=0.05,
+[?2004l[?2004h> #       adapt_kappa=0.75, adapt_t0=10, adapt_init_buffer=100,
+[?2004l[?2004h> #       adapt_term_buffer=50, adapt_window=25, init_r=0.1, refresh=200
+[?2004l[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> t_build = time.time()
+[?2004l[?2004h> posterior = stan.build(stan_code, data=data, random_seed=1)
+[?2004l[?2004h> print("BUILD OK in %.1fs" % (time.time() - t_build), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> t_sample = time.time()
+[?2004l[?2004h> fit = posterior.sample(
+[?2004l[?2004h>     num_chains=4,
+[?2004l[?2004h>     num_samples=1000,   # = R iter(2000) - warmup(1000)
+[?2004l[?2004h>     num_warmup=1000,    # = R warmup
+[?2004l[?2004h>     num_thin=2,         # = R thin
+[?2004l[?2004h>     delta=0.93,         # adapt_delta
+[?2004l[?2004h>     max_depth=14,       # max_treedepth
+[?2004l[?2004h>     gamma=0.05,         # adapt_gamma
+[?2004l[?2004h>     kappa=0.75,         # adapt_kappa
+[?2004l[?2004h>     t0=10,              # adapt_t0
+[?2004l[?2004h>     init_buffer=100,    # adapt_init_buffer
+[?2004l[?2004h>     term_buffer=50,     # adapt_term_buffer
+[?2004l[?2004h>     window=25,          # adapt_window
+[?2004l[?2004h>     refresh=200,        # refresh
+[?2004l[?2004h>     save_warmup=False,
+[?2004l[?2004h> )
+[?2004l[?2004h> print("SAMPLE OK in %.1fs" % (time.time() - t_sample), flush=True)
+[?2004l[?2004h> print("params:", list(fit), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> # 4. Posterior means (match R: alpha/sigma mean, rho/beta colMeans)
+[?2004l[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> alpha_est = float(np.mean(fit["alpha"]))
+[?2004l[?2004h> sigma_est = float(np.mean(fit["sigma"]))
+[?2004l[?2004h> rho_est = np.mean(fit["rho"], axis=1)
+[?2004l[?2004h> beta_est = np.mean(fit["beta"], axis=1)
+[?2004l[?2004h> 
+[?2004l[?2004h> print("Posterior means:", flush=True)
+[?2004l[?2004h> print("alpha:", alpha_est, flush=True)
+[?2004l[?2004h> print("sigma:", sigma_est, flush=True)
+[?2004l[?2004h> print("rho:  ", rho_est, flush=True)
+[?2004l[?2004h> print("beta: ", beta_est, flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> # 5. Save results (numeric values only)
+[?2004l[?2004h> # ----------------------------------------------------------------------
+[?2004l[?2004h> with open("/app/alpha_est.csv", "w") as f:
+[?2004l[?2004h>     f.write(f"{alpha_est}\n")
+[?2004l[?2004h> with open("/app/sigma_est.csv", "w") as f:
+[?2004l[?2004h>     f.write(f"{sigma_est}\n")
+[?2004l[?2004h> with open("/app/rho_est.csv", "w") as f:
+[?2004l[?2004h>     f.write("\n".join(f"{v}" for v in rho_est) + "\n")
+[?2004l[?2004h> with open("/app/beta_est.csv", "w") as f:
+[?2004l[?2004h>     f.write("\n".join(f"{v}" for v in beta_est) + "\n")
+[?2004l[?2004h> 
+[?2004l[?2004h> print("Total time %.1fs" % (time.time() - t_start), flush=True)
+[?2004l[?2004h> print("DONE_ALL", flush=True)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@9107947ed3db:/app# echo "script written"
+[?2004lscript written
+[?2004hroot@9107947ed3db:/app# python3 -c "import ast; ast.parse(open('/app/pystan_analysis.py').read()); print('syntax OK')"
+[?2004lsyntax OK
+[?2004hroot@9107947ed3db:/app# wc -l /app/pystan_analysis.py
+[?2004l207 /app/pystan_analysis.py
+[?2004hroot@9107947ed3db:/app# grep -nE 'cov_ard_sqexp|cross_cov_ard|multi_normal_cholesky|cholesky_decompose|columns_dot_self|normal_rng|lognormal|rep_vector' /app/pystan_analysis.py
+[?2004l[32m[K52[m[K[36m[K:[m[K  matrix [01;31m[Kcov_ard_sqexp[m[K(matrix X, vector rho, real alpha, real jitter) {
+[32m[K72[m[K[36m[K:[m[K  matrix [01;31m[Kcross_cov_ard[m[K(matrix X, matrix X_new, vector rho, real alpha) {
+[32m[K114[m[K[36m[K:[m[K  matrix[N, N] K = [01;31m[Kcov_ard_sqexp[m[K(X, rho, alpha, jitter)
+[32m[K115[m[K[36m[K:[m[K                   + diag_matrix([01;31m[Krep_vector[m[K(square(sigma), N));
+[32m[K116[m[K[36m[K:[m[K  matrix[N, N] L_K = [01;31m[Kcholesky_decompose[m[K(K);
+[32m[K122[m[K[36m[K:[m[K  rho   ~ [01;31m[Klognormal[m[K(0, 1);
+[32m[K124[m[K[36m[K:[m[K  y ~ [01;31m[Kmulti_normal_cholesky[m[K(mu, L_K);
+[32m[K130[m[K[36m[K:[m[K    matrix[N, N_new] K_x_xnew = [01;31m[Kcross_cov_ard[m[K(X, X_new, rho, alpha);
+[32m[K131[m[K[36m[K:[m[K    matrix[N_new, N_new] K_new = [01;31m[Kcov_ard_sqexp[m[K(X_new, rho, alpha, jitter);
+[32m[K139[m[K[36m[K:[m[K    vector[N_new] f_var = to_vector(diagonal(K_new)) - to_vector([01;31m[Kcolumns_dot_self[m[K(v));
+[32m[K143[m[K[36m[K:[m[K      y_new[m] = [01;31m[Knormal_rng[m[K(m_mean, m_sd);
+[?2004hroot@9107947ed3db:/app# grep -nE 'random_seed=1|num_chains=4|num_samples=1000|num_warmup=1000|num_thin=2|delta=0.93|max_depth=14|gamma=0.05|kappa=0.75|t0=10|init_buffer=100|term_buffer=50|window=25|refresh=200|save_warmup=False' /app/pystan_analysis.py
+[?2004l[32m[K152[m[K[36m[K:[m[K#       adapt_[01;31m[Kdelta=0.93[m[K, max_treedepth=14, adapt_[01;31m[Kgamma=0.05[m[K,
+[32m[K153[m[K[36m[K:[m[K#       adapt_[01;31m[Kkappa=0.75[m[K, adapt_[01;31m[Kt0=10[m[K, adapt_[01;31m[Kinit_buffer=100[m[K,
+[32m[K154[m[K[36m[K:[m[K#       adapt_[01;31m[Kterm_buffer=50[m[K, adapt_[01;31m[Kwindow=25[m[K, init_r=0.1, [01;31m[Krefresh=200[m[K
+[32m[K157[m[K[36m[K:[m[Kposterior = stan.build(stan_code, data=data, [01;31m[Krandom_seed=1[m[K)
+[32m[K162[m[K[36m[K:[m[K    [01;31m[Knum_chains=4[m[K,
+[32m[K163[m[K[36m[K:[m[K    [01;31m[Knum_samples=1000[m[K,   # = R iter(2000) - warmup(1000)
+[32m[K164[m[K[36m[K:[m[K    [01;31m[Knum_warmup=1000[m[K,    # = R warmup
+[32m[K165[m[K[36m[K:[m[K    [01;31m[Knum_thin=2[m[K,         # = R thin
+[32m[K166[m[K[36m[K:[m[K    [01;31m[Kdelta=0.93[m[K,         # adapt_delta
+[32m[K167[m[K[36m[K:[m[K    [01;31m[Kmax_depth=14[m[K,       # max_treedepth
+[32m[K168[m[K[36m[K:[m[K    [01;31m[Kgamma=0.05[m[K,         # adapt_gamma
+[32m[K169[m[K[36m[K:[m[K    [01;31m[Kkappa=0.75[m[K,         # adapt_kappa
+[32m[K170[m[K[36m[K:[m[K    [01;31m[Kt0=10[m[K,              # adapt_t0
+[32m[K171[m[K[36m[K:[m[K    [01;31m[Kinit_buffer=100[m[K,    # adapt_init_buffer
+[32m[K172[m[K[36m[K:[m[K    [01;31m[Kterm_buffer=50[m[K,     # adapt_term_buffer
+[32m[K173[m[K[36m[K:[m[K    [01;31m[Kwindow=25[m[K,          # adapt_window
+[32m[K174[m[K[36m[K:[m[K    [01;31m[Krefresh=200[m[K,        # refresh
+[32m[K175[m[K[36m[K:[m[K    [01;31m[Ksave_warmup=False[m[K,
+[?2004hroot@9107947ed3db:/app# grep -nE 'np.mean|alpha_est|sigma_est|rho_est|beta_est|genfromtxt|column_stack|open' /app/pystan_analysis.py
+[?2004l[32m[K11[m[K[36m[K:[m[Kwith [01;31m[Kopen[m[K("/app/meta_public.json") as f:
+[32m[K16[m[K[36m[K:[m[Ktrain_X = np.[01;31m[Kgenfromtxt[m[K("/app/train_X.csv", delimiter=",", skip_header=1)
+[32m[K17[m[K[36m[K:[m[Ktest_X = np.[01;31m[Kgenfromtxt[m[K("/app/test_X.csv", delimiter=",", skip_header=1)
+[32m[K18[m[K[36m[K:[m[Ktrain_y = np.[01;31m[Kgenfromtxt[m[K("/app/train_y.csv", delimiter=",", skip_header=1).ravel()
+[32m[K25[m[K[36m[K:[m[KH = np.[01;31m[Kcolumn_stack[m[K(np.ones(N), train_X[:, 0], train_X[:, 1])
+[32m[K28[m[K[36m[K:[m[K    H_new = np.[01;31m[Kcolumn_stack[m[K(np.ones(N_new), test_X[:, 0], test_X[:, 1])
+[32m[K183[m[K[36m[K:[m[K[01;31m[Kalpha_est[m[K = float([01;31m[Knp.mean[m[K(fit["alpha"]))
+[32m[K184[m[K[36m[K:[m[K[01;31m[Ksigma_est[m[K = float([01;31m[Knp.mean[m[K(fit["sigma"]))
+[32m[K185[m[K[36m[K:[m[K[01;31m[Krho_est[m[K = [01;31m[Knp.mean[m[K(fit["rho"], axis=1)
+[32m[K186[m[K[36m[K:[m[K[01;31m[Kbeta_est[m[K = [01;31m[Knp.mean[m[K(fit["beta"], axis=1)
+[32m[K189[m[K[36m[K:[m[Kprint("alpha:", [01;31m[Kalpha_est[m[K, flush=True)
+[32m[K190[m[K[36m[K:[m[Kprint("sigma:", [01;31m[Ksigma_est[m[K, flush=True)
+[32m[K191[m[K[36m[K:[m[Kprint("rho:  ", [01;31m[Krho_est[m[K, flush=True)
+[32m[K192[m[K[36m[K:[m[Kprint("beta: ", [01;31m[Kbeta_est[m[K, flush=True)
+[32m[K197[m[K[36m[K:[m[Kwith [01;31m[Kopen[m[K("/app/[01;31m[Kalpha_est[m[K.csv", "w") as f:
+[32m[K198[m[K[36m[K:[m[K    f.write(f"{[01;31m[Kalpha_est[m[K}\n")
+[32m[K199[m[K[36m[K:[m[Kwith [01;31m[Kopen[m[K("/app/[01;31m[Ksigma_est[m[K.csv", "w") as f:
+[32m[K200[m[K[36m[K:[m[K    f.write(f"{[01;31m[Ksigma_est[m[K}\n")
+[32m[K201[m[K[36m[K:[m[Kwith [01;31m[Kopen[m[K("/app/[01;31m[Krho_est[m[K.csv", "w") as f:
+[32m[K202[m[K[36m[K:[m[K    f.write("\n".join(f"{v}" for v in [01;31m[Krho_est[m[K) + "\n")
+[32m[K203[m[K[36m[K:[m[Kwith [01;31m[Kopen[m[K("/app/[01;31m[Kbeta_est[m[K.csv", "w") as f:
+[32m[K204[m[K[36m[K:[m[K    f.write("\n".join(f"{v}" for v in [01;31m[Kbeta_est[m[K) + "\n")
+[?2004hroot@9107947ed3db:/app# cd /app && nohup python3 pystan_analysis.py > /app/pystan.log 2>&1 & echo "launched pid $!"
+[?2004l[1] 3246
+launched pid 3246
+[?2004hroot@9107947ed3db:/app# sleep 30; echo '=== log so far ==='; cat /app/pystan.log
+[?2004l[1]+  Exit 1                  cd /app && nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+=== log so far ===
+nohup: ignoring input
+Traceback (most recent call last):
+  File "/app/pystan_analysis.py", line 25, in <module>
+    H = np.column_stack(np.ones(N), train_X[:, 0], train_X[:, 1])
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: column_stack() takes 1 positional argument but 3 were given
+[?2004hroot@9107947ed3db:/app# python3 - <<'PY'
+[?2004l[?2004h> s = open('/app/pystan_analysis.py').read()
+[?2004l[?2004h> s = s.replace("np.column_stack(np.ones(N), train_X[:, 0], train_X[:, 1])", "np.column_stack((np.ones(N), train_X[:, 0], train_X[:, 1]))")
+[?2004l[?2004h> s = s.replace("np.column_stack(np.ones(N_new), test_X[:, 0], test_X[:, 1])", "np.column_stack((np.ones(N_new), test_X[:, 0], test_X[:, 1]))")
+[?2004l[?2004h> open('/app/pystan_analysis.py','w').write(s)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PY
+[?2004lpatched
+[?2004hroot@9107947ed3db:/app# grep -nE 'column_stack' /app/pystan_analysis.py; python3 -c "import ast; ast.parse(open('/app/pystan_analysis.py').read()); print('syntax OK')"
+[?2004l[32m[K25[m[K[36m[K:[m[KH = np.[01;31m[Kcolumn_stack[m[K((np.ones(N), train_X[:, 0], train_X[:, 1]))
+[32m[K28[m[K[36m[K:[m[K    H_new = np.[01;31m[Kcolumn_stack[m[K((np.ones(N_new), test_X[:, 0], test_X[:, 1]))
+syntax OK
+[?2004hroot@9107947ed3db:/app# cd /app && nohup python3 pystan_analysis.py > /app/pystan.log 2>&1 & echo "launched pid $!"
+[?2004l[1] 3363
+launched pid 3363
+[?2004hroot@9107947ed3db:/app# sleep 30; echo '=== log ==='; cat /app/pystan.log
+[?2004l=== log ===
+nohup: ignoring input
+Data: N=200 D=3 P=3 N_new=5 jitter=1e-06
+Building...[?2004hroot@9107947ed3db:/app# sleep 45; echo '=== log ==='; cat /app/pystan.log
+[?2004l/bin/bash: line 292:  3364 Killed                  nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+[1]+  Exit 137                cd /app && nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+=== log ===
+nohup: ignoring input
+Data: N=200 D=3 P=3 N_new=5 jitter=1e-06
+Building...
+
+Building: 39.7s, done.BUILD OK in 40.2s
+Sampling:   0%
+Sampling:   0% (1/8000)
+Sampling:   0% (2/8000)
+Sampling:   0% (3/8000)
+Sampling:   0% (4/8000)
+Sampling:   3% (203/8000)
+Sampling:   5% (402/8000)
+Sampling:   8% (601/8000)
+Sampling:  10% (800/8000)
+Sampling:  12% (1000/8000)
+Sampling:  15% (1200/8000)
+Sampling:  18% (1400/8000)
+Sampling:  20% (1600/8000)
+Sampling:  22% (1800/8000)
+Sampling:  25% (2000/8000)
+Sampling:  28% (2200/8000)
+Sampling:  30% (2400/8000)
+Sampling:  32% (2600/8000)
+Sampling:  35% (2800/8000)
+Sampling:  38% (3000/8000)
+Sampling:  40% (3200/8000)
+Sampling:  43% (3401/8000)
+Sampling:  45% (3602/8000)
+Sampling:  48% (3803/8000)
+Sampling:  50% (4004/8000)
+Sampling:  53% (4203/8000)
+Sampling:  55% (4402/8000)
+Sampling:  58% (4601/8000)
+Sampling:  60% (4800/8000)
+Sampling:  62% (5000/8000)
+Sampling:  65% (5200/8000)
+Sampling:  68% (5400/8000)
+Sampling:  70% (5600/8000)
+Sampling:  72% (5800/8000)
+Sampling:  75% (6000/8000)
+Sampling:  78% (6200/8000)
+Sampling:  80% (6400/8000)
+Sampling:  82% (6600/8000)
+Sampling:  85% (6800/8000)
+Sampling:  88% (7000/8000)
+Sampling:  90% (7200/8000)
+Sampling:  92% (7400/8000)
+Sampling:  95% (7600/8000)
+Sampling:  98% (7800/8000)
+Sampling: 100% (8000/8000)[?2004hroot@9107947ed3db:/app# free -m
+[?2004l               total        used        free      shared  buff/cache   available
+Mem:         1886779      174476       60756        9656     1671250     1712302
+Swap:              0           0           0
+[?2004hroot@9107947ed3db:/app# ps aux --sort=-rss | head -12
+[?2004lUSER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+root        3460 33.5  0.0 2424984 76740 pts/1   S    13:27   2:32 python3 pystan_analysis.py
+root        3459 34.8  0.0 2424984 76732 pts/1   S    13:27   2:38 python3 pystan_analysis.py
+root        3458 33.9  0.0 2424984 76728 pts/1   S    13:27   2:34 python3 pystan_analysis.py
+root        3461 32.3  0.0 2424984 76724 pts/1   S    13:27   2:27 python3 pystan_analysis.py
+root        3665  0.0  0.0 2376860 50308 pts/1   S    13:27   0:00 python3 pystan_analysis.py
+root        3657  0.0  0.0 2376860 50304 pts/1   S    13:27   0:00 python3 pystan_analysis.py
+root        3658  0.0  0.0 2376860 50304 pts/1   S    13:27   0:00 python3 pystan_analysis.py
+root        3659  0.0  0.0 2376860 50304 pts/1   S    13:27   0:00 python3 pystan_analysis.py
+root        3660  0.0  0.0 2376860 50304 pts/1   S    13:27   0:00 python3 pystan_analysis.py
+root        3661  0.0  0.0 2376860 50304 pts/1   S    13:27   0:00 python3 pystan_analysis.py
+root        3662  0.0  0.0 2376860 50304 pts/1   S    13:27   0:00 python3 pystan_analysis.py
+[?2004hroot@9107947ed3db:/app# ls -la /app/*_est.csv 2>&1; echo '--- dmesg oom ---'; dmesg 2>/dev/null | grep -iE 'oom|killed process' | tail -5 || echo 'no dmesg access'
+[?2004lls: cannot access '/app/*_est.csv': No such file or directory
+--- dmesg oom ---
+[?2004hroot@9107947ed3db:/app# echo 'cgroupv2 max:'; cat /sys/fs/cgroup/memory.max 2>/dev/null; echo 'peak:'; cat /sys/fs/cgroup/memory.peak 2>/dev/null; echo 'events:'; cat /sys/fs/cgroup/memory.events 2>/dev/null; echo '--- v1 ---'; cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null
+[?2004lcgroupv2 max:
+8589934592
+peak:
+8589934592
+events:
+low 0
+high 0
+max 4187
+oom 1
+oom_kill 1
+oom_group_kill 0
+--- v1 ---
+[?2004hroot@9107947ed3db:/app# ps -eo pid,ppid,ppid:2,pcpu,pmem,rss,etimes,args --sort=-rss 2>/dev/null | grep -E 'pystan|httpstan|PID|python' | head -20; echo '==='; ps -eo pid,ppid,pcpu,rss,args | grep -E 'pystan|httpstan' | grep -v grep
+[?2004l    PID    PPID PPID %CPU %MEM RSS ELAPSED COMMAND
+   3460       1  1 20.9  0.0 76740     727 python3 pystan_analysis.py
+   3459       1  1 21.7  0.0 76732     727 python3 pystan_analysis.py
+   3458       1  1 21.2  0.0 76728     727 python3 pystan_analysis.py
+   3461       1  1 20.2  0.0 76724     727 python3 pystan_analysis.py
+   3665       1  1  0.0  0.0 50308     727 python3 pystan_analysis.py
+   3657       1  1  0.0  0.0 50304     727 python3 pystan_analysis.py
+   3658       1  1  0.0  0.0 50304     727 python3 pystan_analysis.py
+   3659       1  1  0.0  0.0 50304     727 python3 pystan_analysis.py
+   3660       1  1  0.0  0.0 50304     727 python3 pystan_analysis.py
+   3661       1  1  0.0  0.0 50304     727 python3 pystan_analysis.py
+   3662       1  1  0.0  0.0 50304     727 python3 pystan_analysis.py
+   3663       1  1  0.0  0.0 50304     727 python3 pystan_analysis.py
+   3664       1  1  0.0  0.0 50304     727 python3 pystan_analysis.py
+   3653       1  1  0.0  0.0 50300     727 python3 pystan_analysis.py
+   3654       1  1  0.0  0.0 50300     727 python3 pystan_analysis.py
+   3655       1  1  0.0  0.0 50300     727 python3 pystan_analysis.py
+   3656       1  1  0.0  0.0 50300     727 python3 pystan_analysis.py
+   3648       1  1  0.0  0.0 50296     727 python3 pystan_analysis.py
+   3649       1  1  0.0  0.0 50296     727 python3 pystan_analysis.py
+===
+   3458       1 21.2 76728 python3 pystan_analysis.py
+   3459       1 21.7 76732 python3 pystan_analysis.py
+   3460       1 20.9 76740 python3 pystan_analysis.py
+   3461       1 20.2 76724 python3 pystan_analysis.py
+   3462       1  0.0 50140 python3 pystan_analysis.py
+   3463       1  0.0 50140 python3 pystan_analysis.py
+   3464       1  0.0 50148 python3 pystan_analysis.py
+   3465       1  0.0 50148 python3 pystan_analysis.py
+   3466       1  0.0 50148 python3 pystan_analysis.py
+   3467       1  0.0 50148 python3 pystan_analysis.py
+   3468       1  0.0 50148 python3 pystan_analysis.py
+   3469       1  0.0 50148 python3 pystan_analysis.py
+   3470       1  0.0 50148 python3 pystan_analysis.py
+   3471       1  0.0 50148 python3 pystan_analysis.py
+   3472       1  0.0 50148 python3 pystan_analysis.py
+   3473       1  0.0 50148 python3 pystan_analysis.py
+   3474       1  0.0 50152 python3 pystan_analysis.py
+   3475       1  0.0 50152 python3 pystan_analysis.py
+   3476       1  0.0 50152 python3 pystan_analysis.py
+   3477       1  0.0 50152 python3 pystan_analysis.py
+   3478       1  0.0 50152 python3 pystan_analysis.py
+   3479       1  0.0 50152 python3 pystan_analysis.py
+   3480       1  0.0 50152 python3 pystan_analysis.py
+   3481       1  0.0 50160 python3 pystan_analysis.py
+   3482       1  0.0 50164 python3 pystan_analysis.py
+   3483       1  0.0 50164 python3 pystan_analysis.py
+   3484       1  0.0 50168 python3 pystan_analysis.py
+   3485       1  0.0 50168 python3 pystan_analysis.py
+   3486       1  0.0 50168 python3 pystan_analysis.py
+   3487       1  0.0 50168 python3 pystan_analysis.py
+   3488       1  0.0 50168 python3 pystan_analysis.py
+   3489       1  0.0 50168 python3 pystan_analysis.py
+   3490       1  0.0 50168 python3 pystan_analysis.py
+   3491       1  0.0 50168 python3 pystan_analysis.py
+   3492       1  0.0 50168 python3 pystan_analysis.py
+   3493       1  0.0 50168 python3 pystan_analysis.py
+   3494       1  0.0 50168 python3 pystan_analysis.py
+   3495       1  0.0 50168 python3 pystan_analysis.py
+   3496       1  0.0 50168 python3 pystan_analysis.py
+   3497       1  0.0 50168 python3 pystan_analysis.py
+   3498       1  0.0 50168 python3 pystan_analysis.py
+   3499       1  0.0 50168 python3 pystan_analysis.py
+   3500       1  0.0 50176 python3 pystan_analysis.py
+   3501       1  0.0 50176 python3 pystan_analysis.py
+   3502       1  0.0 50180 python3 pystan_analysis.py
+   3503       1  0.0 50180 python3 pystan_analysis.py
+   3504       1  0.0 50184 python3 pystan_analysis.py
+   3505       1  0.0 50184 python3 pystan_analysis.py
+   3506       1  0.0 50184 python3 pystan_analysis.py
+   3507       1  0.0 50184 python3 pystan_analysis.py
+   3508       1  0.0 50184 python3 pystan_analysis.py
+   3509       1  0.0 50184 python3 pystan_analysis.py
+   3510       1  0.0 50184 python3 pystan_analysis.py
+   3511       1  0.0 50188 python3 pystan_analysis.py
+   3512       1  0.0 50188 python3 pystan_analysis.py
+   3513       1  0.0 50188 python3 pystan_analysis.py
+   3514       1  0.0 50188 python3 pystan_analysis.py
+   3515       1  0.0 50188 python3 pystan_analysis.py
+   3516       1  0.0 50192 python3 pystan_analysis.py
+   3517       1  0.0 50192 python3 pystan_analysis.py
+   3518       1  0.0 50192 python3 pystan_analysis.py
+   3519       1  0.0 50192 python3 pystan_analysis.py
+   3520       1  0.0 50192 python3 pystan_analysis.py
+   3521       1  0.0 50192 python3 pystan_analysis.py
+   3522       1  0.0 50192 python3 pystan_analysis.py
+   3523       1  0.0 50192 python3 pystan_analysis.py
+   3524       1  0.0 50192 python3 pystan_analysis.py
+   3525       1  0.0 50192 python3 pystan_analysis.py
+   3526       1  0.0 50192 python3 pystan_analysis.py
+   3527       1  0.0 50192 python3 pystan_analysis.py
+   3528       1  0.0 50192 python3 pystan_analysis.py
+   3529       1  0.0 50192 python3 pystan_analysis.py
+   3530       1  0.0 50192 python3 pystan_analysis.py
+   3531       1  0.0 50192 python3 pystan_analysis.py
+   3532       1  0.0 50192 python3 pystan_analysis.py
+   3533       1  0.0 50192 python3 pystan_analysis.py
+   3534       1  0.0 50196 python3 pystan_analysis.py
+   3535       1  0.0 50196 python3 pystan_analysis.py
+   3536       1  0.0 50196 python3 pystan_analysis.py
+   3537       1  0.0 50200 python3 pystan_analysis.py
+   3538       1  0.0 50204 python3 pystan_analysis.py
+   3539       1  0.0 50204 python3 pystan_analysis.py
+   3540       1  0.0 50204 python3 pystan_analysis.py
+   3541       1  0.0 50204 python3 pystan_analysis.py
+   3542       1  0.0 50204 python3 pystan_analysis.py
+   3543       1  0.0 50204 python3 pystan_analysis.py
+   3544       1  0.0 50204 python3 pystan_analysis.py
+   3545       1  0.0 50204 python3 pystan_analysis.py
+   3546       1  0.0 50204 python3 pystan_analysis.py
+   3547       1  0.0 50204 python3 pystan_analysis.py
+   3548       1  0.0 50204 python3 pystan_analysis.py
+   3549       1  0.0 50204 python3 pystan_analysis.py
+   3550       1  0.0 50204 python3 pystan_analysis.py
+   3551       1  0.0 50204 python3 pystan_analysis.py
+   3552       1  0.0 50204 python3 pystan_analysis.py
+   3553       1  0.0 50204 python3 pystan_analysis.py
+   3554       1  0.0 50204 python3 pystan_analysis.py
+   3555       1  0.0 50208 python3 pystan_analysis.py
+   3556       1  0.0 50208 python3 pystan_analysis.py
+   3557       1  0.0 50208 python3 pystan_analysis.py
+   3558       1  0.0 50208 python3 pystan_analysis.py
+   3559       1  0.0 50212 python3 pystan_analysis.py
+   3560       1  0.0 50212 python3 pystan_analysis.py
+   3561       1  0.0 50212 python3 pystan_analysis.py
+   3562       1  0.0 50212 python3 pystan_analysis.py
+   3563       1  0.0 50212 python3 pystan_analysis.py
+   3564       1  0.0 50212 python3 pystan_analysis.py
+   3565       1  0.0 50212 python3 pystan_analysis.py
+   3566       1  0.0 50212 python3 pystan_analysis.py
+   3567       1  0.0 50212 python3 pystan_analysis.py
+   3568       1  0.0 50212 python3 pystan_analysis.py
+   3569       1  0.0 50212 python3 pystan_analysis.py
+   3570       1  0.0 50212 python3 pystan_analysis.py
+   3571       1  0.0 50216 python3 pystan_analysis.py
+   3572       1  0.0 50216 python3 pystan_analysis.py
+   3573       1  0.0 50224 python3 pystan_analysis.py
+   3574       1  0.0 50224 python3 pystan_analysis.py
+   3575       1  0.0 50224 python3 pystan_analysis.py
+   3576       1  0.0 50224 python3 pystan_analysis.py
+   3577       1  0.0 50228 python3 pystan_analysis.py
+   3578       1  0.0 50228 python3 pystan_analysis.py
+   3579       1  0.0 50228 python3 pystan_analysis.py
+   3580       1  0.0 50232 python3 pystan_analysis.py
+   3581       1  0.0 50232 python3 pystan_analysis.py
+   3582       1  0.0 50232 python3 pystan_analysis.py
+   3583       1  0.0 50232 python3 pystan_analysis.py
+   3584       1  0.0 50232 python3 pystan_analysis.py
+   3585       1  0.0 50232 python3 pystan_analysis.py
+   3586       1  0.0 50232 python3 pystan_analysis.py
+   3587       1  0.0 50232 python3 pystan_analysis.py
+   3588       1  0.0 50232 python3 pystan_analysis.py
+   3589       1  0.0 50236 python3 pystan_analysis.py
+   3590       1  0.0 50236 python3 pystan_analysis.py
+   3591       1  0.0 50236 python3 pystan_analysis.py
+   3592       1  0.0 50236 python3 pystan_analysis.py
+   3593       1  0.0 50236 python3 pystan_analysis.py
+   3594       1  0.0 50236 python3 pystan_analysis.py
+   3595       1  0.0 50236 python3 pystan_analysis.py
+   3596       1  0.0 50236 python3 pystan_analysis.py
+   3597       1  0.0 50236 python3 pystan_analysis.py
+   3598       1  0.0 50236 python3 pystan_analysis.py
+   3599       1  0.0 50236 python3 pystan_analysis.py
+   3600       1  0.0 50236 python3 pystan_analysis.py
+   3601       1  0.0 50240 python3 pystan_analysis.py
+   3602       1  0.0 50244 python3 pystan_analysis.py
+   3603       1  0.0 50248 python3 pystan_analysis.py
+   3604       1  0.0 50248 python3 pystan_analysis.py
+   3605       1  0.0 50248 python3 pystan_analysis.py
+   3606       1  0.0 50256 python3 pystan_analysis.py
+   3607       1  0.0 50256 python3 pystan_analysis.py
+   3608       1  0.0 50256 python3 pystan_analysis.py
+   3609       1  0.0 50260 python3 pystan_analysis.py
+   3610       1  0.0 50260 python3 pystan_analysis.py
+   3611       1  0.0 50260 python3 pystan_analysis.py
+   3612       1  0.0 50260 python3 pystan_analysis.py
+   3613       1  0.0 50260 python3 pystan_analysis.py
+   3614       1  0.0 50260 python3 pystan_analysis.py
+   3615       1  0.0 50260 python3 pystan_analysis.py
+   3616       1  0.0 50260 python3 pystan_analysis.py
+   3617       1  0.0 50260 python3 pystan_analysis.py
+   3618       1  0.0 50260 python3 pystan_analysis.py
+   3619       1  0.0 50260 python3 pystan_analysis.py
+   3620       1  0.0 50260 python3 pystan_analysis.py
+   3621       1  0.0 50260 python3 pystan_analysis.py
+   3622       1  0.0 50264 python3 pystan_analysis.py
+   3623       1  0.0 50268 python3 pystan_analysis.py
+   3624       1  0.0 50268 python3 pystan_analysis.py
+   3625       1  0.0 50268 python3 pystan_analysis.py
+   3626       1  0.0 50268 python3 pystan_analysis.py
+   3627       1  0.0 50276 python3 pystan_analysis.py
+   3628       1  0.0 50276 python3 pystan_analysis.py
+   3629       1  0.0 50276 python3 pystan_analysis.py
+   3630       1  0.0 50276 python3 pystan_analysis.py
+   3631       1  0.0 50276 python3 pystan_analysis.py
+   3632       1  0.0 50276 python3 pystan_analysis.py
+   3633       1  0.0 50276 python3 pystan_analysis.py
+   3634       1  0.0 50276 python3 pystan_analysis.py
+   3635       1  0.0 50280 python3 pystan_analysis.py
+   3636       1  0.0 50280 python3 pystan_analysis.py
+   3637       1  0.0 50280 python3 pystan_analysis.py
+   3638       1  0.0 50280 python3 pystan_analysis.py
+   3639       1  0.0 50280 python3 pystan_analysis.py
+   3640       1  0.0 50280 python3 pystan_analysis.py
+   3641       1  0.0 50284 python3 pystan_analysis.py
+   3642       1  0.0 50284 python3 pystan_analysis.py
+   3643       1  0.0 50284 python3 pystan_analysis.py
+   3644       1  0.0 50288 python3 pystan_analysis.py
+   3645       1  0.0 50288 python3 pystan_analysis.py
+   3646       1  0.0 50292 python3 pystan_analysis.py
+   3647       1  0.0 50292 python3 pystan_analysis.py
+   3648       1  0.0 50296 python3 pystan_analysis.py
+   3649       1  0.0 50296 python3 pystan_analysis.py
+   3650       1  0.0 50296 python3 pystan_analysis.py
+   3651       1  0.0 50296 python3 pystan_analysis.py
+   3652       1  0.0 50296 python3 pystan_analysis.py
+   3653       1  0.0 50300 python3 pystan_analysis.py
+   3654       1  0.0 50300 python3 pystan_analysis.py
+   3655       1  0.0 50300 python3 pystan_analysis.py
+   3656       1  0.0 50300 python3 pystan_analysis.py
+   3657       1  0.0 50304 python3 pystan_analysis.py
+   3658       1  0.0 50304 python3 pystan_analysis.py
+   3659       1  0.0 50304 python3 pystan_analysis.py
+   3660       1  0.0 50304 python3 pystan_analysis.py
+   3661       1  0.0 50304 python3 pystan_analysis.py
+   3662       1  0.0 50304 python3 pystan_analysis.py
+   3663       1  0.0 50304 python3 pystan_analysis.py
+   3664       1  0.0 50304 python3 pystan_analysis.py
+   3665       1  0.0 50308 python3 pystan_analysis.py
+[?2004hroot@9107947ed3db:/app# pkill -9 -f pystan_analysis.py; sleep 3; echo 'remaining:'; ps -eo pid,args | grep pystan_analysis | grep -v grep | wc -l
+[?2004lremaining:
+0
+[?2004hroot@9107947ed3db:/app# echo 'nproc:'; nproc; echo 'cgroup current MB:'; awk '{printf "%.0f\n", $1/1048576}' /sys/fs/cgroup/memory.current
+[?2004lnproc:
+208
+cgroup current MB:
+57
+[?2004hroot@9107947ed3db:/app# grep -rniE 'Pool|cpu_count|max_workers|ThreadPool|ProcessPool|fork|spawn|workers' /usr/local/lib/python3.12/dist-packages/httpstan/ 2>/dev/null | grep -vE '\.pyc' | head -40
+[?2004l/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:36:executor = concurrent.futures.ProcessPoolExecutor(mp_context=mp.get_context("fork"), initializer=init_worker)
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:41:# because `pickle` (used by ProcessPoolExecutor) cannot pickle local functions.
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:50:# In order to avoid problems with the ProcessPoolExecutor, the module
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:51:# needs to be loaded inside the spawned process, not before.
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/allocators.h:83:// MemoryPoolAllocator
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/allocators.h:102:class MemoryPoolAllocator {
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/allocators.h:110:    MemoryPoolAllocator(size_t chunkSize = kDefaultChunkCapacity, BaseAllocator* baseAllocator = 0) : 
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/allocators.h:116:    /*! The user buffer will be used firstly. When it is full, memory pool allocates new chunk with chunk size.
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/allocators.h:125:    MemoryPoolAllocator(void *buffer, size_t size, size_t chunkSize = kDefaultChunkCapacity, BaseAllocator* baseAllocator = 0) :
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/allocators.h:139:    ~MemoryPoolAllocator() {
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/allocators.h:229:    MemoryPoolAllocator(const MemoryPoolAllocator& rhs) /* = delete */;
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/allocators.h:231:    MemoryPoolAllocator& operator=(const MemoryPoolAllocator& rhs) /* = delete */;
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/schema.h:402:                    typedef Hasher<EncodingType, MemoryPoolAllocator<> > EnumHasherType;
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/schema.h:404:                    MemoryPoolAllocator<> hasherAllocator(buffer, sizeof(buffer));
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/document.h:539:template <typename Encoding, typename Allocator = MemoryPoolAllocator<> > 
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/document.h:2023:template <typename Encoding, typename Allocator = MemoryPoolAllocator<>, typename StackAllocator = CrtAllocator>
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/fwd.h:42:class MemoryPoolAllocator;
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/fwd.h:116:typedef GenericValue<UTF8<char>, MemoryPoolAllocator<CrtAllocator> > Value;
+/usr/local/lib/python3.12/dist-packages/httpstan/include/rapidjson/fwd.h:121:typedef GenericDocument<UTF8<char>, MemoryPoolAllocator<CrtAllocator>, CrtAllocator> Document;
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_scheduler_init.h:36:#if __TBB_SUPPORTS_WORKERS_WAITING_IN_TERMINATE
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_scheduler_init.h:56:    This class allows to customize properties of the TBB task pool to some extent.
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_scheduler_init.h:59:    though this setting is not effective if the thread pool has already been created.
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_scheduler_init.h:77:#if __TBB_SUPPORTS_WORKERS_WAITING_IN_TERMINATE
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_scheduler_init.h:109:#if __TBB_SUPPORTS_WORKERS_WAITING_IN_TERMINATE
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_scheduler_init.h:120:#endif // __TBB_SUPPORTS_WORKERS_WAITING_IN_TERMINATE
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_scheduler_init.h:150:        to boost the number of threads in the TBB's internal pool, if your tasks are
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_scheduler_init.h:162:        in the TBB worker threads pool. */
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/parallel_scan.h:128:                if( a ) spawn(*b);
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/parallel_scan.h:238:                task::spawn_root_and_wait( pass1 );
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/parallel_scan.h:243:                    task::spawn_root_and_wait( *root );
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/parallel_scan.h:285:            // Left child is recycling of *this.  Must recycle this before spawning b,
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/parallel_scan.h:290:            c.spawn(b);
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/tbb_exception.h:87:#if __TBB_SUPPORTS_WORKERS_WAITING_IN_TERMINATE
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/tbb_exception.h:123:    Note: when documentation mentions workers with respect to exception handling,
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/tbb_exception.h:189:    of the workers.
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_arena.h:420:    //! Can decrement the arena demand for workers, causing a worker to leave and free a slot to the calling thread
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_arena.h:429:    //! Can decrement the arena demand for workers, causing a worker to leave and free a slot to the calling thread
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_group.h:163:        task::spawn( *prepare_task< internal::task_handle_task<F> >(h) );
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_group.h:208:        task::spawn( *prepare_task< internal::function_task< typename internal::strip<F>::type > >(std::forward<F>(f)) );
+/usr/local/lib/python3.12/dist-packages/httpstan/include/tbb/task_group.h:213:        task::spawn( *prepare_task< internal::function_task<F> >(f) );
+[?2004hroot@9107947ed3db:/app# grep -rniE 'omp|thread|ProcessPool|cpu_count|num_chains|Executor|multiprocess' /usr/local/lib/python3.12/dist-packages/stan/ 2>/dev/null | grep -vE '\.pyc' | head -40
+[?2004l/usr/local/lib/python3.12/dist-packages/stan/common.py:24:        # mypy 0.961 complains that simdjson lacks a `loads`.
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:27:        num_chains: int,
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:37:        self.num_chains = num_chains
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:38:        assert self.num_chains == len(self.stan_outputs)
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:65:        # _draws is an ndarray with shape (num_sample_and_sampler_params + num_flat_params, num_draws, num_chains)
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:69:        for chain_index, stan_output in zip(range(self.num_chains), self.stan_outputs):
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:91:                            self._draws = np.empty((num_rows, num_samples_saved, num_chains), order="F")
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:131:        """Returns array with shape (stan_dimensions, num_chains * num_samples)"""
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:137:        assert self._draws.shape == (len(self.sample_and_sampler_param_names) + len(self.constrained_param_names), num_samples_saved, self.num_chains)
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:141:            return np.array([]).reshape(param_dim + [num_samples_saved * self.num_chains])
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:144:        assert view.shape == (len(param_indexes), num_samples_saved * self.num_chains)
+/usr/local/lib/python3.12/dist-packages/stan/fit.py:169:        # total draws is num_draws (per-chain) times num_chains
+/usr/local/lib/python3.12/dist-packages/stan/model.py:61:    def sample(self, *, num_chains=4, **kwargs) -> stan.fit.Fit:
+/usr/local/lib/python3.12/dist-packages/stan/model.py:70:        There is one exception:  `num_chains`. `num_chains` is a
+/usr/local/lib/python3.12/dist-packages/stan/model.py:86:            >>> fit = posterior.sample(num_chains=2, init=[{"y": 3}, {"y": 3}])
+/usr/local/lib/python3.12/dist-packages/stan/model.py:89:        return self.hmc_nuts_diag_e_adapt(num_chains=num_chains, **kwargs)
+/usr/local/lib/python3.12/dist-packages/stan/model.py:91:    def hmc_nuts_diag_e_adapt(self, *, num_chains=4, **kwargs) -> stan.fit.Fit:
+/usr/local/lib/python3.12/dist-packages/stan/model.py:99:        There is one exception:  `num_chains`. `num_chains` is a
+/usr/local/lib/python3.12/dist-packages/stan/model.py:108:        return self._create_fit(function=function, num_chains=num_chains, **kwargs)
+/usr/local/lib/python3.12/dist-packages/stan/model.py:110:    def fixed_param(self, *, num_chains=4, **kwargs) -> stan.fit.Fit:
+/usr/local/lib/python3.12/dist-packages/stan/model.py:118:        There is one exception:  `num_chains`. `num_chains` is a
+/usr/local/lib/python3.12/dist-packages/stan/model.py:127:        return self._create_fit(function=function, num_chains=num_chains, **kwargs)
+/usr/local/lib/python3.12/dist-packages/stan/model.py:129:    def _create_fit(self, *, function, num_chains, **kwargs) -> stan.fit.Fit:
+/usr/local/lib/python3.12/dist-packages/stan/model.py:151:        init: List[Data] = kwargs.pop("init", [dict() for _ in range(num_chains)])
+/usr/local/lib/python3.12/dist-packages/stan/model.py:152:        if len(init) != num_chains:
+/usr/local/lib/python3.12/dist-packages/stan/model.py:156:        for chain in range(1, num_chains + 1):
+/usr/local/lib/python3.12/dist-packages/stan/model.py:182:            percent_complete = 0
+/usr/local/lib/python3.12/dist-packages/stan/model.py:183:            sampling_output.write_line(f"<comment>Sampling:</comment> {percent_complete:3.0f}%")
+/usr/local/lib/python3.12/dist-packages/stan/model.py:185:            current_and_max_iterations_re = re.compile(r"Iteration:\s+(\d+)\s+/\s+(\d+)")
+/usr/local/lib/python3.12/dist-packages/stan/model.py:216:                        total_iterations = iteration_max * num_chains
+/usr/local/lib/python3.12/dist-packages/stan/model.py:217:                        percent_complete = 100 * iterations_count / total_iterations
+/usr/local/lib/python3.12/dist-packages/stan/model.py:220:                            f"<comment>Sampling:</comment> {round(percent_complete):3.0f}% ({iterations_count}/{total_iterations})"
+/usr/local/lib/python3.12/dist-packages/stan/model.py:224:                fit_in_cache = len(current_iterations) < num_chains
+/usr/local/lib/python3.12/dist-packages/stan/model.py:253:                    else f"<info>Sampling:</info> {percent_complete:3.0f}% ({iterations_count}/{total_iterations}), done."
+/usr/local/lib/python3.12/dist-packages/stan/model.py:297:                num_chains,
+/usr/local/lib/python3.12/dist-packages/stan/model.py:437:    """Build (compile) a Stan program.
+/usr/local/lib/python3.12/dist-packages/stan/model.py:453:        variable names; see the Stan User's Guide for a complete list.
+/usr/local/lib/python3.12/dist-packages/stan/model.py:461:        # hack: use stdout instead of stderr because httpstan silences stderr during compilation
+[?2004hroot@9107947ed3db:/app# grep -rniE 'multiprocess|Pool|cpu_count|Executor|get_context|max_workers|num_process' /usr/local/lib/python3.12/dist-packages/httpstan/*.py 2>/dev/null | grep -vE '\.pyc' | head -40
+[?2004l/usr/local/lib/python3.12/dist-packages/httpstan/models.py:172:    compiler_output = await asyncio.get_running_loop().run_in_executor(
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:15:import multiprocessing as mp
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:30:# Use `get_context` to get a package-specific multiprocessing context.
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:31:# See "Contexts and start methods" in the `multiprocessing` docs for details.
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:36:executor = concurrent.futures.ProcessPoolExecutor(mp_context=mp.get_context("fork"), initializer=init_worker)
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:41:# because `pickle` (used by ProcessPoolExecutor) cannot pickle local functions.
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:50:# In order to avoid problems with the ProcessPoolExecutor, the module
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:105:        # If HTTPSTAN_DEBUG is set block until sampling is complete. Do not use an executor.
+/usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py:112:            future = asyncio.get_running_loop().run_in_executor(executor, lazy_function_wrapper_partial)  # type: ignore
+[?2004hroot@9107947ed3db:/app# echo '=== fits.py head ==='; sed -n '1,90p' /usr/local/lib/python3.12/dist-packages/httpstan/fits.py
+[?2004l=== fits.py head ===
+"""Helper functions for Stan fits."""
+import base64
+import hashlib
+import pickle
+import random
+import sys
+
+import httpstan
+
+
+def calculate_fit_name(function: str, model_name: str, kwargs: dict) -> str:
+    """Calculate fit name from parameters and data.
+
+    If a random seed is provided, a fit is a deterministic function of
+    the model, data, and parameters. If no random seed is provided,
+    this function returns a random string.
+
+    If a random seed is provided, a fit id is a hash of the concatenation of
+    binary representations of the arguments to ``services_stub.call``
+    (type, model, kwargs):
+
+    - UTF-8 encoded name of service function (e.g., ``hmc_nuts_diag_e_adapt``)
+    - UTF-8 encoded Stan model name (which is derived from a hash of ``program_code``)
+    - Bytes of pickled kwargs dictionary
+    - UTF-8 encoded string recording the httpstan version
+    - UTF-8 encoded string identifying the system platform
+    - UTF-8 encoded string identifying the system bit architecture
+    - UTF-8 encoded string identifying the Python version
+    - UTF-8 encoded string identifying the Python executable
+
+    Arguments:
+        function: name of service function
+        model_name: Stan model name
+        kwargs: kwargs passed to service function
+
+    Returns:
+        str: fit name
+
+    """
+    # digest_size of 5 means we expect a collision after a million fits
+    digest_size = 5
+
+    # cannot cache fit if no random seed provided
+    if "random_seed" not in kwargs:
+        random_bytes = random.getrandbits(digest_size * 8).to_bytes(digest_size, sys.byteorder)
+        id = base64.b32encode(random_bytes).decode().lower()
+        return f"{model_name}/fits/{id}"
+
+    hash = hashlib.blake2b(digest_size=digest_size)
+    hash.update(function.encode())
+    hash.update(model_name.encode())
+    hash.update(pickle.dumps(kwargs))
+
+    # system identifiers
+    hash.update(httpstan.__version__.encode())
+    hash.update(sys.platform.encode())
+    hash.update(str(sys.maxsize).encode())
+    hash.update(sys.version.encode())
+    # include sys.executable in hash to account for different `venv`s
+    hash.update(sys.executable.encode())
+
+    id = base64.b32encode(hash.digest()).decode().lower()
+    return f"{model_name}/fits/{id}"
+[?2004hroot@9107947ed3db:/app# sed -n '1,130p' /usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py
+[?2004l"""Call and process output of stan::services functions.
+
+Functions here perform the menial task of calling (from Python) a named C++
+function in stan::services given a specific Stan model. The output of the
+stan::services function is routed from stan::callbacks writers into Python via a
+Unix domain socket.
+
+"""
+import asyncio
+import collections
+import concurrent.futures
+import functools
+import io
+import logging
+import multiprocessing as mp
+import os
+import select
+import signal
+import socket
+import tempfile
+import typing
+import zlib
+
+import httpstan.cache
+import httpstan.models
+import httpstan.services.arguments as arguments
+from httpstan.config import HTTPSTAN_DEBUG
+
+
+# Use `get_context` to get a package-specific multiprocessing context.
+# See "Contexts and start methods" in the `multiprocessing` docs for details.
+def init_worker() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # ignore KeyboardInterrupt
+
+
+executor = concurrent.futures.ProcessPoolExecutor(mp_context=mp.get_context("fork"), initializer=init_worker)
+logger = logging.getLogger("httpstan")
+
+
+# This function belongs inside `_make_lazy_function_wrapper`. It is defined here
+# because `pickle` (used by ProcessPoolExecutor) cannot pickle local functions.
+def _make_lazy_function_wrapper_helper(
+    function_basename: str, model_name: str, *args: typing.Any, **kwargs: typing.Any
+) -> typing.Callable:  # pragma: no cover
+    services_module = httpstan.models.import_services_extension_module(model_name)
+    function = getattr(services_module, function_basename + "_wrapper")
+    return function(*args, **kwargs)  # type: ignore
+
+
+# In order to avoid problems with the ProcessPoolExecutor, the module
+# needs to be loaded inside the spawned process, not before.
+def _make_lazy_function_wrapper(function_basename: str, model_name: str) -> typing.Callable:
+    # function_basename will be something like "hmc_nuts_diag_e"
+    # function_wrapper will refer to a function like "hmc_nuts_diag_e_wrapper"
+    return functools.partial(_make_lazy_function_wrapper_helper, function_basename, model_name)
+
+
+async def call(
+    function_name: str,
+    model_name: str,
+    fit_name: str,
+    logger_callback: typing.Optional[typing.Callable] = None,
+    **kwargs: dict,
+) -> None:
+    """Call stan::services function.
+
+    Yields (asynchronously) messages from the stan::callbacks writers which are
+    written to by the stan::services function.
+
+    This is a coroutine function.
+
+    Arguments:
+        function_name: full name of function in stan::services
+        services_module (module): model-specific services extension module
+        fit_name: Name of fit, used for saving length-prefixed messages
+        logger_callback: Callback function for logger messages, including sampling progress messages
+        kwargs: named stan::services function arguments, see CmdStan documentation.
+    """
+    method, function_basename = function_name.replace("stan::services::", "").split("::", 1)
+
+    # Fetch defaults for missing arguments. This is an important step!
+    # For example, `random_seed`, if not in `kwargs`, will be set.
+    # temporarily load the module to lookup function arguments
+    services_module = httpstan.models.import_services_extension_module(model_name)
+    function_arguments = arguments.function_arguments(function_basename, services_module)
+    del services_module
+    # This is clumsy due to the way default values are available. There is no
+    # way to directly lookup the default value for an argument (e.g., `delta`)
+    # given both the argument name and the (full) function name (e.g.,
+    # `stan::services::hmc_nuts_diag_e_adapt`).
+    for arg in function_arguments:
+        if arg not in kwargs:
+            kwargs[arg] = typing.cast(typing.Any, arguments.lookup_default(arguments.Method[method.upper()], arg))
+
+    with socket.socket(socket.AF_UNIX, type=socket.SOCK_STREAM) as socket_:
+        temp_fd, socket_filename = tempfile.mkstemp(prefix="httpstan_", suffix=".sock")
+        os.close(temp_fd)
+        os.unlink(socket_filename)
+        socket_.bind(socket_filename)
+        socket_.listen(4)  # three stan callback writers, one stan callback logger
+
+        lazy_function_wrapper = _make_lazy_function_wrapper(function_basename, model_name)
+        lazy_function_wrapper_partial = functools.partial(lazy_function_wrapper, socket_filename, **kwargs)
+
+        # If HTTPSTAN_DEBUG is set block until sampling is complete. Do not use an executor.
+        if HTTPSTAN_DEBUG:  # pragma: no cover
+            future: asyncio.Future = asyncio.Future()
+            logger.debug("Calling stan::services function with debug mode on.")
+            print("Warning: httpstan debug mode is on! `num_samples` must be set to a small number (e.g., 10).")
+            future.set_result(lazy_function_wrapper_partial())
+        else:
+            future = asyncio.get_running_loop().run_in_executor(executor, lazy_function_wrapper_partial)  # type: ignore
+
+        messages_files: typing.Mapping[socket.socket, io.BytesIO] = collections.defaultdict(io.BytesIO)
+        # using a wbits value which makes things compatible with gzip
+        messages_compressobjs: typing.Mapping[socket.socket, zlib._Compress] = collections.defaultdict(
+            functools.partial(zlib.compressobj, level=zlib.Z_BEST_SPEED, wbits=zlib.MAX_WBITS | 16)
+        )
+        potential_readers = [socket_]
+
+        while True:
+            # note: timeout of 0.01 seems to work well based on measurements
+            readable, writeable, errored = select.select(potential_readers, [], [], 0.01)
+            for s in readable:
+                if s is socket_:
+                    conn, _ = s.accept()
+                    logger.debug("Opened socket connection to a socket_logger or socket_writer.")
+                    potential_readers.append(conn)
+                    continue
+                message = s.recv(8192)
+[?2004hroot@9107947ed3db:/app# sed -n '1,60p' /usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py
+[?2004l"""Call and process output of stan::services functions.
+
+Functions here perform the menial task of calling (from Python) a named C++
+function in stan::services given a specific Stan model. The output of the
+stan::services function is routed from stan::callbacks writers into Python via a
+Unix domain socket.
+
+"""
+import asyncio
+import collections
+import concurrent.futures
+import functools
+import io
+import logging
+import multiprocessing as mp
+import os
+import select
+import signal
+import socket
+import tempfile
+import typing
+import zlib
+
+import httpstan.cache
+import httpstan.models
+import httpstan.services.arguments as arguments
+from httpstan.config import HTTPSTAN_DEBUG
+
+
+# Use `get_context` to get a package-specific multiprocessing context.
+# See "Contexts and start methods" in the `multiprocessing` docs for details.
+def init_worker() -> None:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # ignore KeyboardInterrupt
+
+
+executor = concurrent.futures.ProcessPoolExecutor(mp_context=mp.get_context("fork"), initializer=init_worker)
+logger = logging.getLogger("httpstan")
+
+
+# This function belongs inside `_make_lazy_function_wrapper`. It is defined here
+# because `pickle` (used by ProcessPoolExecutor) cannot pickle local functions.
+def _make_lazy_function_wrapper_helper(
+    function_basename: str, model_name: str, *args: typing.Any, **kwargs: typing.Any
+) -> typing.Callable:  # pragma: no cover
+    services_module = httpstan.models.import_services_extension_module(model_name)
+    function = getattr(services_module, function_basename + "_wrapper")
+    return function(*args, **kwargs)  # type: ignore
+
+
+# In order to avoid problems with the ProcessPoolExecutor, the module
+# needs to be loaded inside the spawned process, not before.
+def _make_lazy_function_wrapper(function_basename: str, model_name: str) -> typing.Callable:
+    # function_basename will be something like "hmc_nuts_diag_e"
+    # function_wrapper will refer to a function like "hmc_nuts_diag_e_wrapper"
+    return functools.partial(_make_lazy_function_wrapper_helper, function_basename, model_name)
+
+
+async def call(
+    function_name: str,
+    model_name: str,
+[?2004hroot@9107947ed3db:/app# cat /usr/local/lib/python3.12/dist-packages/stan/common.py
+[?2004l"""Common routines"""
+import socket
+import typing
+
+import aiohttp
+import aiohttp.web
+import httpstan.app
+import simdjson
+
+
+def unused_tcp_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class HTTPResponse(typing.NamedTuple):
+    status: int
+    content: bytes
+
+    def json(self) -> dict:
+        # mypy 0.961 complains that simdjson lacks a `loads`.
+        return simdjson.loads(self.content)  # type: ignore
+
+
+class HttpstanClient:
+    """Manage starting and stopping the httpstan HTTP server."""
+
+    async def __aenter__(self):
+        app = httpstan.app.make_app()
+        self.runner = aiohttp.web.AppRunner(app)
+        await self.runner.setup()
+        host, port = "127.0.0.1", unused_tcp_port()
+        site = aiohttp.web.TCPSite(self.runner, host, port)
+        await site.start()
+        self.session = aiohttp.ClientSession()
+        self.base_url = f"http://{host}:{port}/v1"
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.session.close()
+        await self.runner.cleanup()
+
+    async def get(self, path: str) -> HTTPResponse:
+        async with self.session.get(f"{self.base_url}{path}") as resp:
+            return HTTPResponse(status=resp.status, content=await resp.read())
+
+    async def post(self, path: str, json: dict) -> HTTPResponse:
+        async with self.session.post(f"{self.base_url}{path}", json=json) as resp:
+            return HTTPResponse(status=resp.status, content=await resp.read())
+
+    async def delete(self, path: str) -> HTTPResponse:
+        async with self.session.delete(f"{self.base_url}{path}") as resp:
+            return HTTPResponse(status=resp.status, content=await resp.read())
+[?2004hroot@9107947ed3db:/app# python3 -c "import os, concurrent.futures as f; print('cpu_count', os.cpu_count()); print('process_cpu_count', getattr(os,'process_cpu_count',lambda:None)())"
+[?2004lcpu_count 208
+process_cpu_count None
+[?2004hroot@9107947ed3db:/app# ps -eo pid,args | grep -E 'pystan_analysis|httpstan' | grep -v grep | wc -l
+[?2004l0
+[?2004hroot@9107947ed3db:/app# cd /app && OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1 & echo "launched pid $!"
+[?2004l[1] 3953
+launched pid 3953
+[?2004hroot@9107947ed3db:/app# sleep 20; echo '=== log ==='; cat /app/pystan.log; echo '=== mem MB ==='; awk '{printf "cgroup: %.0f MB / %d MB\n", $1/1048576, 8589934592/1048576}' /sys/fs/cgroup/memory.current; echo 'live procs:'; ps -eo pid,args | grep pystan_analysis | grep -v grep | wc -l
+[?2004l=== log ===
+nohup: ignoring input
+Data: N=200 D=3 P=3 N_new=5 jitter=1e-06
+Building...
+
+Building: found in cache, done.BUILD OK in 1.0s
+Sampling:   0%
+Sampling:   0% (1/8000)
+Sampling:   0% (2/8000)
+Sampling:   0% (3/8000)
+Sampling:   0% (4/8000)
+Sampling:   3% (203/8000)
+Sampling:   5% (402/8000)=== mem MB ===
+cgroup: 664 MB / 8192 MB
+live procs:
+209
+[?2004hroot@9107947ed3db:/app# /bin/bash: line 311:  3954 Killed                  OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+sleep 45; echo '=== log tail ==='; tail -6 /app/pystan.log; echo '=== mem ==='; awk '{printf "cgroup: %.0f MB / 8192 MB\n", $1/1048576}' /sys/fs/cgroup/memory.current
+[?2004l[1]+  Exit 137                cd /app && OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+=== log tail ===
+Sampling:  88% (7000/8000)
+Sampling:  90% (7200/8000)
+Sampling:  92% (7400/8000)
+Sampling:  95% (7600/8000)
+Sampling:  98% (7800/8000)
+Sampling: 100% (8000/8000)=== mem ===
+cgroup: 641 MB / 8192 MB
+[?2004hroot@9107947ed3db:/app# cd /app && OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1 & echo "launched $!"
+[?2004l[1] 4223
+launched 4223
+[?2004hroot@9107947ed3db:/app# sleep 35; echo '=== log tail ==='; tail -3 /app/pystan.log; echo '=== ps by state ==='; ps -eo stat,rss,args | grep pystan_analysis | grep -v grep | awk '{c[$1]++; s[$1]+=$2} END{for(k in c) printf "state=%s count=%d rss=%.0fMB\n", k, c[k], s[k]/1048576}'; echo '=== cgroup MB ==='; awk '{printf "%.0f / 8192 MB\n", $1/1048576}' /sys/fs/cgroup/memory.current
+[?2004l=== log tail ===
+Sampling:   8% (601/8000)
+Sampling:  10% (800/8000)
+Sampling:  12% (1000/8000)=== ps by state ===
+state=Sl count=1 rss=0MB
+state=S count=412 rss=21MB
+state=R count=4 rss=0MB
+=== cgroup MB ===
+1250 / 8192 MB
+[?2004hroot@9107947ed3db:/app# /bin/bash: line 314:  4224 Killed                  OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+echo '--- t0 mem.stat ---'; awk '/^(anon|file|slab|kernel_stack|pagetables) /{printf "%s: %.0f MB\n",$1,$2/1048576}' /sys/fs/cgroup/memory.stat; echo 'cur:'; awk '{printf "%.0f MB\n",$1/1048576}' /sys/fs/cgroup/memory.current; echo '--- top RSS procs ---'; ps -eo pid,ppid,rss,args | grep pystan_analysis | grep -v grep | sort -k3 -rn | head -8
+[?2004l--- t0 mem.stat ---
+anon: 1038 MB
+file: 13 MB
+kernel_stack: 7 MB
+pagetables: 83 MB
+slab: 63 MB
+[1]+  Exit 137                cd /app && OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+cur:
+1214 MB
+--- top RSS procs ---
+   4234       1 81284 python3 pystan_analysis.py
+   4235       1 81272 python3 pystan_analysis.py
+   4232       1 81268 python3 pystan_analysis.py
+   3964       1 76832 python3 pystan_analysis.py
+   3963       1 76820 python3 pystan_analysis.py
+   3965       1 76816 python3 pystan_analysis.py
+   3962       1 76812 python3 pystan_analysis.py
+   4360       1 51436 python3 pystan_analysis.py
+[?2004hroot@9107947ed3db:/app# sleep 25; echo '--- t1 mem.stat ---'; awk '/^(anon|file|slab|kernel_stack|pagetables) /{printf "%s: %.0f MB\n",$1,$2/1048576}' /sys/fs/cgroup/memory.stat; echo 'cur:'; awk '{printf "%.0f MB\n",$1/1048576}' /sys/fs/cgroup/memory.current; echo '--- top RSS procs ---'; ps -eo pid,ppid,rss,args | grep pystan_analysis | grep -v grep | sort -k3 -rn | head -8
+[?2004l--- t1 mem.stat ---
+anon: 1038 MB
+file: 14 MB
+kernel_stack: 7 MB
+pagetables: 83 MB
+slab: 65 MB
+cur:
+1214 MB
+--- top RSS procs ---
+   4234       1 81284 python3 pystan_analysis.py
+   4235       1 81272 python3 pystan_analysis.py
+   4232       1 81268 python3 pystan_analysis.py
+   3964       1 76832 python3 pystan_analysis.py
+   3963       1 76820 python3 pystan_analysis.py
+   3965       1 76816 python3 pystan_analysis.py
+   3962       1 76812 python3 pystan_analysis.py
+   4360       1 51436 python3 pystan_analysis.py
+[?2004hroot@9107947ed3db:/app# pkill -9 -f pystan_analysis; sleep 3; echo 'remaining:'; ps -eo pid,args | grep pystan_analysis | grep -v grep | wc -l; echo 'cur MB:'; awk '{printf "%.0f\n",$1/1048576}' /sys/fs/cgroup/memory.current
+[?2004lremaining:
+0
+cur MB:
+70
+[?2004hroot@9107947ed3db:/app# cd /app && OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1 & echo "subshell=$! ; main python=+$(( $! + 1 ))"
+[?2004l[1] 4519
+subshell=4519 ; main python=+4520
+[?2004hroot@9107947ed3db:/app# sleep 25; echo '=== t25 top-RSS (rss KB by pid/age) ==='; ps -eo pid,rss,etimes,args | grep 'python3 pystan_analysis' | grep -v grep | sort -k2 -rn | head -6; echo 'cgroup MB:'; awk '{printf "%.0f\n",$1/1048576}' /sys/fs/cgroup/memory.current; echo 'log:'; tail -2 /app/pystan.log
+[?2004l=== t25 top-RSS (rss KB by pid/age) ===
+   4531 76960      23 python3 pystan_analysis.py
+   4530 76960      23 python3 pystan_analysis.py
+   4529 76956      23 python3 pystan_analysis.py
+   4528 76896      23 python3 pystan_analysis.py
+   4520 70232      25 python3 pystan_analysis.py
+   4656 54628      23 python3 pystan_analysis.py
+cgroup MB:
+657
+log:
+Sampling:   8% (601/8000)
+Sampling:  10% (800/8000)[?2004hroot@9107947ed3db:/app# /bin/bash: line 319:  4520 Killed                  OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+sleep 25; echo '=== top-RSS ==='; ps -eo pid,rss,etimes,args | grep 'python3 pystan_analysis' | grep -v grep | sort -k2 -rn | head -6; echo 'cgroup MB:'; awk '{printf "%.0f\n",$1/1048576}' /sys/fs/cgroup/memory.current; echo 'count:'; ps -eo pid,args | grep 'python3 pystan_analysis' | grep -v grep | wc -l; echo 'log:'; tail -1 /app/pystan.log
+[?2004l[1]+  Exit 137                cd /app && OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 nohup python3 pystan_analysis.py > /app/pystan.log 2>&1
+=== top-RSS ===
+   4530 76836     291 python3 pystan_analysis.py
+   4529 76828     291 python3 pystan_analysis.py
+   4531 76824     291 python3 pystan_analysis.py
+   4528 76824     291 python3 pystan_analysis.py
+   4735 49840     290 python3 pystan_analysis.py
+   4734 49840     290 python3 pystan_analysis.py
+cgroup MB:
+646
+count:
+208
+log:
+Sampling: 100% (8000/8000)[?2004hroot@9107947ed3db:/app# sleep 25; echo '=== top-RSS ==='; ps -eo pid,rss,etimes,args | grep 'python3 pystan_analysis' | grep -v grep | sort -k2 -rn | head -6; echo 'cgroup MB:'; awk '{printf "%.0f\n",$1/1048576}' /sys/fs/cgroup/memory.current; echo 'count:'; ps -eo pid,args | grep 'python3 pystan_analysis' | grep -v grep | wc -l; echo 'log:'; tail -1 /app/pystan.log
+[?2004l=== top-RSS ===
+   4530 76836     318 python3 pystan_analysis.py
+   4529 76828     318 python3 pystan_analysis.py
+   4531 76824     318 python3 pystan_analysis.py
+   4528 76824     318 python3 pystan_analysis.py
+   4735 49840     317 python3 pystan_analysis.py
+   4734 49840     317 python3 pystan_analysis.py
+cgroup MB:
+646
+count:
+208
+log:
+Sampling: 100% (8000/8000)[?2004hroot@9107947ed3db:/app# wc -l /usr/local/lib/python3.12/dist-packages/httpstan/app.py
+[?2004l45 /usr/local/lib/python3.12/dist-packages/httpstan/app.py
+[?2004hroot@9107947ed3db:/app# grep -nE 'def |_fits|fits/|output|append|messages|while True|resp|read|json|get\(|post\(|return|operation|cache' /usr/local/lib/python3.12/dist-packages/httpstan/app.py | head -80
+[?2004l21:async def _warn_unfinished_operations(app: aiohttp.web.Application) -> None:
+22:    """Warn if tasks (e.g., operations) are unfinished.
+27:    for name, operation in app["operations"].items():
+28:        if not operation["done"]:
+32:def make_app() -> aiohttp.web.Application:
+43:    app["operations"] = {}
+44:    app.on_cleanup.append(_warn_unfinished_operations)
+45:    return app
+[?2004hroot@9107947ed3db:/app# cat /usr/local/lib/python3.12/dist-packages/httpstan/app.py
+[?2004l"""Helper function to launch httpstan server.
+
+Configure the server and schedule startup and shutdown tasks.
+"""
+import asyncio
+import logging
+
+import aiohttp.web
+
+import httpstan.routes
+
+try:
+    from uvloop import EventLoopPolicy
+except ImportError:
+    EventLoopPolicy = asyncio.DefaultEventLoopPolicy
+
+
+logger = logging.getLogger("httpstan")
+
+
+async def _warn_unfinished_operations(app: aiohttp.web.Application) -> None:
+    """Warn if tasks (e.g., operations) are unfinished.
+
+    Called immediately before tasks are cancelled.
+
+    """
+    for name, operation in app["operations"].items():
+        if not operation["done"]:
+            logger.critical(f"Operation `{name}` cancelled before finishing.")
+
+
+def make_app() -> aiohttp.web.Application:
+    """Assemble aiohttp Application.
+
+    Returns:
+        aiohttp.web.Application: assembled aiohttp application.
+
+    """
+    # default `client_max_size` is 1 MiB. Model `data` is often greater. Set to generous 512 GiB.
+    app = aiohttp.web.Application(client_max_size=512 * 1024**3)
+    httpstan.routes.setup_routes(app)
+    # startup and shutdown tasks
+    app["operations"] = {}
+    app.on_cleanup.append(_warn_unfinished_operations)
+    return app
+[?2004hroot@9107947ed3db:/app# ls /usr/local/lib/python3.12/dist-packages/httpstan/*.py; echo '==='; grep -nE 'def |add_routes|router|_fits|fits/' /usr/local/lib/python3.12/dist-packages/httpstan/routes.py 2>/dev/null | head -40
+[?2004l/usr/local/lib/python3.12/dist-packages/httpstan/__init__.py   /usr/local/lib/python3.12/dist-packages/httpstan/models.py
+/usr/local/lib/python3.12/dist-packages/httpstan/__main__.py   /usr/local/lib/python3.12/dist-packages/httpstan/openapi.py
+/usr/local/lib/python3.12/dist-packages/httpstan/app.py        /usr/local/lib/python3.12/dist-packages/httpstan/routes.py
+/usr/local/lib/python3.12/dist-packages/httpstan/build_ext.py  /usr/local/lib/python3.12/dist-packages/httpstan/schemas.py
+/usr/local/lib/python3.12/dist-packages/httpstan/cache.py      /usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py
+/usr/local/lib/python3.12/dist-packages/httpstan/compile.py    /usr/local/lib/python3.12/dist-packages/httpstan/utils.py
+/usr/local/lib/python3.12/dist-packages/httpstan/config.py     /usr/local/lib/python3.12/dist-packages/httpstan/views.py
+/usr/local/lib/python3.12/dist-packages/httpstan/fits.py
+===
+10:def setup_routes(app: aiohttp.web.Application) -> None:
+18:    app.router.add_get("/v1/health", views.handle_health)
+19:    app.router.add_post("/v1/models", views.handle_create_model)
+20:    app.router.add_get("/v1/models", views.handle_list_models)
+21:    app.router.add_delete("/v1/models/{model_id}", views.handle_delete_model)
+22:    app.router.add_post("/v1/models/{model_id}/params", views.handle_show_params)
+23:    app.router.add_post("/v1/models/{model_id}/log_prob", views.handle_log_prob)
+24:    app.router.add_post("/v1/models/{model_id}/log_prob_grad", views.handle_log_prob_grad)
+25:    app.router.add_post("/v1/models/{model_id}/write_array", views.handle_write_array)
+26:    app.router.add_post("/v1/models/{model_id}/transform_inits", views.handle_transform_inits)
+27:    app.router.add_post("/v1/models/{model_id}/fits", views.handle_create_fit)
+28:    app.router.add_get("/v1/models/{model_id}/fits/{fit_id}", views.handle_get_fit)
+29:    app.router.add_delete("/v1/models/{model_id}/fits/{fit_id}", views.handle_delete_fit)
+30:    app.router.add_get("/v1/operations/{operation_id}", views.handle_get_operation)
+[?2004hroot@9107947ed3db:/app# grep -nE 'def |operations|output|append|messages|json|return|update|\[' /usr/local/lib/python3.12/dist-packages/httpstan/views.py | head -70
+[?2004l27:# match a string such as `Iteration: 2000 / 2000 [100%]  (Sampling)`
+28:iteration_info_re = re.compile(rb"Iteration:\s+\d+ / \d+ \[\s*\d+%\]\s+\(\w+\)")
+31:def _make_error(message: str, status: int, details: Optional[Sequence] = None) -> dict:
+34:        status_dict["details"] = details
+35:    return cast(dict, schemas.Status().load(status_dict))
+38:async def handle_health(request: aiohttp.web.Request) -> aiohttp.web.Response:
+48:    return aiohttp.web.Response(text="httpstan is running.")
+51:async def handle_create_model(request: aiohttp.web.Request) -> aiohttp.web.Response:
+58:        - application/json
+60:        - application/json
+69:          description: Identifier for compiled Stan model and compiler output.
+78:    program_code = args["program_code"]
+88:        compiler_output = httpstan.cache.load_services_extension_module_compiler_output(model_name)
+91:            {"name": model_name, "compiler_output": compiler_output, "stanc_warnings": stanc_warnings}
+93:        return aiohttp.web.json_response(response_dict, status=201)
+101:    stan_model_name = f"model_{model_name.split('/')[1]}"  # stan name cannot start with number
+107:        return aiohttp.web.json_response(_make_error(message, status=status), status=status)
+114:        compiler_output = await httpstan.models.build_services_extension_module(program_code)
+121:        return aiohttp.web.json_response(_make_error(message, status=status), status=status)
+122:    httpstan.cache.dump_services_extension_module_compiler_output(compiler_output, model_name)
+124:        {"name": model_name, "compiler_output": compiler_output, "stanc_warnings": stanc_warnings}
+126:    return aiohttp.web.json_response(response_dict, status=201)
+129:async def handle_list_models(request: aiohttp.web.Request) -> aiohttp.web.Response:
+136:        - application/json
+139:          description: Identifier for compiled Stan model and compiler output.
+149:    models = []
+151:        compiler_output = httpstan.cache.load_services_extension_module_compiler_output(model_name)
+153:        models.append(
+155:                {"name": model_name, "compiler_output": compiler_output, "stanc_warnings": stanc_warnings}
+158:    return aiohttp.web.json_response({"models": models}, status=200)
+161:async def handle_delete_model(request: aiohttp.web.Request) -> aiohttp.web.Response:
+173:        - application/json
+187:    model_name = f"models/{request.match_info['model_id']}"
+193:        return aiohttp.web.json_response(_make_error(message, status=status), status=status)
+198:    return aiohttp.web.Response(text="OK")
+201:async def handle_show_params(request: aiohttp.web.Request) -> aiohttp.web.Response:
+211:        Returns the output of Stan C++ model class methods:
+214:        - application/json
+216:        - application/json
+249:    model_name = f'models/{request.match_info["model_id"]}'
+250:    data = args["data"]
+256:        return aiohttp.web.json_response(_make_error(message, status=status), status=status)
+260:    # output of ``get_param_names`` and ``get_dims``.
+269:        return aiohttp.web.json_response(_make_error(message, status=status), status=status)
+272:    params = []
+275:        params.append(schemas.Parameter().load({"name": name, "dims": dims_, "constrained_names": constrained_names}))
+276:    return aiohttp.web.json_response({"name": model_name, "params": params})
+279:async def handle_create_fit(request: aiohttp.web.Request) -> aiohttp.web.Response:
+284:    a GET request to the operations resource endpoint.
+287:    collects all logger and writer messages from Stan.)
+295:        a GET request to the operations resource endpoint.
+298:        collects all logger and writer messages from Stan.)
+312:        - application/json
+314:        - application/json
+338:    model_name = f'models/{request.match_info["model_id"]}'
+345:        return aiohttp.web.json_response(_make_error(message, status=status), status=status)
+355:        operation_name = f'operations/{name.split("/")[-1]}'
+364:        request.app["operations"][operation_name] = operation_dict
+365:        return aiohttp.web.json_response(operation_dict, status=201)
+367:    def _services_call_done(operation: dict, future: asyncio.Future) -> None:
+378:        operation["done"] = True
+390:            operation["result"] = _make_error(message, status=status)
+391:            # Delete messages associated with the fit. If initialization
+392:            # fails, for example, messages will exist on disk. Remove them.
+394:                httpstan.cache.delete_fit(operation["metadata"]["fit"]["name"])
+398:            logger.info(f"Operation `{operation['name']}` finished.")
+399:            operation["result"] = schemas.Fit().load(operation["metadata"]["fit"])
+401:    operation_name = f'operations/{name.split("/")[-1]}'
+407:    # such that the operation gets updated when the task finishes. Note that
+410:    def logger_callback(operation: dict, message: bytes) -> None:
+[?2004hroot@9107947ed3db:/app# sed -n '401,470p' /usr/local/lib/python3.12/dist-packages/httpstan/views.py
+[?2004l    operation_name = f'operations/{name.split("/")[-1]}'
+    operation_dict = schemas.Operation().load(
+        {"name": operation_name, "done": False, "metadata": {"fit": schemas.Fit().load({"name": name})}}
+    )
+
+    # Launch the call to the services function in the background. Wire things up
+    # such that the operation gets updated when the task finishes. Note that
+    # if a task is cancelled before finishing a warning will be issued (see
+    # `on_cleanup` signal handler in main.py).
+    def logger_callback(operation: dict, message: bytes) -> None:
+        if b"info:Iteration" not in message:
+            return
+        # When sampling completes rapidly, multiple iteration messages can be passed together. Use final one.
+        operation["metadata"]["progress"] = iteration_info_re.findall(message).pop().decode()
+
+    logger_callback_partial = functools.partial(logger_callback, operation_dict)
+    task = asyncio.create_task(
+        services_stub.call(
+            function, model_name, operation_dict["metadata"]["fit"]["name"], logger_callback_partial, **args
+        )
+    )
+    task.add_done_callback(functools.partial(_services_call_done, operation_dict))
+    request.app["operations"][operation_name] = operation_dict
+    return aiohttp.web.json_response(operation_dict, status=201)
+
+
+async def handle_get_fit(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Get result of a call to a function defined in stan::services.
+
+    ---
+    get:
+      summary: Get results returned by a function.
+      description: Result (draws, logger messages) from calling a function defined in stan::services.
+      consumes:
+        - application/json
+      produces:
+        - text/plain
+      parameters:
+        - name: model_id
+          in: path
+          description: ID of Stan model associated with the result
+          required: true
+          type: string
+        - name: fit_id
+          in: path
+          description: ID of Stan result ("fit") desired
+          required: true
+          type: string
+      responses:
+        "200":
+          description: Newline-delimited JSON-encoded messages from Stan. Includes draws.
+        "404":
+          description: Fit not found.
+          schema: Status
+    """
+    model_name = f"models/{request.match_info['model_id']}"
+    fit_name = f"{model_name}/fits/{request.match_info['fit_id']}"
+
+    try:
+        fit_bytes_gz = httpstan.cache.load_fit(fit_name)
+    except KeyError:  # pragma: no cover
+        message, status = f"Fit `{fit_name}` not found.", 404
+        return aiohttp.web.json_response(_make_error(message, status=status), status=status)
+    fit_bytes = gzip.decompress(fit_bytes_gz)
+    assert isinstance(fit_bytes, bytes)
+    return aiohttp.web.Response(body=fit_bytes, content_type="text/plain", charset="utf-8")
+
+
+async def handle_delete_fit(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Delete a fit.
+[?2004hroot@9107947ed3db:/app# pkill -9 -f pystan_analysis; pkill -9 -f calibrate; sleep 2; echo 'procs:'; ps -eo pid,cmd | grep -E 'pystan_analysis|calibrate' | grep -v grep | wc -l
+[?2004lprocs:
+0
+[?2004hroot@9107947ed3db:/app# cp /usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py /tmp/ss_backup.py; sed -i 's/initializer=init_worker)/initializer=init_worker, max_workers=4)/' /usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py; grep -n 'max_workers=4' /usr/local/lib/python3.12/dist-packages/httpstan/services_stub.py
+[?2004l[32m[K36[m[K[36m[K:[m[Kexecutor = concurrent.futures.ProcessPoolExecutor(mp_context=mp.get_context("fork"), initializer=init_worker, [01;31m[Kmax_workers=4[m[K)
+[?2004hroot@9107947ed3db:/app# cat > /app/calibrate.py <<'CAL'
+[?2004l[?2004h> import numpy as np, json, time, sys, os
+[?2004l[?2004h> import stan
+[?2004l[?2004h> sys.path.insert(0, '/tmp')
+[?2004l[?2004h> exec(open('/app/_data_model.py').read())
+[?2004l[?2004h> print('DATA+MODEL OK  N',N,'D',D,'P',P,'N_new',N_new, flush=True)
+[?2004l[?2004h> post = stan.build(stan_code, data=data, random_seed=1)
+[?2004l[?2004h> print('BUILD OK %.1fs'%(time.time()-t0), flush=True)
+[?2004l[?2004h> t1=time.time()
+[?2004l[?2004h> fit = post.sample(num_chains=2, num_samples=150, num_warmup=150, num_thin=2, delta=0.93, max_depth=14, gamma=0.05, kappa=0.75, t0=10, init_buffer=50, term_buffer=50, window=25, refresh=200, save_warmup=False)
+[?2004l[?2004h> print('SAMPLE OK %.1fs'%(time.time()-t1), flush=True)
+[?2004l[?2004h> print('alpha %.5f'%float(np.mean(fit['alpha'])), flush=True)
+[?2004l[?2004h> print('sigma %.5f'%float(np.mean(fit['sigma'])), flush=True)
+[?2004l[?2004h> print('rho', np.round(np.mean(fit['rho'],axis=1),5), flush=True)
+[?2004l[?2004h> print('beta', np.round(np.mean(fit['beta'],axis=1),5), flush=True)
+[?2004l[?2004h> print('CAL_DONE', flush=True)
+[?2004l[?2004h> CAL
+[?2004l[?2004hroot@9107947ed3db:/app# echo cal_written
+[?2004lcal_written
+[?2004hroot@9107947ed3db:/app# 

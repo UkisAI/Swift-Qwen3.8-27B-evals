@@ -1,0 +1,1116 @@
+[?2004hroot@6186ec7db2df:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@6186ec7db2df:/app# clear
+[?2004l[H[J[3J[?2004hroot@6186ec7db2df:/app# which R Rscript; R --version 2>/dev/null | head -2
+[?2004l[?2004hroot@6186ec7db2df:/app# ls /app
+[?2004l[?2004hroot@6186ec7db2df:/app# cat /etc/os-release | head -3
+[?2004lPRETTY_NAME="Ubuntu 24.04.3 LTS"
+NAME="Ubuntu"
+VERSION_ID="24.04"
+[?2004hroot@6186ec7db2df:/app# apt-get update 2>&1 | tail -2
+[?2004lHit:4 http://archive.ubuntu.com/ubuntu noble-backports InRelease
+Reading package lists...
+[?2004hroot@6186ec7db2df:/app# DEBIAN_FRONTEND=noninteractive nohup apt-get install -y r-base > /tmp/r_install.log 2>&1 &
+[?2004l[1] 2915
+[?2004hroot@6186ec7db2df:/app# tail -2 /tmp/r_install.log
+[?2004lGet:15 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 zlib1g amd64 1:1.3.dfsg-3.1ubuntu2.2 [63.0 kB]
+Get:16 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 libperl5.38t64 amd64 5.38.2-3.2ubuntu0.4 [4870 kB]
+[?2004hroot@6186ec7db2df:/app# cat > /app/ars.R << 'ARS_EOF'
+[?2004l[?2004h> # ===========================================================================
+[?2004l[?2004h> # Adaptive Rejection Sampling (ARS)
+[?2004l[?2004h> #
+[?2004l("[?2004h> # Implementation of the adaptive rejection sampling sampler of
+[?2004l[?2004h> #     Gilks, W. R. & Wild, P. (1992). "Adaptive rejection sampling for
+[?2004l[?2004h> #     Gibbs sampling". J. R. Stat. Soc. C (Appl. Statist.) 41(2), 337-348.
+[?2004l[?2004h> #
+[?2004lnl[?2004h> # The user supplies a (possibly unnormalized) DENSITY function h(x) that
+[?2004l[?2004h> # works in a vectorized fashion (e.g. dnorm, dexp, or any function of that
+[?2004l[?2004h> # form; an expression in x is also accepted).  Internally the code works
+[?2004l[?2004h> # with f(x) = log h(x) and requires f to be CONCAVE on the domain (i.e. the
+[?2004l[?2004h> # density to be log-concave).  Violations are detected and reported during
+[?2004l[?2004h> # the sampling process.
+[?2004l[?2004h> #
+[?2004lbe[?2004h> # Module overview (helper functions all use the `hull_` family of names):
+[?2004l[?2004h> #   ars()               primary entry point (validate -> build hull -> sample)
+[?2004l[?2004h> #   ars_validate()      input validation (density fn, domain, n, init points)
+[?2004l[?2004h> #   make_logd()         wrap the user density into a safe log-density fn
+[?2004l[?2004h> #   est_slope()         numerical first derivative of f, boundary aware
+[?2004l[?2004h> #   pick_init()         automatic choice of initial evaluation points
+[?2004l[?2004h> #   hull_init()         build initial hull (tangents, tangencies, CDF)
+[?2004l[?2004h> #   hull_tangency()     intersection of two adjacent tangents (concave check)
+[?2004l[?2004h> #   hull_tangencies()   all internal tangency points (concave check)
+[?2004l[?2004h> #   hull_masses()       normalised CDF of the piecewise-exp envelope
+[?2004l[?2004h> #   hull_upper()        upper hull (tangent) value S(x)
+[?2004l[?2004h> #   hull_squeeze()      lower hull (secant/squeeze) value Z(x)
+[?2004l[?2004h> #   hull_piece_draw()   inverse-CDF draw inside one envelope piece
+[?2004l[?2004h> #   hull_draw()         one candidate x drawn from the envelope
+[?2004l[?2004h> #   hull_insert()       adapt the hull with a new point (concave check)
+[?2004l[?2004h> #   ars_sample()        rejection-sampling loop with adaptation
+[?2004l[?2004h> #   test()              formal test suite vs. known distributions
+[?2004l[?2004h> #
+[?2004lin[?2004h> # Usage examples:
+[?2004lf[?2004h> #   source("/app/ars.R")
+[?2004l[?2004h> #   x <- ars(dnorm, c(-Inf, Inf), 1000)          # standard normal
+[?2004l[?2004h> #   y <- ars(function(z) dexp(z, rate = 2), c(0, Inf), 500)
+[?2004l[?2004h> #   test()                 # run the formal test suite (writes sample files)
+[?2004l[?2004h> #   Rscript /app/ars.R     # runs the test suite automatically
+[?2004l[?2004h> # ===========================================================================
+[?2004l[?2004h> 
+[?2004le[?2004h> # Default number of samples used by ars() when n is not supplied.
+[?2004l[?2004h> sample_count <- 1000L
+[?2004lAL[?2004h> 
+[?2004lS[?2004h> # Error raised for invalid user input (distinguished from numerical errors).
+[?2004l[?2004h> ars_user_error <- function(...) stop(..., call. = FALSE)
+[?2004l[?2004h> 
+[?2004l [?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Input validation
+[?2004le[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> 
+[?2004la[?2004h> # Validate all inputs of ars(); returns a list of the validated inputs or
+[?2004l[?2004h> # stops with an informative error message.
+[?2004l[?2004h> ars_validate <- function(density_function, domain, n, initial_points = NULL) {
+[?2004l[?2004h> 
+[?2004lc[?2004h>   # --- density function (a function, an expression, or a formula in x) ---
+[?2004l[?2004h>   if (is.expression(density_function)) {
+[?2004l[?2004h>     expr <- as.list(density_function)[[1]]
+[?2004l[?2004h>     density_function <- function(x) eval(expr, envir = list(x = x),
+[?2004l[?2004h>                                          enclos = globalenv())
+[?2004l[?2004h>   } else if (is.function(density_function)) {
+[?2004l[?2004h>     density_function <- as.function(density_function)
+[?2004l[?2004h>   } else {
+[?2004l[?2004h>     ars_user_error("density_function must be a function (e.g. dnorm) or an", "\n  ",
+[?2004l[?2004h>                    "expression in x; got ", class(density_function)[1])
+[?2004l[?2004h>   }
+[?2004l[?2004h> 
+[?2004l-[?2004h>   # --- domain ---
+[?2004l[?2004h>   if (is.null(domain) || length(domain) != 2 || !is.numeric(domain) ||
+[?2004l[?2004h>       any(is.nan(domain))) {
+[?2004l[?2004h>     ars_user_error("domain must be a numeric vector of length 2, e.g. ",
+[?2004l[?2004h>                    "c(0, Inf)")
+[?2004l[?2004h>   }
+[?2004l[?2004h>   domain <- as.numeric(unlist(domain))
+[?2004l[?2004h>   a <- domain[1]; b <- domain[2]
+[?2004l[?2004h>   if (!is.finite(a) && a > 0) a <- -Inf   # allow e.g. -9999 to mean -Inf? no:
+[?2004l[?2004h>   if (a >= b) {
+[?2004l[?2004h>     ars_user_error("invalid domain: lower bound must be < upper bound")
+[?2004l[?2004h>   }
+[?2004l[?2004h> 
+[?2004l [?2004h>   # --- n (number of samples) ---
+[?2004l[?2004h>   if (missing(n) || is.null(n)) n <- sample_count
+[?2004l[?2004h>   if (!is.numeric(n) || length(n) != 1 || is.nan(n) || !is.finite(n)) {
+[?2004l[?2004h>     ars_user_error("n must be a single finite positive integer")
+[?2004l[?2004h>   }
+[?2004l[?2004h>   if (n < 1 || n != floor(n)) {
+[?2004l[?2004h>     ars_user_error("n (number of samples) must be a positive integer, got ", n)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   n <- as.integer(n)
+[?2004l[?2004h> 
+[?2004l"[?2004h>   # --- initial points (optional) ---
+[?2004l[?2004h>   if (!is.null(initial_points)) {
+[?2004l[?2004h>     initial_points <- suppressWarnings(as.numeric(unlist(initial_points)))
+[?2004l[?2004h>     if (length(initial_points) < 2 || any(is.na(initial_points)) ||
+[?2004l[?2004h>         any(is.nan(initial_points)) || any(initial_points <= a) ||
+[?2004l[?2004h>         any(initial_points >= b)) {
+[?2004l[?2004h>       ars_user_error("initial_points must be at least 2 numeric values, all ",
+[?2004l[?2004h>                      "strictly inside the domain")
+[?2004l[?2004h>     }
+[?2004l[?2004h>     initial_points <- sort(unique(initial_points))
+[?2004l[?2004h>   }
+[?2004l[?2004h> 
+[?2004l,[?2004h>   # --- probe the density: vectorized, numeric, finite and non-negative ---
+[?2004l[?2004h>   probe <- unique(c(a, (a + b) / 2, b, -1, 0, 1))
+[?2004l[?2004h>   probe <- probe[probe > a & probe < b]
+[?2004l[?2004h>   if (length(probe) == 0) probe <- (a + b) / 2
+[?2004l[?2004h>   vals <- tryCatch(density_function(probe),
+[?2004l[?2004h>                    error = function(e) e, warning = function(w) w)
+[?2004l[?2004h>   if (inherits(vals, c("condition", "try-error"))) {
+[?2004l[?2004h>     ars_user_error("density_function failed on the probe point ",
+[?2004l[?2004h>                    probe[1], ": ", conditionMessage(vals))
+[?2004l[?2004h>   }
+[?2004l[?2004h>   vals <- suppressWarnings(as.numeric(vals))
+[?2004l[?2004h>   if (length(vals) != length(probe) || any(is.na(vals)) || any(vals < 0)) {
+[?2004l[?2004h>     ars_user_error("density_function must return one finite, non-negative ",
+[?2004l[?2004h>                    "number for each input (vectorized evaluation)")
+[?2004l[?2004h>   }
+[?2004l[?2004h> 
+[?2004l [?2004h>   list(density_function = density_function, a = a, b = b, n = n,
+[?2004l[?2004h>        initial_points = initial_points)
+[?2004l[?2004h> }
+[?2004l ([?2004h> 
+[?2004lc[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Log-density wrapper and numerical differentiation
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> 
+[?2004ls[?2004h> # Wrap the user's (possibly unnormalized) density into a log-density function
+[?2004l[?2004h> # with runtime error checking.  The returned function takes one numeric input
+[?2004l[?2004h> # and returns a numeric vector of log-densities (-Inf where the density is 0).
+[?2004l[?2004h> make_logd <- function(fn, label = "target density") {
+[?2004l[?2004h>   force(fn)
+[?2004l[?2004h>   function(x) {
+[?2004l[?2004h>     x <- as.numeric(x)
+[?2004l[?2004h>     vals <- tryCatch(fn(x), error = function(e) e, warning = function(w) w)
+[?2004l[?2004h>     if (inherits(vals, c("condition", "try-error"))) {
+[?2004lg[?2004h>       stop("user ", label, " failed at x = ", format(x[1]), ": ",
+[?2004l[?2004h>            conditionMessage(vals), call. = FALSE)
+[?2004l[?2004h>     }
+[?2004li[?2004h>     vals <- suppressWarnings(as.numeric(vals))
+[?2004l[?2004h>     if (length(vals) != length(x) || any(is.na(vals)) || any(vals < 0)) {
+[?2004l[?2004h>       stop("user ", label, " returned non-numeric or negative values", call. = FALSE)
+[?2004l[?2004h>     }
+[?2004l[?2004h>     suppressWarnings(log(vals))
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004lt[?2004h> # Numerical first derivative of f = log(density) at scalar x, using a central
+[?2004l[?2004h> # difference, with one-sided differences near the domain bounds or when the
+[?2004l[?2004h> # density vanishes on one side.  Returns NA if no usable difference exists.
+[?2004l[?2004h> est_slope <- function(logd, x, a, b) {
+[?2004l[?2004h>   h  <- max(6e-6 * max(1, abs(x)), 1e-12)
+[?2004li[?2004h>   xl <- x - h; xr <- x + h
+[?2004l[?2004h>   fl <- logd(xl); fr <- logd(xr); f0 <- logd(x)
+[?2004l[?2004h>   okL <- xl > a && !is.infinite(xl) && is.finite(fl)
+[?2004l[?2004h>   okR <- xr < b && !is.infinite(xr) && is.finite(fr)
+[?2004l[?2004h>   if (okL && okR) return(as.numeric((fr - fl) / (2 * h)))
+[?2004l[?2004h>   if (okR && is.finite(f0)) return(as.numeric((fr - f0) / h))
+[?2004l[?2004h>   if (okL && is.finite(f0)) return(as.numeric((f0 - fl) / h))
+[?2004l[?2004h>   return(NA_real_)
+[?2004l[?2004h> }
+[?2004l  [?2004h> 
+[?2004l [?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Initial evaluation points
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> 
+[?2004l [?2004h> # Choose at least 2 initial abscissae on which the density is evaluated.
+[?2004l[?2004h> # With user-provided points these are returned as-is (already validated).
+[?2004l[?2004h> pick_init <- function(logd, a, b, user_pts) {
+[?2004l[?2004h>   if (!is.null(user_pts)) return(sort(user_pts))
+[?2004l[?2004h>   if (is.finite(a) && is.finite(b)) {
+[?2004l[?2004h>     grid <- seq(a, b, length.out = 41)
+[?2004l[?2004h>   } else if (is.finite(a)) {
+[?2004l[?2004h>     step <- if (a == 0) 1 else abs(a)
+[?2004l[?2004h>     grid <- a + step * c(0.1, 0.3, 1, 3, 10, 30, 100)
+[?2004l[?2004h>   } else if (is.finite(b)) {
+[?2004l[?2004h>     step <- if (b == 0) 1 else abs(b)
+[?2004l[?2004h>     grid <- b - step * c(0.1, 0.3, 1, 3, 10, 30, 100)
+[?2004l[?2004h>   } else {
+[?2004l[?2004h>     grid <- seq(-5, 5, length.out = 21)   # unbounded on both sides
+[?2004l[?2004h>   }
+[?2004l{[?2004h>   grid <- grid[grid > a & grid < b]
+[?2004l[?2004h>   f0 <- logd(grid)
+[?2004l[?2004h>   good <- grid[is.finite(f0)]
+[?2004l [?2004h>   if (length(good) < 2) {
+[?2004l[?2004h>     stop("could not find two points inside the domain with positive ",
+[?2004l in[?2004h>          "density; supply 'initial_points' explicitly", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   # extend towards the tails a little for a better initial envelope
+[?2004l[?2004h>   if (!is.finite(a) && min(good) == a) good <- c(a + 1e-8, good)
+[?2004l[?2004h>   good
+[?2004l[?2004h> }
+[?2004lte[?2004h> 
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Hull construction and maintenance
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> 
+[?2004l<[?2004h> # Intersection of the tangents at (xi, hi) and (xj, hj) with slopes ui, uj.
+[?2004l[?2004h> # Enforces the necessary conditions for a concave f; errors otherwise.
+[?2004l[?2004h> hull_tangency <- function(xi, hi, ui, xj, hj, uj) {
+[?2004l[?2004h>   du <- uj - ui
+[?2004l[?2004h>   if (abs(du) < 1e-8) {
+[?2004l [?2004h>     ci <- hi - ui * xi
+[?2004l[?2004h>     cj <- hj - uj * xj
+[?2004l[?2004h>     if (is.finite(ci) && is.finite(cj) && abs(cj - ci) <= 1e-8 * max(1, abs(ci))) {
+[?2004l[?2004h>       # identical supporting lines (e.g. f is linear there): any point works
+[?2004l[?2004h>       return((xi + xj) / 2)
+[?2004l[?2004h>     }
+[?2004l[?2004h>     stop("log-concavity check failed: adjacent tangents are parallel but ",
+[?2004l[?2004h>          "not parallel-supporting -- the target density does not appear to ",
+[?2004l[?2004h>          "be log-concave on the domain", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004lu[?2004h>   if (!is.finite(hi) || !is.finite(hj)) {
+[?2004l[?2004h>     stop("log-concavity check failed: the density is 0 at an initial ",
+[?2004l[?2004h>          "evaluation point; choose initial_points inside the support", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   ci <- hi - ui * xi
+[?2004l[?2004h>   (ci - (hj - uj * xj)) / du
+[?2004l[?2004h> }
+[?2004lid[?2004h> 
+[?2004le[?2004h> # All internal tangency points for abscissae x with slopes u and values h.
+[?2004l[?2004h> # Returns the k-1 internal tangences t_i in (x_i, x_{i+1}) and verifies that
+[?2004l[?2004h> # each lies between its two supporting abscissae (a log-concavity test).
+[?2004l[?2004h> hull_tangencies <- function(x, h, u) {
+[?2004l[?2004h>   k <- length(x)
+[?2004l[?2004h>   t <- if (k >= 2) {
+[?2004l[?2004h>     vapply(seq_len(k - 1), function(i)
+[?2004l[?2004h>            hull_tangency(x[i], h[i], u[i], x[i + 1], h[i + 1], u[i + 1]),
+[?2004l[?2004h>            numeric(1))
+[?2004l[?2004h>   } else numeric(0)
+[?2004lr[?2004h>   if (length(t) > 0) {
+[?2004l [?2004h>     tol <- 1e-8 * max(1, diff(range(x)))
+[?2004l[?2004h>     if (any(!is.finite(t)) || any(t < x[seq_len(k - 1)] - tol) ||
+[?2004l[?2004h>         any(t > x[seq_len(k - 1) + 1L] + tol)) {
+[?2004l[?2004h>       stop("log-concavity check failed: a tangent intersection lies outside ",
+[?2004l[?2004h>            "the interval it must bound -- the target density does not appear ",
+[?2004l[?2004h>            "to be log-concave on the domain", call. = FALSE)
+[?2004l[?2004h>     }
+[?2004l[?2004h>   }
+[?2004li[?2004h>   c(a = x[1], t, b = x[k])
+[?2004l[?2004h> }
+[?2004log[?2004h> 
+[?2004l([?2004h> # Tangency grid for the current abscissae, clamped to the domain [a, b].
+[?2004l[?2004h> mk_tangencies <- function(x, h, u, a, b) {
+[?2004ll[?2004h>   t <- hull_tangencies(x, h, u)
+[?2004l[?2004h>   c(a, t[seq_len(length(t) - 2)], b)
+[?2004l[?2004h> }
+[?2004l <[?2004h> 
+[?2004l-[?2004h> # Normalised CDF (breakpoints) of the enveloping piecewise-exponential
+[?2004l[?2004h> # distribution.  Exponents are centered for numerical safety.
+[?2004l[?2004h> hull_masses <- function(x, h, u, xst) {
+[?2004l[?2004h>   k <- length(x)
+[?2004l[?2004h>   L <- xst[-(k + 1)]; U <- xst[-1]
+[?2004l[?2004h>   ex <- numeric(0)
+[?2004l[?2004h>   for (i in seq_len(k)) {
+[?2004lt[?2004h>     if (is.finite(L[i])) ex <- c(ex, u[i] * L[i] - h[i])
+[?2004l[?2004h>     if (is.finite(U[i])) ex <- c(ex, u[i] * U[i] - h[i])
+[?2004lr[?2004h>   }
+[?2004l[?2004h>   C <- max(ex)
+[?2004l,[?2004h>   m <- vapply(seq_len(k), function(i) {
+[?2004l[?2004h>     hi <- h[i] - C; ui <- u[i]; L <- xst[i]; U <- xst[i + 1]
+[?2004l[?2004h>     if (is.infinite(L) && L < 0) {
+[?2004l[?2004h>       if (!(ui > 0)) stop("envelope has infinite mass at the left tail: the ",
+[?2004l[?2004h>                           "first tangent slope must be positive (bad domain ",
+[?2004l[?2004h>                           "choice, or a non-log-concave / improper density)",
+[?2004l[?2004h>                           call. = FALSE)
+[?2004l[?2004h>       return(exp(ui * U - hi) / ui)
+[?2004l[?2004h>     }
+[?2004l[?2004h>     if (is.infinite(U) && U > 0) {
+[?2004l[?2004h>       if (!(ui < 0)) stop("envelope has infinite mass at the right tail: the ",
+[?2004l[?2004h>                           "last tangent slope must be negative (bad domain ",
+[?2004l[?2004h>                           "choice, or a non-log-concave / improper density)",
+[?2004l[?2004h>                           call. = FALSE)
+[?2004l[?2004h>       return(exp(ui * L - hi) / (-ui))
+[?2004l[?2004h>     }
+[?2004l[?2004h>     w <- ui * (U - L)
+[?2004l[?2004h>     if (abs(w) < 1e-8) return((U - L) * exp(ui * L - hi))
+[?2004l[?2004h>     if (w > 0) return(exp(ui * U - hi) * (1 - exp(-w)) / ui)
+[?2004l[?2004h>     return(exp(ui * L - hi) * (1 - exp(w)) / (-ui))
+[?2004l[?2004h>   }, numeric(1))
+[?2004l[?2004h>   if (any(!is.finite(m)) || any(m < 0)) {
+[?2004l[?2004h>     stop("internal numerical error while integrating the envelope", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   m / sum(m)   # normalised piece masses = CDF breakpoints
+[?2004l[?2004h> }
+[?2004lam[?2004h> 
+[?2004l[?2004h> # Build a fresh hull from the initial abscissae and check the tail slopes.
+[?2004l[?2004h> hull_init <- function(logd, a, b, user_pts) {
+[?2004l[?2004h>   x <- pick_init(logd, a, b, user_pts)
+[?2004l[?2004h>   h <- logd(x)
+[?2004l, [?2004h>   u <- vapply(x, est_slope, numeric(1), a = a, b = b)
+[?2004l[?2004h>   if (any(!is.finite(u))) {
+[?2004l[?2004h>     stop("could not numerically differentiate log density; try supplying ",
+[?2004l[?2004h>          "initial_points with a different spacing", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   hull <- new_hull(x, h, u, a, b)
+[?2004l[?2004h>   x <- hull["x"]; r <- c(a, x[-length(x)])
+[?2004l[?2004h>   # left tail: need u[1] > 0 when a is -Inf; otherwise move the first point
+[?2004l[?2004h>   n_ext <- 0
+[?2004l[?2004h>   while (!is.finite(a) && u[1] <= 0 && n_ext < 50) {
+[?2004l[?2004h>     nx <- x[1] + min(0.5, 2^n_ext / 10) * (x[2] - x[1])
+[?2004l[?2004h>     nh <- logd(nx); nu <- est_slope(logd, nx, a, b)
+[?2004l[?2004h>     if (!is.finite(nh) || !is.finite(nu)) break
+[?2004l[?2004h>     x <- c(nx, x); h <- c(nh, h); u <- c(nu, u); n_ext <- n_ext + 1
+[?2004l[?2004h>   }
+[?2004lfall[?2004h>   n_ext <- 0
+[?2004l[?2004h>   while (!is.finite(b) && useTAIL <- TRUE) break   # placeholder (replaced below)
+[?2004l[?2004h>   hull
+[?2004l  [?2004h> }
+[?2004l [?2004h> new_hull <- function(x, h, u, a, b) {
+[?2004l[?2004h>   xst <- mk_tangencies(x, h, u, a, b)
+[?2004l[?2004h>   list(x = x, h = h, u = u, a = a, b = b, xst = xst,
+[?2004l[?2004h>        cdf = hull_masses(x, h, u, xst))
+[?2004l[?2004h> }
+[?2004l  [?2004h> 
+[?2004l [?2004h> # Upper hull (tangent) value S(x) and the interval index where it is active.
+[?2004l[?2004h> hull_upper <- function(xv, hull) {
+[?2004l[?2004h>   i <- max(1, findInterval(xv, hull["xst"]))
+[?2004l [?2004h>   hull["h"][i] + hull["u"][i] * (xv - hull["x"][i])
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004lu[?2004h> # Lower hull (secant, squeeze) value Z(x); -Inf outside the convex hull of the
+[?2004l[?2004h> # evaluation abscissae (there is no squeeze available there).
+[?2004l[?2004h> hull_squeeze <- function(xv, hull) {
+[?2004l[?2004h>   x <- hull["x"]; h <- hull["h"]
+[?2004l[?2004h>   j <- findInterval(xv, x)
+[?2004l[?2004h>   if (j < 1 || j >= length(x)) return(-Inf)
+[?2004l[?2004h>   if (abs(xv - x[j]) < 1e-12)  return(h[j])
+[?2004l[?2004h>   if (abs(xv - x[j + 1]) < 1e-12) return(h[j + 1])
+[?2004l[?2004h>   w <- (xv - x[j]) / (x[j + 1] - x[j])
+[?2004l[?2004h>   h[j] + w * (h[j + 1] - h[j])
+[?2004l[?2004h> }
+[?2004lIn[?2004h> 
+[?2004lf[?2004h> # Inverse-CDF draw of one x from the piece exp(u[t]*t - h[i]) restricted to
+[?2004l[?2004h> # (L, U), where rv is its within-piece uniform probability.
+[?2004l[?2004h> hull_piece_draw <- function(L, U, xi, hi, ui, rv) {
+[?2004l[?2004h>   if (is.infinite(L) && L < 0) return(U + log(rv) / ui)      # ui > 0 checked elsewhere
+[?2004l[?2004h>   if (is.infinite(U) && U > 0) return(L + log(1 - rv) / ui)   # ui < 0 checked elsewhere
+[?2004l[?2004h>   d <- U - L
+[?2004l[?2004h>   if (abs(ui) < 1e-10) return(L + d * rv)                    # flat tangent
+[?2004l[?2004h>   if (ui > 0 && ui * d > 50) return(L + d + log(rv) / ui)    # overflow-safe
+[?2004l[?2004h>   L + log(1 + rv * expm1(ui * d)) / ui
+[?2004l[?2004h> }
+[?2004lit[?2004h> 
+[?2004lt[?2004h> # Draw one candidate x from the current envelope.
+[?2004l[?2004h> hull_draw <- function(hull) {
+[?2004l[?2004h>   rv <- runif(1)
+[?2004l[?2004h>   if (rv <= 0) rv <- .Machine$double.xmin
+[?2004l[?2004h>   i <- min(length(hull["x"]), max(1, findInterval(rv, hull["cdf"], rightmost.ok = TRUE)))
+[?2004l[?2004h>   hull_piece_draw(hull["xst"][i], hull["xst"][i + 1], hull["x"][i],
+[?2004l[?2004h>                   hull["h"][i], hull["u"][i], rv)
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> # Adapt the hull with a newly evaluated point (xv, hv, uv).  Re-checks the
+[?2004l[?2004h> # necessary conditions of concavity and returns the updated hull.
+[?2004l[?2004h> hull_insert <- function(hull, xv, hv, uv) {
+[?2004l[?2004h>   x <- hull["x"]
+[?2004l[?2004h>   j <- which.min(abs(x - xv))
+[?2004l[?2004h>   if (abs(x - xv) <= 1e-10 * max(1, abs(x)) ) return(hull)  # already have it
+[?2004l[?2004h>   if (!is.finite(uv)) return(hull)                            # cannot adapt
+[?2004l[?2004h>   xi <- hull["x"][j]; hi <- hull["h"][j]
+[?2004l[?2004h>   ok <- if (j == 1) uv <= hull["u"][2] + 1e-5
+[?2004l[?2004h>         else if (j == length(x)) uv >= hull["u"][length(x) - 1] - 1e-5
+[?2004l[?2004h>         else hull["u"][j - 1] - 1e-5 <= uv && uv <= hull["u"][j + 1] + 1e-5
+[?2004l[?2004h>   if (!ok) {
+[?2004l[?2004h>     stop("log-concavity check failed while adapting: the estimated slopes ",
+[?2004l[?2004h>          "are not monotonically decreasing -- the target density does not ",
+[?2004l[?2004h>          "appear to be log-concave on the domain", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   p <- j + as.integer(xv > xi)
+[?2004l[?2004h>   nx <- c(x[seq_len(j)], xv, x[seq_len(j) + seq_len(length(x) - j)])
+[?2004l[?2004h>   nh <- c(hull["h"][seq_len(j)], hv, hull["h"][seq_len(j) + seq_len(length(x) - j)])
+[?2004l[?2004h>   nu <- c(hull["u"][seq_len(j)], uv, hull["u"][seq_len(j) + seq_len(length(x) - j)])
+[?2004l[?2004h>   new_hull(nx, nh, nu, hull["a"], hull["b"])
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Rejection-sampling loop with adaptation
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> ars_sample <- function(hull, logd, n) {
+[?2004l[?2004h>   out <- numeric(n)
+[?2004l[?2004h>   for (s in seq_len(n)) {
+[?2004l[?2004h>     repeat {
+[?2004l[?2004h>       x  <- hull_draw(hull)
+[?2004l[?2004h>       if (!is.finite(x)) next
+[?2004l[?2004h>       S  <- hull_upper(x, hull)
+[?2004l[?2004h>       Z  <- hull_squeeze(x, hull)
+[?2004l[?2004h>       w  <- runif(1)
+[?2004l[?2004h>       if (Z > -Inf && log(w) <= Z - S) {
+[?2004l[?2004h>         break                                   # accepted via the squeeze
+[?2004l[?2004h>       }
+[?2004l[?2004h>       f  <- as.numeric(logd(x))
+[?2004l[?2004h>       if (!is.finite(f)) next                   # density 0 (out of support)
+[?2004l[?2004h>       if (f > S + 1e-5 * max(1, abs(S))) {
+[?2004l[?2004h>         stop("log-concavity check failed: evaluated log density exceeds the ",
+[?2004l[?2004h>              "upper hull -- the target density does not appear to be ",
+[?2004l[?2004h>              "log-concave on the domain", call. = FALSE)
+[?2004l[?2004h>       }
+[?2004l[?2004h>       if (Z > -Inf && f < Z - 1e-5 * max(1, abs(S))) {
+[?2004l[?2004h>         stop("log-concavity check failed: evaluated log density falls below ",
+[?2004l[?2004h>              "the secant lower hull -- the target density does not appear to ",
+[?2004l[?2004h>              "be log-concave on the domain", call. = FALSE)
+[?2004l[?2004h>       }
+[?2004l[?2004h>       if (log(w) <= f - S) {
+[?2004l[?2004h>         hull <- hull_insert(hull, x, f, est_slope(logd, x, hull["a"], hull["b"]))
+[?2004l[?2004h>         break                                   # accepted, hull adapted
+[?2004l[?2004h>       }
+[?2004l[?2004h>       hull <- hull_insert(hull, x, f, est_slope(logd, x, hull["a"], hull["b"]))
+[?2004l[?2004h>       # rejected by the envelope: loop again
+[?2004l[?2004h>     }
+[?2004l[?2004h>     out[s] <- x
+[?2004l[?2004h>   }
+[?2004l[?2004h>   out
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> # Primary function
+[?2004l[?2004h> # ---------------------------------------------------------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> # Adaptive rejection sampling.
+[?2004l[?2004h> #
+[?2004l[?2004h> # density_function : vectorized (possibly unnormalized) density, e.g. dnorm,
+[?2004l[?2004h> #                    an R function of one argument, or an expression in x
+[?2004l[?2004h> # domain           : c(a, b), the support; bounds may be -Inf / Inf
+[?2004l[?2004h> # n                : number of samples to return (default: sample_count)
+[?2004l[?2004h> # initial_points   : optional numeric vector (>= 2 points) where f and f' are
+[?2004l[?2004h> #                    evaluated first; chosen automatically when omitted
+[?2004l[?2004h> ars <- function(density_function, domain, n = sample_count, initial_points = NULL) {
+[?2004l[?2004h>   v <- ars_validate(density_function, domain, n, initial_points)
+[?2004l[?2004h>   logd <- make_logd(v["density_function"], label = "density function")
+[?2004l[?2004h>   hull <- hull_init(logd, v["a"], v["b"], v["initial_points"])
+[?2004l[?2004h>   ars_sample(hull, logd, v["n"])
+[?2004l[?2004h> }
+[?2004l[?2004h> ARS_EOF
+[?2004l[1]+  Done                    DEBIAN_FRONTEND=noninteractive nohup apt-get install -y r-base > /tmp/r_install.log 2>&1
+[?2004hroot@6186ec7db2df:/app# echo "first part written"; wc -l /app/ars.R
+[?2004lfirst part written
+432 /app/ars.R
+[?2004hroot@6186ec7db2df:/app# tail -5 /tmp/r_install.log
+[?2004lSetting up libxml-parser-perl (2.47-1ubuntu0.24.04.1) ...
+Setting up libheif-plugin-aomenc:amd64 (1.17.6-1ubuntu4.8) ...
+Setting up libxml-twig-perl (1:3.52-2) ...
+Setting up libnet-dbus-perl (1.2.0-2build3) ...
+Processing triggers for libc-bin (2.39-0ubuntu8.8) ...
+[?2004hroot@6186ec7db2df:/app# grep -n "placeholder" /app/ars.R; sed -n '/hull_init <- function/,/^}/p' /app/ars.R
+[?2004l[32m[K305[m[K[36m[K:[m[K  while (!is.finite(b) && useTAIL <- TRUE) break   # [01;31m[Kplaceholder[m[K (replaced below)
+hull_init <- function(logd, a, b, user_pts) {
+  x <- pick_init(logd, a, b, user_pts)
+  h <- logd(x)
+  u <- vapply(x, est_slope, numeric(1), a = a, b = b)
+  if (any(!is.finite(u))) {
+    stop("could not numerically differentiate log density; try supplying ",
+         "initial_points with a different spacing", call. = FALSE)
+  }
+  hull <- new_hull(x, h, u, a, b)
+  x <- hull["x"]; r <- c(a, x[-length(x)])
+  # left tail: need u[1] > 0 when a is -Inf; otherwise move the first point
+  n_ext <- 0
+  while (!is.finite(a) && u[1] <= 0 && n_ext < 50) {
+    nx <- x[1] + min(0.5, 2^n_ext / 10) * (x[2] - x[1])
+    nh <- logd(nx); nu <- est_slope(logd, nx, a, b)
+    if (!is.finite(nh) || !is.finite(nu)) break
+    x <- c(nx, x); h <- c(nh, h); u <- c(nu, u); n_ext <- n_ext + 1
+  }
+  n_ext <- 0
+  while (!is.finite(b) && useTAIL <- TRUE) break   # placeholder (replaced below)
+  hull
+}
+[?2004hroot@6186ec7db2df:/app# R --version | head -1
+[?2004lR version 4.3.3 (2024-02-29) -- "Angel Food Cake"
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/hull_init_new.txt << 'H1'
+[?2004l[?2004h> hull_init <- function(logd, a, b, user_pts) {
+[?2004l[?2004h>   x <- pick_init(logd, a, b, user_pts)
+[?2004l[?2004h>   h <- logd(x)
+[?2004l[?2004h>   u <- vapply(x, est_slope, numeric(1), a = a, b = b)
+[?2004l[?2004h>   if (any(!is.finite(u))) {
+[?2004l[?2004h>     stop("could not numerically differentiate the log density; supply ",
+[?2004l[?2004h>          "initial_points with a different spacing", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   # left tail: with a == -Inf the first tangent slope must be positive
+[?2004l[?2004h>   n_ext <- 0L
+[?2004l[?2004h>   while (!is.finite(a) && u[1] <= 0 && n_ext < 60L) {
+[?2004l[?2004h>     nx <- x[1] - (x[2] - x[1]) * (1 + 0.25 * n_ext)
+[?2004l[?2004h>     nh <- logd(nx); nu <- est_slope(logd, nx, a, b)
+[?2004l[?2004h>     if (!is.finite(nh) || !is.finite(nu)) break
+[?2004l[?2004h>     x <- c(nx, x); h <- c(nh, h); u <- c(nu, u); n_ext <- n_ext + 1L
+[?2004l[?2004h>   }
+[?2004l[?2004h>   # right tail: with b == +Inf the last tangent slope must be negative
+[?2004l[?2004h>   n_ext <- 0L
+[?2004l[?2004h>   while (!is.finite(b) && u[length(x)] >= 0 && n_ext < 60L) {
+[?2004l[?2004h>     nx <- x[length(x)] + (x[length(x)] - x[length(x) - 1]) * (1 + 0.25 * n_ext)
+[?2004l[?2004h>     nh <- logd(nx); nu <- est_slope(logd, nx, a, b)
+[?2004l[?2004h>     if (!is.finite(nh) || !is.finite(nu)) break
+[?2004l[?2004h>     x <- c(x, nx); h <- c(h, nh); u <- c(u, nu); n_ext <- n_ext + 1L
+[?2004l[?2004h>   }
+[?2004l[?2004h>   new_hull(x, h, u, a, b)
+[?2004l[?2004h> }
+[?2004l[?2004h> H1
+[?2004l[?2004hroot@6186ec7db2df:/app# cat > /tmp/hull_insert_new.txt << 'H2'
+[?2004l[?2004h> hull_insert <- function(hull, xv, hv, uv) {
+[?2004l[?2004h>   x <- hull["x"]; k <- length(x)
+[?2004l[?2004h>   j <- which.min(abs(x - xv))
+[?2004l[?2004h>   if (abs(xv - x[j]) <= 1e-10 * (1 + abs(x[j]))) return(hull)  # already close
+[?2004l[?2004h>   if (!is.finite(uv)) return(hull)                             # cannot adapt
+[?2004l[?2004h>   # the derivative of a concave f must be non-increasing in x
+[?2004l[?2004h>   ok <- if (j == 1) uv <= hull["u"][2] + 1e-5
+[?2004l[?2004h>         else if (j == k) uv >= hull["u"][k - 1] - 1e-5
+[?2004l[?2004h>         else hull["u"][j - 1] - 1e-5 <= uv && uv <= hull["u"][j + 1] + 1e-5
+[?2004l[?2004h>   if (!ok) {
+[?2004l[?2004h>     stop("log-concavity check failed while adapting: the estimated slopes ",
+[?2004l[?2004h>          "are not monotonically decreasing -- the target density does not ",
+[?2004l[?2004h>          "appear to be log-concave on the domain", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   p <- j + as.integer(xv > x[j])
+[?2004l[?2004h>   nx <- if (p <= k) c(x[seq_len(p - 1)], xv, x[p:k]) else c(x, xv)
+[?2004l[?2004h>   nh <- if (p <= k) c(hull["h"][seq_len(p - 1)], hv, hull["h"][p:k]) else c(hull["h"], hv)
+[?2004l[?2004h>   nu <- if (p <= k) c(hull["u"][seq_len(p - 1)], uv, hull["u"][p:k]) else c(hull["u"], uv)
+[?2004l[?2004h>   new_hull(nx, nh, nu, hull["a"], hull["b"])
+[?2004l[?2004h> }
+[?2004l[?2004h> H2
+[?2004l[?2004hroot@6186ec7db2df:/app# echo written; wc -l /tmp/hull_init_new.txt /tmp/hull_insert_new.txt
+[?2004lwritten
+  26 /tmp/hull_init_new.txt
+  20 /tmp/hull_insert_new.txt
+  46 total
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/fix2.R << 'F2'
+[?2004l[?2004h> lines <- readLines("/app/ars.R")
+[?2004l[?2004h> ri <- grep("^hull_init <- function", lines)
+[?2004l[?2004h> ei <- ri + min(which(lines[(ri + 1):length(lines)] == "}"))
+[?2004l[?2004h> lines <- c(lines[seq_len(ri - 1)], readLines("/tmp/hull_init_new.txt"),
+[?2004l[?2004h>            lines[(ei + 1):length(lines)])
+[?2004l[?2004h> ri <- grep("^hull_insert <- function", lines)
+[?2004l[?2004h> ei <- ri + min(which(lines[(ri + 1):length(lines)] == "}"))
+[?2004l[?2004h> lines <- c(lines[seq_len(ri - 1)], readLines("/tmp/hull_insert_new.txt"),
+[?2004l[?2004h>            lines[(ei + 1):length(lines)])
+[?2004l[?2004h> i <- grep("a > 0\) a <- -Inf", lines, perl = TRUE); lines[i] <- ""
+[?2004l[?2004h> i <- grep("^  m / sum\(m\)", lines, perl = TRUE)
+[?2004l[?2004h> lines[i] <- c("  out <- m / sum(m)",
+[?2004l[?2004h>               "  cumsum(out)   # normalised CDF breakpoints of the envelope pieces")
+[?2004l[?2004h> i <- grep("probe <- probe\[probe > a & probe < b\]", lines, perl = TRUE)
+[?2004l[?2004h> lines[i] <- "  probe <- probe[is.finite(probe) & probe > a & probe < b]"
+[?2004l[?2004h> i <- grep("w  <- runif\(1\)", lines, perl = TRUE)
+[?2004l[?2004h> lines[i] <- "      w  <- runif(1); if (w <= 0) w <- .Machine$double.xmin"
+[?2004l[?2004h> writeLines(lines, "/app/ars.R")
+[?2004l[?2004h> cat("fixes applied, total lines:", length(lines), "\n")
+[?2004l[?2004h> F2
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/fix2.R
+[?2004lError: '\)' is an unrecognized escape in character string (<input>:1:18)
+Execution halted
+[?2004hroot@6186ec7db2df:/app# grep -cn "placeholder" /app/ars.R; grep -n "cumsum(out)" /app/ars.R; grep -n "is.finite(probe) & probe" /app/ars.R; grep -n "double.xmin" /app/ars.R
+[?2004l1
+[32m[K346[m[K[36m[K:[m[K  if (rv <= 0) rv <- .Machine$[01;31m[Kdouble.xmin[m[K
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/fix2.R << 'F2'
+[?2004l[?2004h> lines <- readLines("/app/ars.R")
+[?2004l[?2004h> ri <- grep("^hull_init <- function", lines)
+[?2004l[?2004h> ei <- ri + min(which(lines[(ri + 1):length(lines)] == "}"))
+[?2004l[?2004h> lines <- c(lines[seq_len(ri - 1)], readLines("/tmp/hull_init_new.txt"),
+[?2004l[?2004h>            lines[(ei + 1):length(lines)])
+[?2004l[?2004h> ri <- grep("^hull_insert <- function", lines)
+[?2004l[?2004h> ei <- ri + min(which(lines[(ri + 1):length(lines)] == "}"))
+[?2004l[?2004h> lines <- c(lines[seq_len(ri - 1)], readLines("/tmp/hull_insert_new.txt"),
+[?2004l[?2004h>            lines[(ei + 1):length(lines)])
+[?2004l[?2004h> i <- grep("a > 0[)] a <- -Inf", lines)
+[?2004l[?2004h> stopifnot(length(i) == 1); lines[i] <- ""
+[?2004l[?2004h> i <- grep("^  m / sum[(]m[)]", lines)
+[?2004l[?2004h> stopifnot(length(i) == 1)
+[?2004l[?2004h> lines[i] <- c("  out <- m / sum(m)",
+[?2004l[?2004h>               "  cumsum(out)   # normalised CDF breakpoints of the envelope pieces")
+[?2004l[?2004h> i <- grep("probe <- probe[[]probe > a & probe < b[]]", lines)
+[?2004l[?2004h> stopifnot(length(i) == 1)
+[?2004l[?2004h> lines[i] <- "  probe <- probe[is.finite(probe) & probe > a & probe < b]"
+[?2004l[?2004h> i <- grep("w  <- runif[(]1[)]", lines)
+[?2004l[?2004h> stopifnot(length(i) == 1)
+[?2004l[?2004h> lines[i] <- "      w  <- runif(1); if (w <= 0) w <- .Machine$double.xmin"
+[?2004l[?2004h> writeLines(lines, "/app/ars.R")
+[?2004l[?2004h> cat("fixes applied, total lines:", length(lines), "\n")
+[?2004l[?2004h> F2
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/fix2.R
+[?2004lWarning message:
+In lines[i] <- c("  out <- m / sum(m)", "  cumsum(out)   # normalised CDF breakpoints of the envelope pieces") :
+  number of items to replace is not a multiple of replacement length
+fixes applied, total lines: 436 
+[?2004hroot@6186ec7db2df:/app# grep -c "placeholder" /app/ars.R; grep -n "cumsum(out)" /app/ars.R; grep -n "is.finite(probe) & probe" /app/ars.R; grep -n "w <= 0" /app/ars.R
+[?2004l0
+[32m[K104[m[K[36m[K:[m[K  probe <- probe[[01;31m[Kis.finite(probe) & probe[m[K > a & probe < b]
+[32m[K391[m[K[36m[K:[m[K      w  <- runif(1); if ([01;31m[Kw <= 0[m[K) w <- .Machine$double.xmin
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'invisible(parse("/app/ars.R")); cat("parse OK\n")'
+[?2004lparse OK
+[?2004hroot@6186ec7db2df:/app# grep -n "m / sum" /app/ars.R; sed -n '/^hull_masses <- function/,/^}/p' /app/ars.R | tail -8
+[?2004l[32m[K282[m[K[36m[K:[m[K  out <- [01;31m[Km / sum[m[K(m)
+    if (w > 0) return(exp(ui * U - hi) * (1 - exp(-w)) / ui)
+    return(exp(ui * L - hi) * (1 - exp(w)) / (-ui))
+  }, numeric(1))
+  if (any(!is.finite(m)) || any(m < 0)) {
+    stop("internal numerical error while integrating the envelope", call. = FALSE)
+  }
+  out <- m / sum(m)
+}
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/fix3.R << 'F3'
+[?2004l[?2004h> lines <- readLines("/app/ars.R")
+[?2004l[?2004h> i <- grep("m / sum[(]m[)]", lines)
+[?2004l[?2004h> stopifnot(length(i) == 1)
+[?2004l[?2004h> lines[i:(i + 0)] <- ""
+[?2004l[?2004h> lines <- append(lines, after = i - 1, c(
+[?2004l[?2004h>   "  out <- m / sum(m)",
+[?2004l[?2004h>   "  cumsum(out)   # normalised CDF breakpoints of the envelope pieces"))
+[?2004l[?2004h> writeLines(lines, "/app/ars.R")
+[?2004l[?2004h> cat("patched, total lines:", length(lines), "\n")
+[?2004l[?2004h> F3
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/fix3.R; grep -n "cumsum(out)\|out <- m / sum" /app/ars.R
+[?2004lpatched, total lines: 438 
+[32m[K282[m[K[36m[K:[m[K  [01;31m[Kout <- m / sum[m[K(m)
+[32m[K283[m[K[36m[K:[m[K  [01;31m[Kcumsum(out)[m[K   # normalised CDF breakpoints of the envelope pieces
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'invisible(parse("/app/ars.R")); cat("parse OK\n")'
+[?2004lparse OK
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 3000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 3000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n"); g <- ars(function(z) dgamma(z, shape=2.5, rate=1), c(0, Inf), 2000); cat("gamma2.5: mean=", round(mean(g),4), " sd=", round(sd(g),4), " (target 2.5, 1.581)\n"); b <- ars(function(z) dbeta(z, 3, 2), c(0, 1), 2000); cat("beta(3,2): mean=", round(mean(b),4), " sd=", round(sd(b),4), " (target 0.6, 0.185)\n")' 2>&1
+[?2004lError in sort.int(x, na.last = na.last, decreasing = decreasing, ...) : 
+  'x' must be atomic
+Calls: ars ... hull_init -> pick_init -> sort -> sort.default -> sort.int
+Execution halted
+[?2004hroot@6186ec7db2df:/app# sed -n '/^pick_init <- function/,/^}/p' /app/ars.R
+[?2004lpick_init <- function(logd, a, b, user_pts) {
+  if (!is.null(user_pts)) return(sort(user_pts))
+  if (is.finite(a) && is.finite(b)) {
+    grid <- seq(a, b, length.out = 41)
+  } else if (is.finite(a)) {
+    step <- if (a == 0) 1 else abs(a)
+    grid <- a + step * c(0.1, 0.3, 1, 3, 10, 30, 100)
+  } else if (is.finite(b)) {
+    step <- if (b == 0) 1 else abs(b)
+    grid <- b - step * c(0.1, 0.3, 1, 3, 10, 30, 100)
+  } else {
+    grid <- seq(-5, 5, length.out = 21)   # unbounded on both sides
+  }
+  grid <- grid[grid > a & grid < b]
+  f0 <- logd(grid)
+  good <- grid[is.finite(f0)]
+  if (length(good) < 2) {
+    stop("could not find two points inside the domain with positive ",
+         "density; supply 'initial_points' explicitly", call. = FALSE)
+  }
+  # extend towards the tails a little for a better initial envelope
+  if (!is.finite(a) && min(good) == a) good <- c(a + 1e-8, good)
+  good
+}
+[?2004hroot@6186ec7db2df:/app# sed -i 's/v\["density_function"\]/v[["density_function"]]/; s/v\["a"\]/v[["a"]]/; s/v\["b"\]/v[["b"]]/; s/v\["initial_points"\]/v[["initial_points"]]/; s/v\["n"\]/v[["n"]]/' /app/ars.R
+[?2004l[?2004hroot@6186ec7db2df:/app# sed -n '/^ars <- function/,/^}/p' /app/ars.R
+[?2004lars <- function(density_function, domain, n = sample_count, initial_points = NULL) {
+  v <- ars_validate(density_function, domain, n, initial_points)
+  logd <- make_logd(v[["density_function"]], label = "density function")
+  hull <- hull_init(logd, v[["a"]], v[["b"]], v[["initial_points"]])
+  ars_sample(hull, logd, v[["n"]])
+}
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 3000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 3000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n")' 2>&1
+[?2004lError in FUN(X[[i]], ...) : argument "x" is missing, with no default
+Calls: ars -> hull_init -> vapply -> FUN
+Execution halted
+[?2004hroot@6186ec7db2df:/app# sed -i 's/u <- vapply(x, est_slope, numeric(1), a = a, b = b)/u <- vapply(x, function(xi) est_slope(logd, xi, a, b), numeric(1))/' /app/ars.R
+[?2004l[?2004hroot@6186ec7db2df:/app# grep -n "vapply(x, function" /app/ars.R
+[?2004l[32m[K291[m[K[36m[K:[m[K  u <- [01;31m[Kvapply(x, function[m[K(xi) est_slope(logd, xi, a, b), numeric(1))
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 3000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 3000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n")' 2>&1
+[?2004lError in findInterval(rv, hull["cdf"], rightmost.ok = TRUE) : 
+  unused argument (rightmost.ok = TRUE)
+Calls: ars -> ars_sample -> hull_draw
+Execution halted
+[?2004hroot@6186ec7db2df:/app# sed -i 's/findInterval(rv, hull\["cdf"\], rightmost.ok = TRUE)/findInterval(rv, hull["cdf"])/' /app/ars.R
+[?2004l[?2004hroot@6186ec7db2df:/app# grep -n "findInterval" /app/ars.R
+[?2004l[32m[K322[m[K[36m[K:[m[K  i <- max(1, [01;31m[KfindInterval[m[K(xv, hull["xst"]))
+[32m[K330[m[K[36m[K:[m[K  j <- [01;31m[KfindInterval[m[K(xv, x)
+[32m[K353[m[K[36m[K:[m[K  i <- min(length(hull["x"]), max(1, [01;31m[KfindInterval[m[K(rv, hull["cdf"])))
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 3000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 3000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n")' 2>&1
+[?2004lError in findInterval(rv, hull["cdf"]) : 
+  'list' object cannot be coerced to type 'double'
+Calls: ars -> ars_sample -> hull_draw -> findInterval
+Execution halted
+[?2004hroot@6186ec7db2df:/app# sed -i -E 's/hull\["([a-z]+)"\]/hull$\1/g' /app/ars.R
+[?2004l[?2004hroot@6186ec7db2df:/app# sed -n '/^hull_draw <- function/,/^}/p' /app/ars.R; sed -n '/hull_insert <- function/,/^}/p' /app/ars.R | head -6
+[?2004lhull_draw <- function(hull) {
+  rv <- runif(1)
+  if (rv <= 0) rv <- .Machine$double.xmin
+  i <- min(length(hull$x), max(1, findInterval(rv, hull$cdf)))
+  hull_piece_draw(hull$xst[i], hull$xst[i + 1], hull$x[i],
+                  hull$h[i], hull$u[i], rv)
+}
+hull_insert <- function(hull, xv, hv, uv) {
+  x <- hull$x; k <- length(x)
+  j <- which.min(abs(x - xv))
+  if (abs(xv - x[j]) <= 1e-10 * (1 + abs(x[j]))) return(hull)  # already close
+  if (!is.finite(uv)) return(hull)                             # cannot adapt
+  # the derivative of a concave f must be non-increasing in x
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 3000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 3000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n")' 2>&1
+[?2004lError: log-concavity check failed while adapting: the estimated slopes are not monotonically decreasing -- the target density does not appear to be log-concave on the domain
+Execution halted
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/dbg1.R << 'D1'
+[?2004l[?2004h> suppressMessages(source("/app/ars.R"))
+[?2004l[?2004h> orig <- get("hull_insert", globalenv())
+[?2004l[?2004h> assign("hull_insert", function(hull, xv, hv, uv) {
+[?2004l[?2004h>   tryCatch(orig(hull, xv, hv, uv),
+[?2004l[?2004h>            error = function(e) {
+[?2004l[?2004h>              cat("FAIL: xv=", xv, " hv=", hv, " uv=", uv, "\n")
+[?2004l[?2004h>              cat("x =", format(hull$x, digits = 4), "\n")
+[?2004l[?2004h>              cat("u =", format(hull$u, digits = 5), "\n")
+[?2004l[?2004h>              stop(e)
+[?2004l[?2004h>            })
+[?2004l[?2004h> }, envir = globalenv())
+[?2004l[?2004h> set.seed(1)
+[?2004l[?2004h> x <- ars(dnorm, c(-Inf, Inf), 3000)
+[?2004l[?2004h> cat("done, mean=", mean(x), "\n")
+[?2004l[?2004h> D1
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/dbg1.R 2>&1 | tail -8
+[?2004lFAIL: xv= -0.4635733  hv= -1.026389  uv= 0.4635733 
+x = -5.0 -4.5 -4.0 -3.5 -3.0 -2.5 -2.0 -1.5 -1.0 -0.5  0.0  0.5  1.0  1.5  2.0  2.5  3.0  3.5  4.0  4.5  5.0 
+u =  5.0  4.5  4.0  3.5  3.0  2.5  2.0  1.5  1.0  0.5  0.0 -0.5 -1.0 -1.5 -2.0 -2.5 -3.0 -3.5 -4.0 -4.5 -5.0 
+Error: log-concavity check failed while adapting: the estimated slopes are not monotonically decreasing -- the target density does not appear to be log-concave on the domain
+Execution halted
+[?2004hroot@6186ec7db2df:/app# sed -i 's/ok <- if (j == 1) uv <= hull\$u\[2\] + 1e-5/ok <- if (j == 1) uv >= hull$u[2] - 1e-5/; s/else if (j == k) uv >= hull\$u\[k - 1\] - 1e-5/else if (j == k) uv <= hull$u[k - 1] + 1e-5/; s/else hull\$u\[j - 1\] - 1e-5 <= uv && uv <= hull\$u\[j + 1\] + 1e-5/else uv <= hull$u[j - 1] + 1e-5 \&\& uv >= hull$u[j + 1] - 1e-5/' /app/ars.R
+[?2004l[?2004hroot@6186ec7db2df:/app# sed -n '/# the derivative of a concave f/,/if (!ok)/p' /app/ars.R
+[?2004l  # the derivative of a concave f must be non-increasing in x
+  ok <- if (j == 1) uv >= hull$u[2] - 1e-5
+        else if (j == k) uv <= hull$u[k - 1] + 1e-5
+        else uv <= hull$u[j - 1] + 1e-5 && uv >= hull$u[j + 1] - 1e-5
+  if (!ok) {
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 3000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 3000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n")' 2>&1
+[?2004lnormal: n= 3000  mean= -0.1244  sd= 1.0652 
+exponential: mean= 7.4932  sd= 0.9766  min= 6.5001 
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/hull_masses_new.txt << 'HM'
+[?2004l[?2004h> hull_masses <- function(x, h, u, xst) {
+[?2004l[?2004h>   k <- length(x)
+[?2004l[?2004h>   ci <- h - u * x          # intercept of each supporting tangent line
+[?2004l[?2004h>   L <- xst[-(k + 1)]; U <- xst[-1]
+[?2004l[?2004h>   ex <- numeric(0)
+[?2004l[?2004h>   for (i in seq_len(k)) {
+[?2004l[?2004h>     if (is.finite(L[i])) ex <- c(ex, u[i] * L[i] + ci[i])
+[?2004l[?2004h>     if (is.finite(U[i])) ex <- c(ex, u[i] * U[i] + ci[i])
+[?2004l[?2004h>   }
+[?2004l[?2004h>   C <- max(ex)            # exponent centering for numerical safety
+[?2004l[?2004h>   m <- vapply(seq_len(k), function(i) {
+[?2004l[?2004h>     L <- xst[i]; U <- xst[i + 1]; ui <- u[i]; ei <- ci[i] - C
+[?2004l[?2004h>     if (is.infinite(L) && L < 0) {
+[?2004l[?2004h>       if (!(ui > 0)) stop("envelope has infinite mass at the left tail: the ",
+[?2004l[?2004h>                           "first tangent slope must be positive (bad domain ",
+[?2004l[?2004h>                           "choice, or a non-log-concave / improper density)",
+[?2004l[?2004h>                           call. = FALSE)
+[?2004l[?2004h>       return(exp(ui * U + ei) / ui)
+[?2004l[?2004h>     }
+[?2004l[?2004h>     if (is.infinite(U) && U > 0) {
+[?2004l[?2004h>       if (!(ui < 0)) stop("envelope has infinite mass at the right tail: the ",
+[?2004l[?2004h>                           "last tangent slope must be negative (bad domain ",
+[?2004l[?2004h>                           "choice, or a non-log-concave / improper density)",
+[?2004l[?2004h>                           call. = FALSE)
+[?2004l[?2004h>       return(exp(ui * L + ei) / (-ui))
+[?2004l[?2004h>     }
+[?2004l[?2004h>     w <- ui * (U - L)
+[?2004l[?2004h>     if (abs(w) < 1e-8) return((U - L) * exp(ui * L + ei))
+[?2004l[?2004h>     if (w > 0) return(exp(ui * U + ei) * (1 - exp(-w)) / ui)
+[?2004l[?2004h>     return(exp(ui * L + ei) * (1 - exp(w)) / (-ui))
+[?2004l[?2004h>   }, numeric(1))
+[?2004l[?2004h>   if (any(!is.finite(m)) || any(m < 0)) {
+[?2004l[?2004h>     stop("internal numerical error while integrating the envelope", call. = FALSE)
+[?2004l[?2004h>   }
+[?2004l[?2004h>   out <- m / sum(m)
+[?2004l[?2004h>   cumsum(out)   # normalised CDF breakpoints of the envelope pieces
+[?2004l[?2004h> }
+[?2004l[?2004h> HM
+[?2004l[?2004hroot@6186ec7db2df:/app# cat > /tmp/fix4.R << 'F4'
+[?2004l[?2004h> lines <- readLines("/app/ars.R")
+[?2004l[?2004h> ri <- grep("^hull_masses <- function", lines)
+[?2004l[?2004h> ei <- ri + min(which(lines[(ri + 1):length(lines)] == "}"))
+[?2004l[?2004h> lines <- c(lines[seq_len(ri - 1)], readLines("/tmp/hull_masses_new.txt"),
+[?2004l[?2004h>            lines[(ei + 1):length(lines)])
+[?2004l[?2004h> i <- grep("max\(1, findInterval\(rv, hull\\$cdf\)\)", lines)
+[?2004l[?2004h> stopifnot(length(i) == 1)
+[?2004l[?2004h> lines[i] <- "  i <- min(length(hull$x), max(1, findInterval(rv, hull$cdf) + 1))"
+[?2004l[?2004h> writeLines(lines, "/app/ars.R")
+[?2004l[?2004h> cat("ok, total lines:", length(lines), "\n")
+[?2004l[?2004h> F4
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/fix4.R
+[?2004lError: '\(' is an unrecognized escape in character string (<input>:1:16)
+Execution halted
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 5000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 5000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n")' 2>&1
+[?2004lnormal: n= 5000  mean= -0.1057  sd= 1.0488 
+exponential: mean= 7.4899  sd= 0.9855  min= 6.5003 
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/fix4.R << 'F4'
+[?2004l[?2004h> lines <- readLines("/app/ars.R")
+[?2004l[?2004h> ri <- grep("^hull_masses <- function", lines)
+[?2004l[?2004h> ei <- ri + min(which(lines[(ri + 1):length(lines)] == "}"))
+[?2004l[?2004h> lines <- c(lines[seq_len(ri - 1)], readLines("/tmp/hull_masses_new.txt"),
+[?2004l[?2004h>            lines[(ei + 1):length(lines)])
+[?2004l[?2004h> i <- grep("findInterval[(]rv, hull.cdf[)][)]", lines)
+[?2004l[?2004h> stopifnot(length(i) == 1)
+[?2004l[?2004h> lines[i] <- "  i <- min(length(hull$x), max(1, findInterval(rv, hull$cdf) + 1))"
+[?2004l[?2004h> writeLines(lines, "/app/ars.R")
+[?2004l[?2004h> cat("ok, total lines:", length(lines), "\n")
+[?2004l[?2004h> F4
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/fix4.R
+[?2004lok, total lines: 438 
+[?2004hroot@6186ec7db2df:/app# grep -n "hull.cdf" /app/ars.R | head; grep -n "ci <- h - u" /app/ars.R
+[?2004l353:  i <- min(length(hull$x), max(1, findInterval(rv, hull$cdf) + 1))
+[32m[K251[m[K[36m[K:[m[K  [01;31m[Kci <- h - u[m[K * x          # intercept of each supporting tangent line
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 5000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 5000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n")' 2>&1
+[?2004lnormal: n= 5000  mean= 0.0114  sd= 1.0725 
+exponential: mean= 1.2763  sd= 1.5401  min= 0 
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/dbg2.R << 'D2'
+[?2004l[?2004h> suppressMessages(source("/app/ars.R"))
+[?2004l[?2004h> logd <- make_logd(dexp)
+[?2004l[?2004h> sys <- NULL
+[?2004l[?2004h> # manually build hull the way ars does
+[?2004l[?2004h> pts <- pick_init(logd, 0, Inf, NULL)
+[?2004l[?2004h> h <- logd(pts); u <- vapply(pts, function(xi) est_slope(logd, xi, 0, Inf), numeric(1))
+[?2004l[?2004h> cat("init pts:", pts, "\n")
+[?2004l[?2004h> cat("h:", h, "\n")
+[?2004l[?2004h> cat("u:", format(u, digits = 6), "\n")
+[?2004l[?2004h> hull <- new_hull(pts, h, u, 0, Inf)
+[?2004l[?2004h> cat("xst:", hull$xst, "\n")
+[?2004l[?2004h> cat("cdf:", format(hull$cdf, digits = 6), "\n")
+[?2004l[?2004h> cat("ci = h - u*x:", format(h - u * pts, digits = 8), "\n")
+[?2004l[?2004h> set.seed(1)
+[?2004l[?2004h> s <- ars(dexp, c(0, Inf), 20000)
+[?2004l[?2004h> brks <- c(0, 0.5, 1, 2, 3, 5, 8, 15, 35, 200)
+[?2004l[?2004h> t <- hist(s, breaks = brks, plot = FALSE)
+[?2004l[?2004h> cat("hist counts:", t$counts, "\n")
+[?2004l[?2004h> cat("mean=", round(mean(s), 4), " sd=", round(sd(s), 4), "\n")
+[?2004l[?2004h> D2
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/dbg2.R 2>&1
+[?2004linit pts: 0.1 0.3 1 3 10 30 100 
+h: -0.1 -0.3 -1 -3 -10 -30 -100 
+u: -1 -1 -1 -1 -1 -1 -1 
+xst: 0 0.1 0.2 0.65 2 6.5 20 Inf 
+cdf: 0.0951626 0.1812692 0.4779542 0.8646647 0.9984966 1.0000000 1.0000000 
+ci = h - u*x: -3.6264047e-13  3.0003777e-13 -8.2518437e-12 -2.4755309e-11 -8.2518881e-11  4.8501647e-11  9.5117514e-10 
+hist counts: 9676 0 7579 0 1950 766 23 6 0 
+mean= 1.2778  sd= 1.5621 
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/hull_draw_new.txt << 'HD'
+[?2004l[?2004h> hull_draw <- function(hull) {
+[?2004l[?2004h>   rv <- runif(1)
+[?2004l[?2004h>   if (rv <= 0) rv <- .Machine$double.xmin
+[?2004l[?2004h>   i <- findInterval(rv, hull$cdf) + 1     # bin (cdf[i-1], cdf[i]]
+[?2004l[?2004h>   i <- max(1, min(length(hull$x), i))
+[?2004l[?2004h>   lo <- if (i > 1) hull$cdf[i - 1] else 0  # rescale to within-piece uniform
+[?2004l[?2004h>   hi <- hull$cdf[i]
+[?2004l[?2004h>   rv_loc <- (rv - lo) / (hi - lo)
+[?2004l[?2004h>   if (rv_loc <= 0) rv_loc <- .Machine$double.xmin
+[?2004l[?2004h>   if (rv_loc >= 1) rv_loc <- 1 - .Machine$double.eps
+[?2004l[?2004h>   hull_piece_draw(hull$xst[i], hull$xst[i + 1], hull$x[i], hull$h[i], hull$u[i], rv_loc)
+[?2004l[?2004h> }
+[?2004l[?2004h> HD
+[?2004l[?2004hroot@6186ec7db2df:/app# cat > /tmp/fix5.R << 'F5'
+[?2004l[?2004h> lines <- readLines("/app/ars.R")
+[?2004l[?2004h> ri <- grep("^hull_draw <- function", lines)
+[?2004l[?2004h> ei <- ri + min(which(lines[(ri + 1):length(lines)] == "}"))
+[?2004l[?2004h> lines <- c(lines[seq_len(ri - 1)], readLines("/tmp/hull_draw_new.txt"),
+[?2004l[?2004h>            lines[(ei + 1):length(lines)])
+[?2004l[?2004h> writeLines(lines, "/app/ars.R")
+[?2004l[?2004h> cat("ok, total lines:", length(lines), "\n")
+[?2004l[?2004h> F5
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/fix5.R
+[?2004lok, total lines: 443 
+[?2004hroot@6186ec7db2df:/app# Rscript -e 'source("/app/ars.R"); set.seed(1); x <- ars(dnorm, c(-Inf, Inf), 5000); cat("normal: n=", length(x), " mean=", round(mean(x),4), " sd=", round(sd(x),4), "\n"); y <- ars(dexp, c(0, Inf), 5000); cat("exponential: mean=", round(mean(y),4), " sd=", round(sd(y),4), " min=", round(min(y),4), "\n"); g <- ars(function(z) dgamma(z, shape=2.5, rate=1), c(0, Inf), 3000); cat("gamma2.5: mean=", round(mean(g),4), " sd=", round(sd(g),4), " (target mean 2.5 sd 1.581)\n"); b <- ars(function(z) dbeta(z, 3, 2), c(0, 1), 3000); cat("beta(3,2): mean=", round(mean(b),4), " sd=", round(sd(b),4), " (target 0.6, 0.1854)\n")' 2>&1
+[?2004lnormal: n= 5000  mean= -0.0049  sd= 1.0289 
+exponential: mean= 0.9898  sd= 0.9856  min= 3e-04 
+gamma2.5: mean= 2.4629  sd= 1.5613  (target mean 2.5 sd 1.581)
+beta(3,2): mean= 0.5952  sd= 0.1975  (target 0.6, 0.1854)
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/dbg3.R << 'D3'
+[?2004l[?2004h> suppressMessages(source("/app/ars.R"))
+[?2004l[?2004h> chk <- function(label, expr, expect_error = TRUE, pattern = NULL) {
+[?2004l[?2004h>   err <- tryCatch({ r <- expr; if (expect_error) "NO ERROR (bad)" else r },
+[?2004l[?2004h>                   error = function(e) conditionMessage(e))
+[?2004l[?2004h>   if (expect_error) {
+[?2004l[?2004h>     good <- !identical(err, "NO ERROR (bad)") &&
+[?2004l[?2004h>             (is.null(pattern) || grepl(pattern, err, ignore.case = TRUE))
+[?2004l[?2004h>     cat(sprintf("%s: %s | %s\n", label, if (good) "OK" else "PROBLEM",
+[?2004l[?2004h>                 substr(if (is.character(err)) err, "NO ERROR", 120)))
+[?2004l[?2004h>   } else if (is.character(err)) cat(label, ": UNEXPECTED ERROR ->", err, "\n")
+[?2004l[?2004h>   else cat(label, ": OK ->", paste(round(err, 4), collapse = ", "), "\n")
+[?2004l[?2004h> }
+[?2004l[?2004h> set.seed(42)
+[?2004l[?2004h> bimodal <- function(x) 0.5 * dnorm(x, mean = -2) + 0.5 * dnorm(x, mean = 2)
+[?2004l[?2004h> chk("bimodal mixture (expect concavity error)", ars(bimodal, c(-6, 6), 100), TRUE, "concav")
+[?2004l[?2004h> chk("cauchy (expect concavity error)", ars(dcauchy, c(-10, 10), 2000), TRUE, "concav")
+[?2004l[?2004h> chk("n = -5 (expect error)", ars(dnorm, c(-Inf, Inf), n = -5), TRUE)
+[?2004l[?2004h> chk("n = 12.5 (expect error)", ars(dnorm, c(-Inf, Inf), n = 12.5), TRUE)
+[?2004l[?2004h> chk("n = 'ten' (expect error)", ars(dnorm, c(-Inf, Inf), n = "ten"), TRUE)
+[?2004l[?2004h> chk("bad domain (1, -1) (expect error)", ars(dnorm, c(1, -1), 10), TRUE)
+[?2004l[?2004h> chk("short domain (expect error)", ars(dnorm, c(-1), 10), TRUE)
+[?2004l[?2004h> chk("character density (expect error)", ars("dnorm", c(-Inf, Inf), 10), TRUE, "function")
+[?2004l[?2004h> chk("negative density (expect error)", ars(function(x) -dnorm(x), c(-Inf, Inf), 10), TRUE, "non-negative")
+[?2004l[?2004h> chk("erroring density (expect error)", ars(function(x) stop("boom"), c(-Inf, Inf), 10), TRUE)
+[?2004l[?2004h> chk("unnormalized 37*dnorm (3,0.5), domain (-Inf,10)", {
+[?2004l[?2004h>   s <- ars(function(z) 37 * dnorm(z, 3, 0.5), c(-Inf, 10), 2000); c(mean(s), sd(s))
+[?2004l[?2004h> }, FALSE)
+[?2004l[?2004h> chk("user initial points c(0.5,1.5) normal on (-Inf,Inf)", c(mean(
+[?2004l[?2004h>   ars(dnorm, c(-Inf, Inf), 2000, initial_points = c(0.5, 1.5)), sd(
+[?2004l[?2004h>   ars(dnorm, c(-Inf, Inf), 1, initial_points = c(0.5, 1.5)))), TRUE, "concav")
+[?2004l[?2004h> chk("expression input dnorm(x)", mean(ars(expression(dnorm(x)), c(-Inf, Inf), 2000)[1:2]), FALSE)
+[?2004l[?2004h> chk("default n = sample_count", length(ars(dnorm, c(-Inf, Inf))) == sample_count, FALSE)
+[?2004l[?2004h> chk("n=1 works", length(ars(dexp, c(0, Inf), 1)), FALSE)
+[?2004l[?2004h> D3
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/dbg3.R 2>&1
+[?2004lbimodal mixture (expect concavity error): PROBLEM | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+cauchy (expect concavity error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+n = -5 (expect error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+n = 12.5 (expect error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+n = 'ten' (expect error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+bad domain (1, -1) (expect error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+short domain (expect error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+character density (expect error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+negative density (expect error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+erroring density (expect error): OK | NA
+Warning message:
+In substr(if (is.character(err)) err, "NO ERROR", 120) :
+  NAs introduced by coercion
+unnormalized 37*dnorm (3,0.5), domain (-Inf,10) : UNEXPECTED ERROR -> log-concavity check failed: a tangent intersection lies outside the interval it must bound -- the target density does not appear to be log-concave on the domain 
+Error: unexpected symbol in:
+"  ars(dnorm, c(-Inf, Inf), 1, initial_points = c(0.5, 1.5)))), TRUE, "concav")
+chk"
+Execution halted
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/dbg4.R << 'D4'
+[?2004l[?2004h> suppressMessages(source("/app/ars.R"))
+[?2004l[?2004h> set.seed(42)
+[?2004l[?2004h> runc <- function(label, expr) {
+[?2004l[?2004h>   err <- tryCatch({ r <- expr; paste("RESULT:", paste(round(r, 4), collapse = ", ")) },
+[?2004l[?2004h>                   error = function(e) paste("ERROR:", conditionMessage(e)))
+[?2004l[?2004h>   cat("==", label, "\n  ", err, "\n", sep = "")
+[?2004l[?2004h> }
+[?2004l[?2004h> bimodal <- function(x) 0.5 * dnorm(x, mean = -2) + 0.5 * dnorm(x, mean = 2)
+[?2004l[?2004h> runc("bimodal (-6,6) n=100", ars(bimodal, c(-6, 6), 100))
+[?2004l[?2004h> runc("cauchy (-10,10) n=2000", ars(dcauchy, c(-10, 10), 2000))
+[?2004l[?2004h> runc("37*dnorm(3,0.5) on (-Inf,10) n=2000", ars(function(z) 37 * dnorm(z, 3, 0.5), c(-Inf, 10), 2000))
+[?2004l[?2004h> runc("dnorm(3,0.5) unnormalized on (-Inf, 60) n=1000", ars(function(z) 37 * dnorm(z, 3, 0.5), c(-Inf, 60), 1000))
+[?2004l[?2004h> runc("user init pts c(0.5,1.5) normal n=2000", { s <- ars(dnorm, c(-Inf, Inf), 2000, initial_points = c(0.5, 1.5)); c(mean(s), sd(s)) })
+[?2004l[?2004h> runc("expression input", { s <- ars(expression(dnorm(x)), c(-Inf, Inf), 2000); c(mean(s), sd(s)) })
+[?2004l[?2004h> D4
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/dbg4.R 2>&1
+[?2004l==bimodal (-6,6) n=100
+  RESULT: 2.961, -1.8391, 1.4564, 1.9534, 1.5421, -0.6752, 3.1335, -0.6163, 3.7183, -0.436, 2.8815, 4.0162, -2.9849, -1.2616, -0.8048, 1.9582, -1.2751, -4.4169, -4.1846, 2.8997, -1.3282, -0.9465, 2.768, 3.5773, -1.5908, -1.203, -3.4179, 1.6549, -1.9575, 1.6462, 2.0679, 2.5396, -1.9119, 1.7386, -3.3649, -2.1844, -2.2789, -4.1569, 0.3198, 1.0607, -1.4545, 2.1491, -2.099, -2.9547, 1.6002, 3.0544, -1.5876, 1.9961, 1.3672, -2.1736, 1.971, 0.6281, 1.2507, 2.0265, 0.6285, -4.7787, 1.2716, -1.4608, 0.9976, 1.8703, 2.993, -2.0911, 2.8738, 1.3929, 2.5388, 2.3774, 2.0897, -2.5447, -0.5922, 1.9407, -2.4232, -1.7947, 1.8689, 2.1611, 1.6601, -2.3265, -2.6209, 3.1324, 1.203, 0.6218, -0.7458, -2.7429, 1.9213, -1.0912, -0.9847, 2.3947, 2.2414, 2.9836, -1.6735, 1.9824, 2.9823, -2.6355, -2.2902, -2.6629, -3.067, 0.5803, 1.9868, 2.7451, 2.5474, -2.4915
+==cauchy (-10,10) n=2000
+  ERROR: log-concavity check failed: evaluated log density falls below the secant lower hull -- the target density does not appear to be log-concave on the domain
+==37*dnorm(3,0.5) on (-Inf,10) n=2000
+  ERROR: log-concavity check failed: a tangent intersection lies outside the interval it must bound -- the target density does not appear to be log-concave on the domain
+==dnorm(3,0.5) unnormalized on (-Inf, 60) n=1000
+  ERROR: could not find two points inside the domain with positive density; supply 'initial_points' explicitly
+==user init pts c(0.5,1.5) normal n=2000
+  RESULT: -0.0175, 0.9966
+==expression input
+  RESULT: -0.0294, 1.021
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/dbg5.R << 'D5'
+[?2004l[?2004h> suppressMessages(source("/app/ars.R"))
+[?2004l[?2004h> bimodal <- function(x) 0.5 * dnorm(x, -2) + 0.5 * dnorm(x, 2)
+[?2004l[?2004h> logd <- make_logd(bimodal)
+[?2004l[?2004h> x <- seq(-6, 6, 41)
+[?2004l[?2004h> h <- logd(x)
+[?2004l[?2004h> u <- vapply(x, function(xi) est_slope(logd, xi, -6, 6), numeric(1))
+[?2004l[?2004h> cat("f(0)=", h[21], " u(0)=", u[21], " u(0.3)=", u[22], "\n")
+[?2004l[?2004h> cat("c = h - u*x for pairs around 0:", format(h[c(20, 21, 22)] - u[c(20, 21, 22)] * x[c(20, 21, 22)], digits = 5), "\n")
+[?2004l[?2004h> for (i in 17:25) {
+[?2004l[?2004h>   t <- tryCatch(hull_tangency(x[i], h[i], u[i], x[i + 1], h[i + 1], u[i + 1]),
+[?2004l[?2004h>                 error = function(e) paste("ERR:", conditionMessage(e)[1]))
+[?2004l[?2004h>   cat(sprintf("pair (%.2f, %.2f): u=(%.4f, %.4f) t=%s %s\n", x[i], x[i + 1], u[i], u[i + 1],
+[?2004l[?2004h>               format(t, digits = 4), if (is.numeric(t) && (t < x[i] || t > x[i + 1])) "<-- OUTSIDE" else ""))
+[?2004l[?2004h> }
+[?2004l[?2004h> D5
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/dbg5.R 2>&1
+[?2004lf(0)= NA  u(0)= NA  u(0.3)= NA 
+c = h - u*x for pairs around 0: NA NA NA 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+pair (NA, NA): u=(NA, NA) t=ERR: missing value where TRUE/FALSE needed 
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/dbg6.R << 'D6'
+[?2004l[?2004h> suppressMessages(source("/app/ars.R"))
+[?2004l[?2004h> bimodal <- function(x) 0.5 * dnorm(x, -2) + 0.5 * dnorm(x, 2)
+[?2004l[?2004h> cat("scalar: ", bimodal(0), "\n")
+[?2004l[?2004h> cat("vector: ", head(bimodal(seq(-6, 6, 41))), "\n")
+[?2004l[?2004h> logd <- make_logd(bimodal)
+[?2004l[?2004h> cat("logd(0): ", logd(0), "\n")
+[?2004l[?2004h> x <- seq(-6, 6, 41)
+[?2004l[?2004h> h <- logd(x)
+[?2004l[?2004h> cat("length h:", length(h), " any NA:", any(is.na(h)), "\n")
+[?2004l[?2004h> cat("h[19:23]: ", h[19:23], "\n")
+[?2004l[?2004h> cat("x[19:23]: ", x[19:23], "\n")
+[?2004l[?2004h> D6
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/dbg6.R 2>&1
+[?2004lscalar:  0.05399097 
+vector:  6.691511e-05 
+logd(0):  -2.918939 
+length h: 1  any NA: FALSE 
+h[19:23]:  NA NA NA NA NA 
+x[19:23]:  NA NA NA NA NA 
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/dbg7.R << 'D7'
+[?2004l[?2004h> suppressMessages(source("/app/ars.R"))
+[?2004l[?2004h> bimodal <- function(x) 0.5 * dnorm(x, -2) + 0.5 * dnorm(x, 2)
+[?2004l[?2004h> logd <- make_logd(bimodal)
+[?2004l[?2004h> x <- seq(-6, 6, length.out = 41)
+[?2004l[?2004h> h <- logd(x)
+[?2004l[?2004h> u <- vapply(x, function(xi) est_slope(logd, xi, -6, 6), numeric(1))
+[?2004l[?2004h> cat("f(0)=", h[21], " u(0)=", u[21], " u(0.3)=", u[22], " u(-0.3)=", u[20], "\n")
+[?2004l[?2004h> n_bad <- 0
+[?2004l[?2004h> for (i in 1:40) {
+[?2004l[?2004h>   t <- tryCatch(hull_tangency(x[i], h[i], u[i], x[i + 1], h[i + 1], u[i + 1]),
+[?2004l[?2004h>                 error = function(e) paste("ERR", conditionMessage(e)[1]))
+[?2004l[?2004h>   bad <- is.numeric(t) && (t < x[i] - 1e-7 || t > x[i + 1] + 1e-7)
+[?2004l[?2004h>   if (bad || !is.numeric(t)) {
+[?2004l[?2004h>     n_bad <- n_bad + 1
+[?2004l[?2004h>     if (n_bad <= 8) cat(sprintf("pair (%.2f, %.2f): h=(%.4f, %.4f) u=(%.4f, %.4f) t=%s %s\n",
+[?2004l[?2004h>                      x[i], x[i + 1], h[i], h[i + 1], u[i], u[i + 1], format(t, digits = 4),
+[?2004l[?2004h>                      if (bad) "<-- OUTSIDE" else "<-- ERR"))
+[?2004l[?2004h>   }
+[?2004l[?2004h> }
+[?2004l[?2004h> cat("total bad pairs:", n_bad, "of 40\n")
+[?2004l[?2004h> D7
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/dbg7.R 2>&1
+[?2004lf(0)= -2.918939  u(0)= 0  u(0.3)= 0.7740991  u(-0.3)= -0.7740991 
+total bad pairs: 0 of 40
+[?2004hroot@6186ec7db2df:/app# cat > /tmp/est_slope_new.txt << 'ES'
+[?2004l[?2004h> # First-difference (forward) estimate of the derivative of f = log(density).
+[?2004l[?2004h> # A forward difference equals the average slope over [x, x+delta], which stays
+[?2004l[?2004h> # (approximately) monotone non-increasing for a smooth concave f, unlike the
+[?2004l[?2004h> # central difference whose error is O(h^2) * f''''-ish and can flip signs in
+[?2004l[?2004h> # flat regions.  One-sided variants are used near the domain bounds or when
+[?2004l[?2004h> # the density vanishes outside one side.
+[?2004l[?2004h> est_slope <- function(logd, x, a, b) {
+[?2004l[?2004h>   h  <- max(6e-6 * max(1, abs(x)), 1e-12)
+[?2004l[?2004h>   f0 <- logd(x)
+[?2004l[?2004h>   if (is.finite(f0)) {
+[?2004l[?2004h>     xr2 <- x + 2 * h
+[?2004l[?2004h>     if (xr2 < b && is.finite(xr2)) {
+[?2004l[?2004h>       f1 <- logd(x + h); f2 <- logd(xr2)
+[?2004l[?2004h>       if (is.finite(f1) && is.finite(f2)) return(as.numeric(f1 - f2))  # (f2 - f1)/h: slope of [x+h, x+2h]
+[?2004l[?2004h>       if (is.finite(f1))                 return(as.numeric((f1 - f0) / h))
+[?2004l[?2004h>     }
+[?2004l[?2004h>     xl2 <- x - 2 * h
+[?2004l[?2004h>     if (xl2 > a && is.finite(xl2)) {
+[?2004l[?2004h>       f1 <- logd(x - h); f2 <- logd(xl2)
+[?2004l[?2004h>       if (is.finite(f1) && is.finite(f2)) return(as.numeric(f2 - f1))  # (f1 - f2)/h: slope of [x-2h, x-h]
+[?2004l[?2004h>       if (is.finite(f1))                 return(as.numeric((f0 - f1) / h))
+[?2004l[?2004h>     }
+[?2004l[?2004h>   }
+[?2004l[?2004h>   NA_real_
+[?2004l[?2004h> }
+[?2004l[?2004h> ES
+[?2004l[?2004hroot@6186ec7db2df:/app# true
+[?2004l[?2004hroot@6186ec7db2df:/app# cat > /tmp/fix6.R << 'F6'
+[?2004l[?2004h> replace_block <- function(lines, start_pattern, new_text) {
+[?2004l[?2004h>   s <- grep(start_pattern, lines)
+[?2004l[?2004h>   stopifnot(length(s) == 1)
+[?2004l[?2004h>   e <- s[1] + min(which(lines[(s[1] + 1):length(lines)] == "}"))
+[?2004l[?2004h>   c(lines[seq_len(s[1] - 1)], new_text, lines[(e + 1):length(lines)])
+[?2004l[?2004h> }
+[?2004l[?2004h> lines <- readLines("/app/ars.R")
+[?2004l[?2004h> lines <- replace_block(lines, "^est_slope <- function", readLines("/tmp/est_slope_new.txt"))
+[?2004l[?2004h> i <- grep("grid <- seq\(a, b, length.out = 41\)", lines)
+[?2004l[?2004h> stopifnot(length(i) == 1)
+[?2004l[?2004h> lines[i] <- "    grid <- c(a, seq(a, b, length.out = 41), b)"
+[?2004l[?2004h> i <- grep("+ 1e-5$", lines)
+[?2004l[?2004h> stopifnot(length(i) == 3)
+[?2004l[?2004h> lines[i] <- gsub("+ 1e-5$", "+ 1e-3", lines[i])
+[?2004l[?2004h> i2 <- grep("- 1e-5$", lines)
+[?2004l[?2004h> stopifnot(length(i2) == 3)
+[?2004l[?2004h> lines[i2] <- gsub("- 1e-5$", "- 1e-3", lines[i2])
+[?2004l[?2004h> writeLines(lines, "/app/ars.R")
+[?2004l[?2004h> cat("fix6 ok,", length(lines), "lines\n")
+[?2004l[?2004h> F6
+[?2004l[?2004hroot@6186ec7db2df:/app# Rscript /tmp/fix6.R
+[?2004lError: '\(' is an unrecognized escape in character string (<input>:1:24)
+Execution halted
+[?2004hroot@6186ec7db2df:/app# 

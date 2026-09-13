@@ -1,0 +1,1941 @@
+[?2004hroot@7846d2fb431e:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@7846d2fb431e:/app# clear
+[?2004l[H[J[3J[?2004hroot@7846d2fb431e:/app# ls -la /app
+[?2004ltotal 8
+drwxr-xr-x 1 root root   35 Sep 13  2025 .
+drwxr-xr-x 1 root root  102 Sep  7 05:39 ..
+-rw-r--r-- 1 root root 3112 Sep 13  2025 eval.py
+-rw-r--r-- 1 root root 1254 Sep 13  2025 model_ref.xml
+[?2004hroot@7846d2fb431e:/app# cat /app/eval.py
+[?2004limport time
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+total_sim_time = 2.0
+atol = 1e-5  # absolute tolerance for state comparison
+pctg = 0.6  # target percentage of reference model time
+n_runs = 20  # number of runs to average timing
+model_path = Path("model.xml")
+model_ref_path = Path("model_ref.xml")
+
+
+def test_correctness():
+    """Compare final states of models with potentially different timesteps"""
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    model_ref = mujoco.MjModel.from_xml_path(str(model_ref_path))
+
+    seed = np.random.randint(0, 10000)
+    final_state = simulate_model(model, seed)
+    final_state_ref = simulate_model(model_ref, seed)
+
+    # compare final states
+    state_diff = np.linalg.norm(final_state - final_state_ref)
+    print(f"Final state difference: {state_diff:.4f}")
+
+    assert np.allclose(final_state, final_state_ref, atol=atol), (
+        f"Final states differ by {state_diff}, exceeding tolerance {atol}"
+    )
+
+
+def simulate_model(model, seed):
+    """Simulate model with randomized initial qpos and return only the final state"""
+    data = mujoco.MjData(model)
+    nstep = int(total_sim_time / model.opt.timestep)
+    # jiggle initial qpos for robustness
+    rng = np.random.default_rng(seed)
+    data.qpos += rng.normal(0, 0.01, size=data.qpos.shape)
+    mujoco.mj_forward(model, data)
+
+    for _ in range(nstep):
+        mujoco.mj_step(model, data)
+
+    full_physics = mujoco.mjtState.mjSTATE_FULLPHYSICS
+    state = np.zeros(mujoco.mj_stateSize(model, full_physics))
+    mujoco.mj_getState(model, data, state, full_physics)
+    assert not np.isnan(state).any(), "Final state contains NaN values"
+    assert not np.isinf(state).any(), "Final state contains Inf values"
+    return state
+
+
+def simulation_time(model, n_runs):
+    """Run n_runs times with different seeds, and return time taken."""
+    times = []
+    for _ in range(n_runs):
+        seed = np.random.randint(0, 10000)
+        time_start = time.perf_counter()
+        _ = simulate_model(model, seed)
+        time_end = time.perf_counter()
+        times.append(time_end - time_start)
+    return np.array(times)
+
+
+def test_model_speed():
+    """Test that new model is faster than the reference model"""
+    model = mujoco.MjModel.from_xml_path(str(model_path))
+    model_ref = mujoco.MjModel.from_xml_path(str(model_ref_path))
+
+    # simulate both models for same total time with same random seed
+    times_model = simulation_time(model, n_runs=n_runs)
+    times_model_ref = simulation_time(model_ref, n_runs=n_runs)
+    speedup = (times_model_ref / times_model).mean().item()
+    act_time_pctg = (times_model / times_model_ref).mean().item()
+
+    print(f"Avg simulation time: {times_model.mean().item():.4f} secs")
+    print(f"Avg simulation time (ref): {times_model_ref.mean().item():.4f} secs")
+    print(f"Speedup: {speedup:.2f}x")
+    print(f"Time pctg: {act_time_pctg:.2f}")
+
+    assert act_time_pctg <= pctg, (
+        f"Time pctg {act_time_pctg * 100:.2f}% (need {pctg * 100:.2f}%)"
+    )
+
+
+if __name__ == "__main__":
+    test_correctness()
+    test_model_speed()
+[?2004hroot@7846d2fb431e:/app# cat /app/model_ref.xml
+[?2004l<!-- Inspired by https://github.com/google-deepmind/mujoco/blob/main/model/plugin/elasticity/cable.xml -->
+<mujoco model="Cable">
+
+  <extension>
+    <plugin plugin="mujoco.elasticity.cable"/>
+  </extension>
+
+  <statistic center="0 0 .3" extent="1"/>
+  <visual>
+    <global elevation="-30"/>
+  </visual>
+
+  <compiler autolimits="true"/>
+
+  <size memory="2M"/>
+
+  <worldbody>
+    <composite type="cable" curve="s" count="41 1 1" size="1" offset="-.3 0 .6" initial="none">
+      <plugin plugin="mujoco.elasticity.cable">
+        <!--Units are in Pa (SI)-->
+        <config key="twist" value="1e7"/>
+        <config key="bend" value="4e6"/>
+        <config key="vmax" value="0.05"/>
+      </plugin>
+      <joint kind="main" damping=".015"/>
+      <geom type="capsule" size=".005" rgba=".8 .2 .1 1" condim="1"/>
+    </composite>
+    <body name="slider" pos=".7 0 .6">
+      <joint type="slide" axis="1 0 0" damping=".1"/>
+      <geom size=".01"/>
+    </body>
+  </worldbody>
+  <equality>
+    <connect name="right_boundary" body1="B_last" body2="slider" anchor=".025 0 0"/>
+  </equality>
+  <contact>
+    <exclude body1="B_last" body2="slider"/>
+  </contact>
+  <actuator>
+    <motor site="S_last" gear="0 0 0 1 0 0" ctrlrange="-.03 .03"/>
+  </actuator>
+</mujoco>[?2004hroot@7846d2fb431e:/app# cd /app && python3 -c "import mujoco; print(mujoco.__version__)"
+[?2004l3.3.5
+[?2004hroot@7846d2fb431e:/app# python3 -c "import mujoco; m=mujoco.MjModel.from_xml_path('model_ref.xml'); print('nq',m.nq,'nv',m.nv,'nbody',m.nbody,'njnt',m.njnt,'neq',m.neq)"
+[?2004lnq 157 nv 118 nbody 42 njnt 40 neq 1
+[?2004hroot@7846d2fb431e:/app# python3 -c "import mujoco; m=mujoco.MjModel.from_xml_path('model_ref.xml'); print(mujoco.MjModel.to_xml(m))" > /app/ref_dump.xml 2>&1; wc -l /app/ref_dump.xml
+[?2004l5 /app/ref_dump.xml
+[?2004hroot@7846d2fb431e:/app# head -100 /app/ref_dump.xml
+[?2004lTraceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import mujoco; m=mujoco.MjModel.from_xml_path('model_ref.xml'); print(mujoco.MjModel.to_xml(m))
+                                                                          ^^^^^^^^^^^^^^^^^^^^^
+AttributeError: type object 'mujoco._structs.MjModel' has no attribute 'to_xml'
+[?2004hroot@7846d2fb431e:/app# python3 -c "import mujoco, os; print(os.path.dirname(mujoco.__file__))"
+[?2004l/usr/local/lib/python3.13/site-packages/mujoco
+find / -name "*.py" -path "*elasticity*" 2>/dev/null; find / -name "cable*" 2>/dev/null | head
+[?2004hroot@7846d2fb431e:/app# find / -name "*.py" -path "*elasticity*" 2>/dev/null; find / -name "cable*" 2>/dev/null | head
+[?2004l[?2004hroot@7846d2fb431e:/app# find / -path "*mujoco*" -name "*.py" 2>/dev/null | grep -i -E "plugin|elastic|cable" | head -50
+[?2004l[?2004hroot@7846d2fb431e:/app# find / -iname "*elastic*" 2>/dev/null | head -50; echo "---plugins---"; find / -type d -iname "*plugin*" 2>/dev/null | head
+[?2004l/proc/sys/net/ipv6/route/gc_elasticity
+/usr/local/lib/python3.13/site-packages/mujoco/plugin/libelasticity.so
+---plugins---
+/usr/lib/x86_64-linux-gnu/krb5/plugins
+/usr/local/lib/python3.13/site-packages/mujoco/plugin
+[?2004hroot@7846d2fb431e:/app# ls -la /usr/local/lib/python3.13/site-packages/mujoco/plugin/
+[?2004ltotal 1648
+drwxr-xr-x  2 root root    116 Sep 13  2025 .
+drwxr-xr-x 12 root root   4096 Sep 13  2025 ..
+-rw-r--r--  1 root root 324544 Sep 13  2025 libactuator.so
+-rw-r--r--  1 root root 339512 Sep 13  2025 libelasticity.so
+-rw-r--r--  1 root root 366440 Sep 13  2025 libsdf_plugin.so
+-rw-r--r--  1 root root 644216 Sep 13  2025 libsensor.so
+[?2004hroot@7846d2fb431e:/app# strings /usr/local/lib/python3.13/site-packages/mujoco/plugin/libelasticity.so 2>/dev/null | grep -i -E "cable|twist|bend|vmax|elastic" | head -40
+[?2004l[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, time
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print("timestep", m.opt.timestep, "nstep", int(2.0/m.opt.timestep))
+[?2004l[?2004h> print("constr iters", m.opt.iterations, "ls iters", m.opt.ls_iter)
+[?2004l[?2004h> print("nbody", m.nbody, "njnt", m.njnt, "ngeom", m.ngeom, "neq", m.neq)
+[?2004l[?2004h> print("ncon (from fwd)", end=" ")
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> print(d.ncon)
+[?2004l[?2004h> print("plugin", m.plugin[0].id if m.nplugin else None, "nplugin", m.nplugin)
+[?2004l[?2004h> t0=time.perf_counter()
+[?2004l[?2004h> n=int(2.0/m.opt.timestep)
+[?2004l[?2004h> for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h> t1=time.perf_counter()
+[?2004l[?2004h> print("ref 2s sim wall", t1-t0, "per step ms", (t1-t0)/n*1000)
+[?2004l[?2004h> EOF
+[?2004ltimestep 0.002 nstep 1000
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m4[0m, in [35m<module>[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjOption' object has no attribute 'ls_iter'[0m
+[?2004hroot@7846d2fb431e:/app# timeout 10 python3 -c "import urllib.request; print(urllib.request.urlopen('https://github.com', timeout=5).status)" 2>&1 | head
+[?2004l200
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, time
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print("timestep", m.opt.timestep, "nstep", int(2.0/m.opt.timestep))
+[?2004l[?2004h> print("constr iters", m.opt.iterations, "ls iters", m.opt.ls_iterations)
+[?2004l[?2004h> print("nbody", m.nbody, "njnt", m.njnt, "ngeom", m.ngeom, "neq", m.neq, "nfrc", m.nforce if hasattr(m,'nforce') else '?')
+[?2004l[?2004h> d = mujoco.MjData(m)
+[?2004l[?2004h> mujoco.mj_forward(m,d)
+[?2004l[?2004h> print("d.ncon", d.ncon)
+[?2004l[?2004h> t0=time.perf_counter()
+[?2004l[?2004h> n=int(2.0/m.opt.timestep)
+[?2004l[?2004h> for _ in range(n): mujoco.mj_step(m,d)
+[?2004l[?2004h> t1=time.perf_counter()
+[?2004l[?2004h> print("ref 2s wall", t1-t0, "per step ms", (t1-t0)/n*1000)
+[?2004l[?2004h> EOF
+[?2004ltimestep 0.002 nstep 1000
+constr iters 100 ls iters 50
+nbody 42 njnt 40 ngeom 41 neq 1 nfrc ?
+d.ncon 0
+ref 2s wall 0.44530373299494386 per step ms 0.44530373299494386
+[?2004hroot@7846d2fb431e:/app# cd /app && for f in cable rope string elasticity main; do echo "=== $f ==="; timeout 12 curl -sSL "https://raw.githubusercontent.com/google-deepmind/mujoco/main/plugin/mujoco.elasticity/$f.cc" 2>/dev/null | head -3; done
+[?2004l=== cable ===
+=== rope ===
+=== string ===
+=== elasticity ===
+=== main ===
+[?2004hroot@7846d2fb431e:/app# cd /app && timeout 20 curl -sSL "https://api.github.com/repos/google-deepmind/mujoco/git/trees/main?recursive=1" 2>/dev/null | grep -i -E "elastic|cable" | head -40
+[?2004l[?2004hroot@7846d2fb431e:/app# cd /app && timeout 20 curl -sSL "https://api.github.com/repos/google-deepmind/mujoco/git/trees/main?recursive=1" 2>/dev/null | head -c 500; echo
+[?2004l
+[?2004hroot@7846d2fb431e:/app# cd /app && for p in plugin/mujoco.elasticity elastic cable; do echo "=== $p ==="; timeout 12 curl -sSL "https://raw.githubusercontent.com/google-deepmind/mujoco/main/model/$p/cable.xml" 2>/dev/null | head -c 200; echo; done
+[?2004l=== plugin/mujoco.elasticity ===
+
+=== elastic ===
+
+=== cable ===
+
+[?2004hroot@7846d2fb431e:/app# cd /app && timeout 15 curl -sSL "https://raw.githubusercontent.com/google-deepmind/mujoco/main/model/plugin/elasticity/cable.xml" 2>/dev/null | head -40; echo "=== END ==="
+[?2004l=== END ===
+[?2004hroot@7846d2fb431e:/app# cd /app && echo "--- cable.xml status ---"; timeout 15 curl -sS -o /dev/null -w "%{http_code}\n" "https://raw.githubusercontent.com/google-deepmind/mujoco/main/model/plugin/elasticity/cable.xml" 2>&1
+[?2004l--- cable.xml status ---
+timeout: failed to run command ‘curl’: No such file or directory
+[?2004hroot@7846d2fb431e:/app# cd /app && echo "--- plugin tree via API (auth-less) ---"; timeout 20 curl -sS "https://api.github.com/repos/google-deepmind/mujoco/contents/plugin?ref=main" 2>/dev/null | head -c 800; echo
+[?2004l--- plugin tree via API (auth-less) ---
+
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import urllib.request, json
+[?2004l[?2004h> def get(url):
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         with urllib.request.urlopen(url, timeout=15) as r:
+[?2004l[?2004h>             return r.status, r.read()
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         return None, str(e)
+[?2004l[?2004h> # cable.xml
+[?2004l[?2004h> st, b = get("https://raw.githubusercontent.com/google-deepmind/mujoco/main/model/plugin/elasticity/cable.xml")
+[?2004l[?2004h> print("cable.xml", st)
+[?2004l[?2004h> print(b.decode()[:1500])
+[?2004l[?2004h> EOF
+[?2004lcable.xml 200
+<!-- Copyright 2021 DeepMind Technologies Limited
+
+     Licensed under the Apache License, Version 2.0 (the "License");
+     you may not use this file except in compliance with the License.
+     You may obtain a copy of the License at
+
+         http://www.apache.org/licenses/LICENSE-2.0
+
+     Unless required by applicable law or agreed to in writing, software
+     distributed under the License is distributed on an "AS IS" BASIS,
+     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     See the License for the specific language governing permissions and
+     limitations under the License.
+-->
+
+<mujoco model="Cable">
+  <include file="scene.xml"/>
+
+  <extension>
+    <plugin plugin="mujoco.elasticity.cable"/>
+  </extension>
+
+  <statistic center="0 0 .3" extent="1"/>
+  <visual>
+    <global elevation="-30"/>
+  </visual>
+
+  <compiler autolimits="true"/>
+
+  <size memory="2M"/>
+
+  <worldbody>
+    <composite type="cable" curve="s" count="41 1 1" size="1" offset="-.3 0 .6" initial="none">
+      <plugin plugin="mujoco.elasticity.cable">
+        <!--Units are in Pa (SI)-->
+        <config key="twist" value="1e7"/>
+        <config key="bend" value="4e6"/>
+        <config key="vmax" value="0.05"/>
+      </plugin>
+      <joint kind="main" damping=".015"/>
+      <geom type="capsule" size=".005" rgba=".8 .2 .1 1" condim="1"/>
+    </composite>
+    <body name="slider" pos=".7 0 .6">
+      <joint type="slide" axis="1 0 0" damping=".1"/>
+      <geom size=".01"/>
+    </body
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import urllib.request, json
+[?2004l[?2004h> def get(url):
+[?2004l[?2004h>     with urllib.request.urlopen(url, timeout=25) as r:
+[?2004l[?2004h>         return r.read()
+[?2004l[?2004h> tree = json.loads(get("https://api.github.com/repos/google-deepmind/mujoco/git/trees/main?recursive=1"))
+[?2004l[?2004h> paths = [t["path"] for t in tree["tree"]]
+[?2004l[?2004h> print("total paths", len(paths), "truncated", tree.get("truncated"))
+[?2004l[?2004h> for p in paths:
+[?2004l[?2004h>     if any(k in p.lower() for k in ["elastic"]):
+[?2004l[?2004h>         print(p)
+[?2004l[?2004h> EOF
+[?2004ltotal paths 2441 truncated False
+model/plugin/elasticity
+model/plugin/elasticity/belt.xml
+model/plugin/elasticity/cable.xml
+model/plugin/elasticity/coil.xml
+model/plugin/elasticity/scene.xml
+plugin/elasticity
+plugin/elasticity/CMakeLists.txt
+plugin/elasticity/README.md
+plugin/elasticity/cable.cc
+plugin/elasticity/cable.h
+plugin/elasticity/elasticity.cc
+plugin/elasticity/elasticity.h
+plugin/elasticity/register.cc
+test/plugin/elasticity
+test/plugin/elasticity/CMakeLists.txt
+test/plugin/elasticity/elasticity_test.cc
+[?2004hroot@7846d2fb431e:/app# cd /app && mkdir -p plugin_src && python3 << 'EOF'
+[?2004l[?2004h> import urllib.request
+[?2004l[?2004h> def get(url, path):
+[?2004l[?2004h>     with urllib.request.urlopen(url, timeout=25) as r:
+[?2004l[?2004h>         data = r.read()
+[?2004l[?2004h>     with open(path, 'wb') as f: f.write(data)
+[?2004l[?2004h>     return len(data)
+[?2004l[?2004h> base="https://raw.githubusercontent.com/google-deepmind/mujoco/main/plugin/elasticity/"
+[?2004l[?2004h> for fn in ["cable.cc","cable.h","elasticity.cc","elasticity.h","register.cc","README.md"]:
+[?2004l[?2004h>     try: print(fn, get(base+fn, "plugin_src/"+fn))
+[?2004l[?2004h>     except Exception as e: print(fn, "ERR", e)
+[?2004l[?2004h> EOF
+[?2004lcable.cc 10441
+cable.h 2022
+elasticity.cc 1432
+elasticity.h 2316
+register.cc 799
+README.md 1029
+[?2004hroot@7846d2fb431e:/app# cat /app/plugin_src/cable.h
+[?2004l// Copyright 2022 DeepMind Technologies Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef MUJOCO_SRC_PLUGIN_ELASTICITY_CABLE_H_
+#define MUJOCO_SRC_PLUGIN_ELASTICITY_CABLE_H_
+
+#include <optional>
+#include <vector>
+
+#include <mujoco/mjdata.h>
+#include <mujoco/mjmodel.h>
+#include <mujoco/mjtype.h>
+#include <mujoco/mjvisualize.h>
+
+
+namespace mujoco::plugin::elasticity {
+
+class Cable {
+ public:
+  // Creates a new Cable instance (allocated with `new`) or
+  // returns null on failure.
+  static std::optional<Cable> Create(const mjModel* m, mjData* d, int instance);
+  Cable(Cable&&) = default;
+  ~Cable() = default;
+
+  void Compute(const mjModel* m, mjData* d, int instance);
+  void Visualize(const mjModel* m, mjData* d, mjvScene* scn, int instance);
+
+  static void RegisterPlugin();
+
+  int i0;                         // index of first body
+  int n;                          // number of bodies in the cable
+  std::vector<int> prev;          // indices of previous bodies   (n x 1)
+  std::vector<int> next;          // indices of next bodies       (n x 1)
+  std::vector<mjtNum> stiffness;  // stiffness parameters         (n x 4)
+  std::vector<mjtNum> omega0;     // reference curvature          (n x 3)
+  std::vector<mjtNum> stress;     // mechanical stress            (n x 3)
+  mjtNum vmax;                    // max value in colormap
+
+ private:
+  Cable(const mjModel* m, mjData* d, int instance);
+};
+
+}  // namespace mujoco::plugin::elasticity
+
+#endif  // MUJOCO_SRC_PLUGIN_ELASTICITY_CABLE_H_
+[?2004hroot@7846d2fb431e:/app# cat /app/plugin_src/cable.cc
+[?2004l// Copyright 2022 DeepMind Technologies Limited
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <optional>
+#include <string>
+#include <utility>
+
+#include <mujoco/mjplugin.h>
+#include <mujoco/mjtype.h>
+#include <mujoco/mujoco.h>
+#include "cable.h"
+
+
+namespace mujoco::plugin::elasticity {
+namespace {
+
+// Jet color palette
+void scalar2rgba(float rgba[4], mjtNum stress[3], mjtNum vmin, mjtNum vmax) {
+  // L2 norm of the stress
+  mjtNum v = mju_norm3(stress);
+  v = v < vmin ? vmin : v;
+  v = v > vmax ? vmax : v;
+  mjtNum dv = vmax - vmin;
+
+  if (v < (vmin + 0.25 * dv)) {
+    rgba[0] = 0;
+    rgba[1] = 4 * (v - vmin) / dv;
+    rgba[2] = 1;
+  } else if (v < (vmin + 0.5 * dv)) {
+    rgba[0] = 0;
+    rgba[1] = 1;
+    rgba[2] = 1 + 4 * (vmin + 0.25 * dv - v) / dv;
+  } else if (v < (vmin + 0.75 * dv)) {
+    rgba[0] = 4 * (v - vmin - 0.5 * dv) / dv;
+    rgba[1] = 1;
+    rgba[2] = 0;
+  } else {
+    rgba[0] = 1;
+    rgba[1] = 1 + 4 * (vmin + 0.75 * dv - v) / dv;
+    rgba[2] = 0;
+  }
+}
+
+// compute quaternion difference between two frames in joint coordinates
+void QuatDiff(mjtNum* quat, const mjtNum body_quat[4],
+              const mjtNum joint_quat[4], bool pullback = false) {
+  if (pullback == 0) {
+    // contribution in local coordinates
+    mju_mulQuat(quat, body_quat, joint_quat);
+  } else {
+    // contribution pulled-back in local coordinates of the other body
+    mjtNum invquat[4];
+    mju_mulQuat(invquat, body_quat, joint_quat);
+    mju_negQuat(quat, invquat);
+  }
+}
+
+// compute local stress given material properties, orientation,
+// and reference curvature
+//   inputs:
+//     stiffness   - material parameters
+//     quat        - orientation of the body in local coordinates
+//     omega0      - initial curvature
+//     xquat       - Cartesian orientation of the body (optional)
+//     scl         - scaling of the force
+//   outputs:
+//     stress      - local stress contribution
+void LocalStress(mjtNum stress[3], const mjtNum stiffness[4],
+                 const mjtNum quat[4], const mjtNum omega0[3],
+                 bool pullback = false) {
+  mjtNum omega[3];
+
+  // compute curvature
+  mju_quat2Vel(omega, quat, 1.0);
+
+  // subtract omega0 in reference configuration
+  mjtNum tmp[] = {
+      -stiffness[0] * (omega[0] - omega0[0]) / stiffness[3],
+      -stiffness[1] * (omega[1] - omega0[1]) / stiffness[3],
+      -stiffness[2] * (omega[2] - omega0[2]) / stiffness[3],
+  };
+
+
+  // pull-back into the other body frame
+  if (pullback) {
+    mjtNum invquat[4];
+    mju_negQuat(invquat, quat);
+    mju_rotVecQuat(stress, tmp, invquat);
+  } else {
+    mju_copy3(stress, tmp);
+  }
+}
+
+// reads numeric attributes
+bool CheckAttr(const char* name, const mjModel* m, int instance) {
+  char* end;
+  std::string value = mj_getPluginConfig(m, instance, name);
+  value.erase(std::remove_if(value.begin(), value.end(), isspace), value.end());
+  strtod(value.c_str(), &end);
+  return end == value.data() + value.size();
+}
+
+}  // namespace
+
+
+// factory function
+std::optional<Cable> Cable::Create(const mjModel* m, mjData* d, int instance) {
+  if (CheckAttr("twist", m, instance) && CheckAttr("bend", m, instance)) {
+    return Cable(m, d, instance);
+  } else {
+    mju_warning("Invalid parameter specification in cable plugin");
+    return std::nullopt;
+  }
+}
+
+// plugin constructor
+Cable::Cable(const mjModel* m, mjData* d, int instance) {
+  // parameters were validated by the factor function
+  std::string flat = mj_getPluginConfig(m, instance, "flat");
+  mjtNum G = strtod(mj_getPluginConfig(m, instance, "twist"), nullptr);
+  mjtNum E = strtod(mj_getPluginConfig(m, instance, "bend"), nullptr);
+  vmax = strtod(mj_getPluginConfig(m, instance, "vmax"), nullptr);
+  // count plugin bodies
+  n = 0;
+  for (int i = 1; i < m->nbody; i++) {
+    if (m->body_plugin[i] == instance) {
+      if (!n++) {
+        i0 = i;
+      }
+    }
+  }
+
+  // allocate arrays
+  prev.assign(n, 0);           // index of previous body
+  next.assign(n, 0);           // index of next body
+  omega0.assign(3 * n, 0);     // reference curvature
+  stress.assign(3 * n, 0);     // mechanical stress
+  stiffness.assign(4 * n, 0);  // material parameters
+
+  // run forward kinematics to populate xquat (mjData not yet initialized)
+  mju_zero(d->mocap_quat, 4 * m->nmocap);
+  mju_copy(d->qpos, m->qpos0, m->nq);
+  mj_kinematics(m, d);
+
+  // compute initial curvature
+  for (int b = 0; b < n; b++) {
+    int i = i0 + b;
+    if (m->body_plugin[i] != instance) {
+      mju_error("This body does not have the requested plugin instance");
+    }
+    bool first = (b == 0), last = (b == n - 1);
+    prev[b] = first ? 0 : -1;
+    next[b] = last ? 0 : +1;
+
+    // compute omega0: curvature at equilibrium
+    if (prev[b] && flat != "true") {
+      int qadr = m->jnt_qposadr[m->body_jntadr[i]] + m->body_dofnum[i] - 3;
+      mju_subQuat(omega0.data() + 3 * b, m->body_quat + 4 * i, d->qpos + qadr);
+    } else {
+      mju_zero3(omega0.data() + 3 * b);
+    }
+
+    // compute physical parameters
+    int geom_i = m->body_geomadr[i];
+    mjtNum J = 0, Iy = 0, Iz = 0;
+    if (m->geom_type[geom_i] == mjGEOM_CYLINDER ||
+        m->geom_type[geom_i] == mjGEOM_CAPSULE) {
+      // https://en.wikipedia.org/wiki/Torsion_constant#Circle
+      // https://en.wikipedia.org/wiki/List_of_second_moments_of_area
+      J = mjPI * pow(m->geom_size[3 * geom_i + 0], 4) / 2;
+      Iy = Iz = mjPI * pow(m->geom_size[3 * geom_i + 0], 4) / 4.;
+    } else if (m->geom_type[geom_i] == mjGEOM_BOX) {
+      // https://en.wikipedia.org/wiki/Torsion_constant#Rectangle
+      // https://en.wikipedia.org/wiki/List_of_second_moments_of_area
+      mjtNum h = m->geom_size[3 * geom_i + 1];
+      mjtNum w = m->geom_size[3 * geom_i + 2];
+      mjtNum a = std::max(h, w);
+      mjtNum b = std::min(h, w);
+      J = a * pow(b, 3) *
+          (16. / 3. - 3.36 * b / a * (1 - pow(b, 4) / pow(a, 4) / 12));
+      Iy = pow(2 * w, 3) * 2 * h / 12.;
+      Iz = pow(2 * h, 3) * 2 * w / 12.;
+    }
+    stiffness[4 * b + 0] = J * G;
+    stiffness[4 * b + 1] = Iy * E;
+    stiffness[4 * b + 2] = Iz * E;
+    stiffness[4 * b + 3] =
+        prev[b] ? mju_dist3(d->xpos + 3 * i, d->xpos + 3 * (i + prev[b])) : 0;
+  }
+}
+
+void Cable::Compute(const mjModel* m, mjData* d, int instance) {
+  for (int b = 0; b < n; b++) {
+    // index into body array
+    int i = i0 + b;
+    if (m->body_plugin[i] != instance) {
+      mju_error(
+          "This body is not associated with the requested plugin instance");
+    }
+
+    // if no stiffness, skip body
+    if (!stiffness[b * 4 + 0] && !stiffness[b * 4 + 1] &&
+        !stiffness[b * 4 + 2]) {
+      continue;
+    }
+
+    // elastic forces
+    mjtNum quat[4] = {0};
+    mjtNum lfrc[3] = {0};
+
+    // local orientation
+    if (prev[b]) {
+      int qadr = m->jnt_qposadr[m->body_jntadr[i]] + m->body_dofnum[i] - 3;
+      QuatDiff(quat, m->body_quat + 4 * i, d->qpos + qadr);
+
+      // contribution of orientation i-1 to xfrc i
+      LocalStress(stress.data() + 3 * b, stiffness.data() + 4 * b, quat,
+                  omega0.data() + 3 * b, true);
+      mju_addToScl3(lfrc, stress.data() + 3 * b, 1.0);
+    }
+
+    if (next[b]) {
+      int bn = b + next[b];
+      int in = i + next[b];
+
+      // local orientation
+      int qadr = m->jnt_qposadr[m->body_jntadr[in]] + m->body_dofnum[in] - 3;
+      QuatDiff(quat, m->body_quat + 4 * in, d->qpos + qadr);
+
+      // contribution of orientation i+1 to xfrc i
+      LocalStress(stress.data() + 3 * bn, stiffness.data() + 4 * bn, quat,
+                  omega0.data() + 3 * bn);
+      mju_addToScl3(lfrc, stress.data() + 3 * bn, -1.0);
+    }
+
+    // convert from global coordinates and apply torque to com
+    mjtNum xfrc[3] = {0};
+    mju_rotVecQuat(xfrc, lfrc, d->xquat + 4 * i);
+    mj_applyFT(m, d, 0, xfrc, d->xpos + 3 * i, i, d->qfrc_passive);
+  }
+}
+
+void Cable::Visualize(const mjModel* m, mjData* d, mjvScene* scn,
+                      int instance) {
+  if (!vmax) {
+    return;
+  }
+
+  for (int b = 0; b < n; b++) {
+    int i = i0 + b;
+    int bn = b + next[b];
+
+    // set geometry color based on stress norm
+    mjtNum stress_m[3] = {0};
+    mjtNum* stress_l = prev[b] ? stress.data() + 3 * b : stress.data() + 3 * bn;
+    mjtNum* stress_r = next[b] ? stress.data() + 3 * bn : stress.data() + 3 * b;
+    mju_add3(stress_m, stress_l, stress_r);
+    mju_scl3(stress_m, stress_m, 0.5);
+    scalar2rgba(m->geom_rgba + 4 * m->body_geomadr[i], stress_m, 0, vmax);
+  }
+}
+
+void Cable::RegisterPlugin() {
+  mjpPlugin plugin;
+  mjp_defaultPlugin(&plugin);
+
+  plugin.name = "mujoco.elasticity.cable";
+  plugin.capabilityflags |= mjPLUGIN_PASSIVE;
+
+  const char* attributes[] = {"twist", "bend", "flat", "vmax"};
+  plugin.nattribute = sizeof(attributes) / sizeof(attributes[0]);
+  plugin.attributes = attributes;
+  plugin.nstate = +[](const mjModel* m, int instance) { return 0; };
+
+  plugin.init = +[](const mjModel* m, mjData* d, int instance) {
+    auto elasticity_or_null = Cable::Create(m, d, instance);
+    if (!elasticity_or_null.has_value()) {
+      return -1;
+    }
+    d->plugin_data[instance] =
+        reinterpret_cast<uintptr_t>(new Cable(std::move(*elasticity_or_null)));
+    return 0;
+  };
+  plugin.destroy = +[](mjData* d, int instance) {
+    delete reinterpret_cast<Cable*>(d->plugin_data[instance]);
+    d->plugin_data[instance] = 0;
+  };
+  plugin.compute =
+      +[](const mjModel* m, mjData* d, int instance, int capability_bit) {
+        auto* elasticity = reinterpret_cast<Cable*>(d->plugin_data[instance]);
+        elasticity->Compute(m, d, instance);
+      };
+  plugin.visualize = +[](const mjModel* m, mjData* d, const mjvOption* opt,
+                         mjvScene* scn, int instance) {
+    auto* elasticity = reinterpret_cast<Cable*>(d->plugin_data[instance]);
+    elasticity->Visualize(m, d, scn, instance);
+  };
+
+  mjp_registerPlugin(&plugin);
+}
+
+}  // namespace mujoco::plugin::elasticity
+[?2004hroot@7846d2fb431e:/app# sed -n '126,176p' /app/plugin_src/cable.cc
+[?2004l  } else {
+    mju_warning("Invalid parameter specification in cable plugin");
+    return std::nullopt;
+  }
+}
+
+// plugin constructor
+Cable::Cable(const mjModel* m, mjData* d, int instance) {
+  // parameters were validated by the factor function
+  std::string flat = mj_getPluginConfig(m, instance, "flat");
+  mjtNum G = strtod(mj_getPluginConfig(m, instance, "twist"), nullptr);
+  mjtNum E = strtod(mj_getPluginConfig(m, instance, "bend"), nullptr);
+  vmax = strtod(mj_getPluginConfig(m, instance, "vmax"), nullptr);
+  // count plugin bodies
+  n = 0;
+  for (int i = 1; i < m->nbody; i++) {
+    if (m->body_plugin[i] == instance) {
+      if (!n++) {
+        i0 = i;
+      }
+    }
+  }
+
+  // allocate arrays
+  prev.assign(n, 0);           // index of previous body
+  next.assign(n, 0);           // index of next body
+  omega0.assign(3 * n, 0);     // reference curvature
+  stress.assign(3 * n, 0);     // mechanical stress
+  stiffness.assign(4 * n, 0);  // material parameters
+
+  // run forward kinematics to populate xquat (mjData not yet initialized)
+  mju_zero(d->mocap_quat, 4 * m->nmocap);
+  mju_copy(d->qpos, m->qpos0, m->nq);
+  mj_kinematics(m, d);
+
+  // compute initial curvature
+  for (int b = 0; b < n; b++) {
+    int i = i0 + b;
+    if (m->body_plugin[i] != instance) {
+      mju_error("This body does not have the requested plugin instance");
+    }
+    bool first = (b == 0), last = (b == n - 1);
+    prev[b] = first ? 0 : -1;
+    next[b] = last ? 0 : +1;
+
+    // compute omega0: curvature at equilibrium
+    if (prev[b] && flat != "true") {
+      int qadr = m->jnt_qposadr[m->body_jntadr[i]] + m->body_dofnum[i] - 3;
+      mju_subQuat(omega0.data() + 3 * b, m->body_quat + 4 * i, d->qpos + qadr);
+    } else {
+      mju_zero3(omega0.data() + 3 * b);
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> np.set_printoptions(precision=6, suppress=False)
+[?2004l[?2004h> print("=== BODIES ===")
+[?2004l[?2004h> for i in range(1,m.nbody):
+[?2004l[?2004h>     print(f"b{i} name={mujoco.mj_id2name(m,mjOBJ_BODY,i)!r} parent={m.body_parent[i]} pos={m.body_pos[i]} quat={m.body_quat[i]} plug={m.body_plugin[i]} dofnum={m.body_dofadr[i+1]-m.body_dofadr[i]} mass={m.body_mass[i]}")
+[?2004l[?2004h> print("=== JOINTS ===")
+[?2004l[?2004h> typ={0:'free',1:'ball',2:'slide',3:'hinge',4:'slide?'}
+[?2004l[?2004h> for i in range(m.njnt):
+[?2004l[?2004h>     print(f"j{i} name={mujoco.mj_id2name(m,mjOBJ_JOINT,i)!r} type={m.jnt_type[i]} body={m.jnt_bodyid[i]} qposadr={m.jnt_qposadr[i]} dim={m.jnt_dim[i]} axis={m.jnt_axis[i]} dref={m.jnt_damping[i] if m.jnt_damping is not None else '?'} limited={[m.jnt_range[i]]}")
+[?2004l[?2004h> print("=== GEOMS ===")
+[?2004l[?2004h> for i in range(m.ngeom):
+[?2004l[?2004h>     print(f"g{i} type={m.geom_type[i]} body={m.geom_bodyid[i]} size={m.geom_size[i]} pos={m.geom_pos[i]} quat={m.geom_quat[i]} mass={m.geom_rbound[i]}")
+[?2004l[?2004h> print("=== EQ ===", m.neq, m.eq_type, "body1",m.eq_obj1id,"body2",m.eq_obj2id,"anchor",m.eq_data)
+[?2004l[?2004h> print("=== ACTUATOR ===", m.nu, [mujoco.mj_id2name(m,mjOBJ_ACTUATION,i) for i in range(m.nu)], "gain", m.actuator_gain, "ctrlrange", m.actuator_ctrlrange)
+[?2004l[?2004h> print("body_jntadr", m.body_jntadr[1:])
+[?2004l[?2004h> print("body_dofnum", m.body_dofnum[1:])
+[?2004l[?2004h> print("body_mocapid", m.body_mocapid[1:])
+[?2004l[?2004h> EOF
+[?2004l=== BODIES ===
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m6[0m, in [35m<module>[0m
+[1;35mNameError[0m: [35mname 'mjOBJ_BODY' is not defined[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 -c "import mujoco; print([x for x in dir(mujoco) if 'OBJ' in x and 'BODY' in x]); print([x for x in dir(mujoco) if x.startswith('mju') and 'BODY' in x.upper()])"
+[?2004l[]
+[]
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 -c "import mujoco; print([x for x in dir(mujoco) if 'BODY' in x][:30]); print('---'); print([x for x in dir(mujoco) if x.startswith('mju')][:40])"
+[?2004l[]
+---
+['mju_Halton', 'mju_L1', 'mju_add', 'mju_add3', 'mju_addScl', 'mju_addScl3', 'mju_addTo', 'mju_addTo3', 'mju_addToScl', 'mju_addToScl3', 'mju_axisAngle2Quat', 'mju_band2Dense', 'mju_bandDiag', 'mju_bandMulMatVec', 'mju_boxQP', 'mju_cholFactor', 'mju_cholFactorBand', 'mju_cholSolve', 'mju_cholSolveBand', 'mju_cholUpdate', 'mju_clip', 'mju_copy', 'mju_copy3', 'mju_copy4', 'mju_cross', 'mju_d2n', 'mju_decodePyramid', 'mju_dense2Band', 'mju_dense2sparse', 'mju_derivQuat', 'mju_dist3', 'mju_dot', 'mju_dot3', 'mju_eig3', 'mju_encodePyramid', 'mju_euler2Quat', 'mju_eye', 'mju_f2n', 'mju_fill', 'mju_insertionSort']
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 -c "import mujoco; print([x for x in dir(mujoco) if 'Obj' in x or 'obj' in x][:30])"
+[?2004l['mj_objectAcceleration', 'mj_objectVelocity', 'mjtObj']
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 -c "import mujoco; print(getattr(mujoco.mjtObj,'mjOBJ_BODY', 'nope'))"
+[?2004lmjtObj.mjOBJ_BODY
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> O=mujoco.mjtObj
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> np.set_printoptions(precision=6)
+[?2004l[?2004h> print("=== BODIES ===")
+[?2004l[?2004h> for i in range(1,m.nbody):
+[?2004l[?2004h>     nm=mujoco.mj_id2name(m,O.mjOBJ_BODY,i) or f"b{i}"
+[?2004l[?2004h>     print(f"{nm}: parent={m.body_parent[i]} pos={np.round(m.body_pos[i],4)} quat={np.round(m.body_quat[i],4)} plug={m.body_plugin[i]} dofnum={m.body_dofnum[i]} mass={round(m.body_mass[i],5)}")
+[?2004l[?2004h> print("=== JOINTS ===")
+[?2004l[?2004h> for i in range(m.njnt):
+[?2004l[?2004h>     nm=mujoco.mj_id2name(m,O.mjOBJ_JOINT,i) or f"j{i}"
+[?2004l[?2004h>     print(f"{nm}: type={m.jnt_type[i]} body={m.jnt_bodyid[i]} qposadr={m.jnt_qposadr[i]} dim={m.jnt_dim[i]} nprm={m.jnt_gain[i]} axis={np.round(m.jnt_axis[i],4)} damp={m.jnt_damping[i]} lim={np.round(m.jnt_range[i],4)}")
+[?2004l[?2004h> print("body_jntadr(1:)", m.body_jntadr[1:])
+[?2004l[?2004h> print("body_dofnum(1:)", m.body_dofnum[1:])
+[?2004l[?2004h> print("=== GEOMS ===")
+[?2004l[?2004h> for i in range(m.ngeom):
+[?2004l[?2004h>     nm=mujoco.mj_id2name(m,O.mjOBJ_GEOM,i) or f"g{i}"
+[?2004l[?2004h>     print(f"{nm}: type={m.geom_type[i]} body={m.geom_bodyid[i]} size={np.round(m.geom_size[i],4)} pos={np.round(m.geom_pos[i],4)} quat={np.round(m.geom_quat[i],4)} condim={m.geom_condim[i]}")
+[?2004l[?2004h> print("=== EQ ===","type",m.eq_type,"b1",m.eq_obj1id,"b2",m.eq_obj2id,"data",np.round(m.eq_data,4))
+[?2004l[?2004h> print("=== ACTUATOR ===","nu",m.nu,[mujoco.mj_id2name(m,O.mjOBJ_ACTUATION,i) for i in range(m.nu)],"gain",m.actuator_gain,"gear",m.actuator_gear,"ctrlrange",m.actuator_ctrlrange,"biastype",m.actuator_biastype)
+[?2004l[?2004h> EOF
+[?2004l=== BODIES ===
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m8[0m, in [35m<module>[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjModel' object has no attribute 'body_parent'. Did you mean: 'body_parentid'?[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> O=mujoco.mjtObj
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> np.set_printoptions(precision=5)
+[?2004l[?2004h> def F(name):
+[?2004l[?2004h>     c=[a for a in dir(m) if a.lower().replace('_id','')==name.lower()]
+[?2004l[?2004h>     return c
+[?2004l[?2004h> def G(name):
+[?2004l[?2004h>     for cand in (name, name+'id', name+'_id'):
+[?2004l[?2004h>         if hasattr(m,cand): return getattr(m,cand)
+[?2004l[?2004h>     print("MISS",name); return None
+[?2004l[?2004h> print("=== BODIES ===")
+[?2004l[?2004h> bp=G('body_parent'); bm=G('body_mass'); bq=G('body_pos'); bx=G('body_quat'); bpl=G('body_plugin'); bd=G('body_dofnum')
+[?2004l[?2004h> for i in range(1,m.nbody):
+[?2004l[?2004h>     nm=mujoco.mj_id2name(m,O.mjOBJ_BODY,i) or f"b{i}"
+[?2004l[?2004h>     print(f"{nm}: pid={bp[i]} pos={np.round(bq[i],4)} quat={np.round(bx[i],4)} plug={bpl[i]} dof={bd[i]} mass={round(bm[i],5)}")
+[?2004l[?2004h> print("=== JOINTS ===")
+[?2004l[?2004h> jt=G('jnt_type');jb=G('jnt_bodyid');jq=G('jnt_qposadr');jd=G('jnt_dim');ja=G('jnt_axis');jj=G('jnt_jax');jr=G('jnt_range');jdamp=G('jnt_damping');jg=G('jnt_gain')
+[?2004l[?2004h> for i in range(m.njnt):
+[?2004l[?2004h>     nm=mujoco.mj_id2name(m,O.mjOBJ_JOINT,i) or f"j{i}"
+[?2004l[?2004h>     print(f"{nm}: type={jt[i]} body={jb[i]} qadr={jq[i]} dim={jd[i]} axis={np.round(ja[i],4)} gain={jg[i]} damp={jdamp[i]} lim={np.round(jr[i],4)}")
+[?2004l[?2004h> print("body_jntadr(1:)", G('body_jntadr')[1:])
+[?2004l[?2004h> print("body_dofnum(1:)", bd[1:])
+[?2004l[?2004h> print("body_mocapid(1:)", G('body_mocapid')[1:])
+[?2004l[?2004h> print("body_jntaxis? ")
+[?2004l[?2004h> print("=== GEOMS ===")
+[?2004l[?2004h> gt=G('geom_type');gbb=G('geom_bodyid');gs=G('geom_size');gp=G('geom_pos');gq=G('geom_quat');gc=G('geom_condim')
+[?2004l[?2004h> for i in range(m.ngeom):
+[?2004l[?2004h>     nm=mujoco.mj_id2name(m,O.mjOBJ_GEOM,i) or f"g{i}"
+[?2004l[?2004h>     print(f"{nm}: type={gt[i]} body={gbb[i]} size={np.round(gs[i],4)} pos={np.round(gp[i],4)} quat={np.round(gq[i],4)} condim={gc[i]}")
+[?2004l[?2004h> print("=== EQ ===","type",G('eq_type'),"b1",G('eq_obj1id'),"b2",G('eq_obj2id'),"data",np.round(G('eq_data'),4))
+[?2004l[?2004h> print("=== ACT ===","nu",m.nu,[mujoco.mj_id2name(m,O.mjOBJ_ACTUATION,i) for i in range(m.nu)],"gain",G('actuator_gain'),"gear",G('actuator_gear'),"cr",G('actuator_ctrlrange'),"bias",G('actuator_biastype'))
+[?2004l[?2004h> EOF
+[?2004l=== BODIES ===
+B_first: pid=0 pos=[-0.3  0.   0.6] quat=[1. 0. 0. 0.] plug=0 dof=0 mass=0.00249
+B_1: pid=1 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_2: pid=2 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_3: pid=3 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_4: pid=4 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_5: pid=5 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_6: pid=6 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_7: pid=7 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_8: pid=8 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_9: pid=9 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_10: pid=10 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_11: pid=11 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_12: pid=12 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_13: pid=13 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_14: pid=14 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_15: pid=15 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_16: pid=16 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_17: pid=17 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_18: pid=18 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_19: pid=19 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_20: pid=20 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_21: pid=21 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_22: pid=22 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_23: pid=23 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_24: pid=24 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_25: pid=25 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_26: pid=26 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_27: pid=27 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_28: pid=28 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_29: pid=29 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_30: pid=30 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_31: pid=31 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_32: pid=32 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_33: pid=33 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_34: pid=34 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_35: pid=35 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_36: pid=36 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_37: pid=37 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_38: pid=38 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+B_last: pid=39 pos=[0.025 0.    0.   ] quat=[1. 0. 0. 0.] plug=0 dof=3 mass=0.00249
+slider: pid=0 pos=[0.7 0.  0.6] quat=[1. 0. 0. 0.] plug=-1 dof=1 mass=0.00419
+=== JOINTS ===
+MISS jnt_dim
+MISS jnt_jax
+MISS jnt_damping
+MISS jnt_gain
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m21[0m, in [35m<module>[0m
+[1;35mTypeError[0m: [35m'NoneType' object is not subscriptable[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> O=mujoco.mjtObj
+[?2004l[?2004h> m = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> np.set_printoptions(precision=6)
+[?2004l[?2004h> print("jnt fields:", [a for a in dir(m) if a.startswith('jnt_')])
+[?2004l[?2004h> print("dof fields:", [a for a in dir(m) if a.startswith('dof_')])
+[?2004l[?2004h> print("=== JOINTS ===")
+[?2004l[?2004h> for i in range(m.njnt):
+[?2004l[?2004h>     nm=mujoco.mj_id2name(m,O.mjOBJ_JOINT,i) or f"j{i}"
+[?2004l[?2004h>     print(f"{nm} body={m.jnt_bodyid[i]} type={m.jnt_type[i]} qadr={m.jnt_qposadr[i]} dofs={m.jnt_dofadr[i]}-{m.jnt_dofadr[i]+m.dof_adr[i]}" if False else f"{nm} body={m.jnt_bodyid[i]} type={m.jnt_type[i]} qadr={m.jnt_qposadr[i]} jaxadr={m.jnt_dofadr[i]} axis={np.round(m.jnt_axis[i],4)} range={np.round(m.jnt_range[i],4)} limited={m.jnt_limited[i]} solref={np.round(m.jnt_solref[i],5)} solimp={np.round(m.jnt_solimp[i],5)}")
+[?2004l[?2004h> print("dof_damping", np.round(m.dof_damping,5))
+[?2004l[?2004h> print("dof_mass", np.round(m.dof_mass,5))
+[?2004l[?2004h> print("jnt_springref", np.round(m.jnt_springref,4))
+[?2004l[?2004h> EOF
+[?2004ljnt fields: ['jnt_actfrclimited', 'jnt_actfrcrange', 'jnt_actgravcomp', 'jnt_axis', 'jnt_bodyid', 'jnt_dofadr', 'jnt_group', 'jnt_limited', 'jnt_margin', 'jnt_pos', 'jnt_qposadr', 'jnt_range', 'jnt_solimp', 'jnt_solref', 'jnt_stiffness', 'jnt_type', 'jnt_user']
+dof fields: ['dof_M0', 'dof_Madr', 'dof_armature', 'dof_bodyid', 'dof_damping', 'dof_frictionloss', 'dof_invweight0', 'dof_jntid', 'dof_parentid', 'dof_simplenum', 'dof_solimp', 'dof_solref', 'dof_treeid']
+=== JOINTS ===
+J_1 body=2 type=1 qadr=0 jaxadr=0 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_2 body=3 type=1 qadr=4 jaxadr=3 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_3 body=4 type=1 qadr=8 jaxadr=6 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_4 body=5 type=1 qadr=12 jaxadr=9 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_5 body=6 type=1 qadr=16 jaxadr=12 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_6 body=7 type=1 qadr=20 jaxadr=15 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_7 body=8 type=1 qadr=24 jaxadr=18 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_8 body=9 type=1 qadr=28 jaxadr=21 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_9 body=10 type=1 qadr=32 jaxadr=24 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_10 body=11 type=1 qadr=36 jaxadr=27 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_11 body=12 type=1 qadr=40 jaxadr=30 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_12 body=13 type=1 qadr=44 jaxadr=33 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_13 body=14 type=1 qadr=48 jaxadr=36 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_14 body=15 type=1 qadr=52 jaxadr=39 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_15 body=16 type=1 qadr=56 jaxadr=42 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_16 body=17 type=1 qadr=60 jaxadr=45 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_17 body=18 type=1 qadr=64 jaxadr=48 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_18 body=19 type=1 qadr=68 jaxadr=51 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_19 body=20 type=1 qadr=72 jaxadr=54 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_20 body=21 type=1 qadr=76 jaxadr=57 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_21 body=22 type=1 qadr=80 jaxadr=60 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_22 body=23 type=1 qadr=84 jaxadr=63 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_23 body=24 type=1 qadr=88 jaxadr=66 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_24 body=25 type=1 qadr=92 jaxadr=69 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_25 body=26 type=1 qadr=96 jaxadr=72 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_26 body=27 type=1 qadr=100 jaxadr=75 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_27 body=28 type=1 qadr=104 jaxadr=78 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_28 body=29 type=1 qadr=108 jaxadr=81 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_29 body=30 type=1 qadr=112 jaxadr=84 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_30 body=31 type=1 qadr=116 jaxadr=87 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_31 body=32 type=1 qadr=120 jaxadr=90 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_32 body=33 type=1 qadr=124 jaxadr=93 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_33 body=34 type=1 qadr=128 jaxadr=96 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_34 body=35 type=1 qadr=132 jaxadr=99 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_35 body=36 type=1 qadr=136 jaxadr=102 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_36 body=37 type=1 qadr=140 jaxadr=105 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_37 body=38 type=1 qadr=144 jaxadr=108 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_38 body=39 type=1 qadr=148 jaxadr=111 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+J_last body=40 type=1 qadr=152 jaxadr=114 axis=[0. 0. 1.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+j39 body=41 type=2 qadr=156 jaxadr=117 axis=[1. 0. 0.] range=[0. 0.] limited=0 solref=[0.02 1.  ] solimp=[9.0e-01 9.5e-01 1.0e-03 5.0e-01 2.0e+00]
+dof_damping [0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015
+ 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.015 0.1  ]
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m12[0m, in [35m<module>[0m
+[1;35mAttributeError[0m: [35m'mujoco._structs.MjModel' object has no attribute 'dof_mass'. Did you mean: 'dof_Madr'?[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> 
+[?2004l[?2004h> prof = mujoco.MjData(ref)
+[?2004l[?2004h> mujoco.mj_forward(ref, prof)
+[?2004l[?2004h> print("base opts  iters", ref.opt.iterations, "ls", ref.opt.ls_iterations, "dt", ref.opt.timestep)
+[?2004l[?2004h> 
+[?2004l[?2004h> # time mj_forward vs mj_step
+[?2004l[?2004h> n=1000
+[?2004l[?2004h> tf=0.0; ts=0.0
+[?2004l[?2004h> for _ in range(5):  # warmup
+[?2004l[?2004h>     mujoco.mj_forward(ref, prof)
+[?2004l[?2004h> for _ in range(n):
+[?2004l[?2004h>     a=time.perf_counter(); mujoco.mj_forward(ref,prof); tf+=time.perf_counter()-a
+[?2004l[?2004h> for _ in range(n):
+[?2004l[?2004h>     a=time.perf_counter(); mujoco.mj_step(ref,prof); ts+=time.perf_counter()-a
+[?2004l[?2004h> print(f"mj_forward/step ms {tf/n*1e3:.4f}   mj_step/step ms {ts/n*1e3:.4f}  (integ+solve {ts/n-tf/n:.4f? })")
+[?2004l[?2004h> 
+[?2004l[?2004h> # collisions disable
+[?2004l[?2004h> ref2 = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> ref2.opt.disableflags |= mujoco.mjtDisableFlag.mjDSBL_CONTACT
+[?2004l[?2004h> d2=mujoco.MjData(ref2); mujoco.mj_forward(ref2,d2)
+[?2004l[?2004h> for _ in range(5): mujoco.mj_step(ref2,d2)
+[?2004l[?2004h> tc=np.mean([ (lambda: (lambda a=0:0))() ])
+[?2004l[?2004h> # simpler:
+[?2004l[?2004h> import statistics
+[?2004l[?2004h> def tsteps(m,d,k=300):
+[?2004l[?2004h>     for _ in range(3): mujoco.mj_step(m,d)
+[?2004l[?2004h>     times=[]
+[?2004l[?2004h>     for _ in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_step(m,d); times.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(times)*1e3
+[?2004l[?2004h> print(f"step ms base          {tsteps(ref,prof):.4f}")
+[?2004l[?2004h> print(f"step ms no-contact    {tsteps(ref2,d2):.4f}")
+[?2004l[?2004h> for it in [50,20,10,5]:
+[?2004l[?2004h>     m3 = mujoco.MjModel.from_xml_path('model_ref.xml'); m3.opt.iterations=it; d3=mujoco.MjData(m3); mujoco.mj_forward(m3,d3)
+[?2004l[?2004h>     print(f"step ms iters={it:<3}      {tsteps(m3,d3):.4f}")
+[?2004l[?2004h> for ls in [30,10,5]:
+[?2004l[?2004h>     m3 = mujoco.MjModel.from_xml_path('model_ref.xml'); m3.opt.ls_iterations=ls; d3=mujoco.MjData(m3); mujoco.mj_forward(m3,d3)
+[?2004l[?2004h>     print(f"step ms ls_it={ls:<3}      {tsteps(m3,d3):.4f}")
+[?2004l[?2004h> EOF
+[?2004lbase opts  iters 100 ls 50 dt 0.002
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m17[0m, in [35m<module>[0m
+[1;35mValueError[0m: [35mInvalid format specifier '.4f? ' for object of type 'float'[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> prof = mujoco.MjData(ref)
+[?2004l[?2004h> mujoco.mj_forward(ref, prof)
+[?2004l[?2004h> def tsteps(m,d,k=400):
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_step(m,d)
+[?2004l[?2004h>     times=[]
+[?2004l[?2004h>     for _ in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_step(m,d); times.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(times)*1e3
+[?2004l[?2004h> def tfwd(m,d,k=400):
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_forward(m,d)
+[?2004l[?2004h>     times=[]
+[?2004l[?2004h>     for _ in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_forward(m,d); times.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(times)*1e3
+[?2004l[?2004h> print(f"fwd ms   {tfwd(ref,prof):.4f}  step ms {tsteps(ref,prof):.4f}")
+[?2004l[?2004h> ref2 = mujoco.MjModel.from_xml_path('model_ref.xml'); ref2.opt.disableflags |= mujoco.mjtDisableFlag.mjDSBL_CONTACT
+[?2004l[?2004h> d2=mujoco.MjData(ref2); mujoco.mj_forward(ref2,d2)
+[?2004l[?2004h> print(f"nocontact step ms {tsteps(ref2,d2):.4f}")
+[?2004l[?2004h> for it in [100,50,20,10,5,1]:
+[?2004l[?2004h>     m3 = mujoco.MjModel.from_xml_path('model_ref.xml'); m3.opt.iterations=it; d3=mujoco.MjData(m3); mujoco.mj_forward(m3,d3)
+[?2004l[?2004h>     print(f"iters={it:<3} step ms {tsteps(m3,d3):.4f}")
+[?2004l[?2004h> for ls in [50,20,10,5,1]:
+[?2004l[?2004h>     m3 = mujoco.MjModel.from_xml_path('model_ref.xml'); m3.opt.ls_iterations=ls; d3=mujoco.MjData(m3); mujoco.mj_forward(m3,d3)
+[?2004l[?2004h>     print(f"ls_it={ls:<3} step ms {tsteps(m3,d3):.4f}")
+[?2004l[?2004h> EOF
+[?2004lfwd ms   0.4007  step ms 0.4527
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m18[0m, in [35m<module>[0m
+[1;35mAttributeError[0m: [35mmodule 'mujoco' has no attribute 'mjtDisableFlag'. Did you mean: 'mjtDisableBit'?[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> def load(): return mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> def state(m, seed):
+[?2004l[?2004h>     d=mujoco.MjData(m); nstep=int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(m,d)
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(m,FULL)); mujoco.mj_getState(m,d,s,FULL)
+[?2004l[?2004h>     return s,nstep
+[?2004l[?2004h> def tsteps(m,seed,nsteps,k=200):
+[?2004l[?2004h>     d=mujoco.MjData(m); rng=np.random.default_rng(seed); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_step(m,d); ts=[]
+[?2004l[?2004h>     for _ in range(k): a=time.perf_counter(); mujoco.mj_step(m,d); ts.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(ts)
+[?2004l[?2004h> 
+[?2004l[?2004h> # forward isolation
+[?2004l[?2004h> ref=load(); prof=mujoco.MjData(ref); mujoco.mj_forward(ref,prof)
+[?2004l[?2004h> def tfwd(m,d,k=400):
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_forward(m,d)
+[?2004l[?2004h>     return np.mean([ (lambda: ((a:=time.perf_counter(),mujoco.mj_forward(m,d),time.perf_counter()-a)[2])() ) for _ in range(k)])*1e3
+[?2004l[?2004h> print(f"fwd(contact) ms      {tfwd(ref,prof):.4f}")
+[?2004l[?2004h> r2=load(); r2.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT; d2=mujoco.MjData(r2); mujoco.mj_forward(r2,d2)
+[?2004l[?2004h> print(f"fwd(noccontact) ms   {tfwd(r2,d2):.4f}")
+[?2004l[?2004h> # evalQ (kinematics only)
+[?2004l[?2004h> def teq(m,d,k=400):
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_evalQ(m,d)
+[?2004l[?2004h>     return np.mean([ (lambda: ((a:=time.perf_counter(),mujoco.mj_evalQ(m,d),time.perf_counter()-a)[2])() ) for _ in range(k)])*1e3
+[?2004l[?2004h> print(f"evalQ(kinematics) ms {teq(ref,prof):.4f}")
+[?2004l[?2004h> 
+[?2004l[?2004h> print("\n--- timestep sweep (seed 123) ---")
+[?2004l[?2004h> r0=load(); s0,_=state(r0,123); per0=tsteps(r0,123,1000,200); tot0=per0*int(2.0/r0.opt.timestep)
+[?2004l[?2004h> for dt in [0.002,0.0025,0.003,0.0033,0.004,0.005,0.006,0.01]:
+[?2004l[?2004h>     mc=load(); mc.opt.timestep=dt; sc,ns=state(mc,123); per=tsteps(mc,123,ns,200); tot=per*ns
+[?2004l[?2004h>     diff=np.abs(sc-s0); rat=tot/tot0
+[?2004l[?2004h>     print(f"dt={dt:<6} nstep={ns:<4} maxdiff={diff.max():.2e} l2norm={np.linalg.norm(sc-s0):.2e} time={tot:.4f}s ratio={rat:.3f} (atol5e-{'PASS' if (np.linalg.norm(sc-s0)<=1e-5) else 'failL2'})")
+[?2004l[?2004h> EOF
+[?2004lTraceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m22[0m, in [35m<module>[0m
+  File [35m"<stdin>"[0m, line [35m21[0m, in [35mtfwd[0m
+  File [35m"/usr/local/lib/python3.13/site-packages/numpy/_core/fromnumeric.py"[0m, line [35m3860[0m, in [35mmean[0m
+    return [31m_methods._mean[0m[1;31m(a, axis=axis, dtype=dtype,[0m
+           [31m~~~~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+                          [1;31mout=out, **kwargs)[0m
+                          [1;31m^^^^^^^^^^^^^^^^^^[0m
+  File [35m"/usr/local/lib/python3.13/site-packages/numpy/_core/_methods.py"[0m, line [35m134[0m, in [35m_mean[0m
+    ret = umr_sum(arr, axis, dtype, out, keepdims, where=where)
+[1;35mTypeError[0m: [35munsupported operand type(s) for +: 'function' and 'function'[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> def load(): return mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> def state(m, seed):
+[?2004l[?2004h>     d=mujoco.MjData(m); nstep=int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(m,d)
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(m,FULL)); mujoco.mj_getState(m,d,s,FULL)
+[?2004l[?2004h>     return s,nstep
+[?2004l[?2004h> def meanstep(m,seed,n,k=300):
+[?2004l[?2004h>     d=mujoco.MjData(m); rng=np.random.default_rng(seed); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_step(m,d)
+[?2004l[?2004h>     ts=[0.0]*k
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_step(m,d); ts[i]=time.perf_counter()-a
+[?2004l[?2004h>     return np.mean(ts)
+[?2004l[?2004h> def meanfwd(m,d,k=600):
+[?2004l[?2004h>     for _ in range(10): mujoco.mj_forward(m,d)
+[?2004l[?2004h>     ts=[0.0]*k
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_forward(m,d); ts[i]=time.perf_counter()-a
+[?2004l[?2004h>     return np.mean(ts)
+[?2004l[?2004h> def meanfn(m,d,fn,k=600):
+[?2004l[?2004h>     for _ in range(10): fn(m,d)
+[?2004l[?2004h>     ts=[0.0]*k
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); fn(m,d); ts[i]=time.perf_counter()-a
+[?2004l[?2004h>     return np.mean(ts)
+[?2004l[?2004h> 
+[?2004l[?2004h> ref=load(); prof=mujoco.MjData(ref); mujoco.mj_forward(ref,prof)
+[?2004l[?2004h> print(f"fwd(contact) ms   {meanfwd(ref,prof)*1e3:.4f}")
+[?2004l[?2004h> r2=load(); r2.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT; d2=mujoco.MjData(r2); mujoco.mj_forward(r2,d2)
+[?2004l[?2004h> print(f"fwd(noccontact)ms {meanfwd(r2,d2)*1e3:.4f}")
+[?2004l[?2004h> print(f"evalQ(kinematics) ms {meanfn(ref,prof,mujoco.mj_evalQ)*1e3:.4f}")
+[?2004l[?2004h> print(f"step ms            {meanstep(ref,123,int(2/ref.opt.timestep))*1e3:.4f}")
+[?2004l[?2004h> 
+[?2004l[?2004h> print("\n--- timestep sweep (seed 123) ---")
+[?2004l[?2004h> r0=load(); s0,_=state(r0,123); per0=meanstep(r0,123,1000,300); tot0=per0*int(2.0/r0.opt.timestep)
+[?2004l[?2004h> print(f"ref per-step {per0*1e3:.4f} ms total {tot0:.4f}s")
+[?2004l[?2004h> for dt in [0.002,0.0025,0.003,0.0033,0.004,0.005,0.006,0.008,0.01]:
+[?2004l[?2004h>     mc=load(); mc.opt.timestep=dt; sc,ns=state(mc,123); per=meanstep(mc,123,ns,300); tot=per*ns
+[?2004l[?2004h>     l2=np.linalg.norm(sc-s0); rat=tot/tot0
+[?2004l[?2004h>     print(f"dt={dt:<6} nstep={ns:<4} maxabs={np.abs(sc-s0).max():.2e} l2={l2:.2e} total={tot:.4f}s ratio={rat:.3f}")
+[?2004l[?2004h> EOF
+[?2004lfwd(contact) ms   0.3940
+fwd(noccontact)ms 0.3645
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m35[0m, in [35m<module>[0m
+[1;35mAttributeError[0m: [35mmodule 'mujoco' has no attribute 'mj_evalQ'[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> def load(): return mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> def state(m, seed):
+[?2004l[?2004h>     d=mujoco.MjData(m); nstep=int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(m,d)
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(m,FULL)); mujoco.mj_getState(m,d,s,FULL)
+[?2004l[?2004h>     return s,nstep
+[?2004l[?2004h> def meanstep(m,seed,n,k=400):
+[?2004l[?2004h>     d=mujoco.MjData(m); rng=np.random.default_rng(seed); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_step(m,d)
+[?2004l[?2004h>     ts=[0.0]*k
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_step(m,d); ts[i]=time.perf_counter()-a
+[?2004l[?2004h>     return np.mean(ts)
+[?2004l[?2004h> print("--- timestep sweep ---")
+[?2004l[?2004h> r0=load(); s0,_=state(r0,123); per0=meanstep(r0,123,1000,400); tot0=per0*int(2.0/r0.opt.timestep)
+[?2004l[?2004h> print(f"ref per-step {per0*1e3:.4f} ms total {tot0:.4f}s")
+[?2004l[?2004h> for dt in [0.002,0.0025,0.003,0.0033,0.004,0.005,0.006,0.008,0.01]:
+[?2004l[?2004h>     mc=load(); mc.opt.timestep=dt; sc,ns=state(mc,123); per=meanstep(mc,123,ns,400); tot=per*ns
+[?2004l[?2004h>     l2=np.linalg.norm(sc-s0); rat=tot/tot0; ok = np.allclose(sc,s0,atol=1e-5)
+[?2004l[?2004h>     print(f"dt={dt:<6} nstep={ns:<4} maxabs={np.abs(sc-s0).max():.2e} l2={l2:.2e} total={tot:.4f}s ratio={rat:.3f} allclose={ok}")
+[?2004l[?2004h> EOF
+[?2004l--- timestep sweep ---
+ref per-step 0.4654 ms total 0.4654s
+dt=0.002  nstep=1000 maxabs=0.00e+00 l2=0.00e+00 total=0.4673s ratio=1.004 allclose=True
+dt=0.0025 nstep=800  maxabs=2.60e-04 l2=4.46e-04 total=0.3805s ratio=0.818 allclose=False
+dt=0.003  nstep=666  maxabs=2.00e-03 l2=2.78e-03 total=0.3093s ratio=0.665 allclose=False
+dt=0.0033 nstep=606  maxabs=6.95e-04 l2=1.22e-03 total=0.2925s ratio=0.629 allclose=False
+dt=0.004  nstep=500  maxabs=9.00e-04 l2=1.61e-03 total=0.2371s ratio=0.509 allclose=False
+dt=0.005  nstep=400  maxabs=1.21e-03 l2=2.33e-03 total=0.1873s ratio=0.403 allclose=False
+dt=0.006  nstep=333  maxabs=2.10e-03 l2=4.54e-03 total=0.1558s ratio=0.335 allclose=False
+dt=0.008  nstep=250  maxabs=1.75e-03 l2=6.22e-03 total=0.1159s ratio=0.249 allclose=False
+dt=0.01   nstep=200  maxabs=9.89e-02 l2=3.02e-01 total=0.0954s ratio=0.205 allclose=False
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 << 'EOF'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def meanstep(m,seed,n,k=500):
+[?2004l[?2004h>     d=mujoco.MjData(m); rng=np.random.default_rng(seed); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_step(m,d)
+[?2004l[?2004h>     ts=[0.0]*k
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_step(m,d); ts[i]=time.perf_counter()-a
+[?2004l[?2004h>     return np.mean(ts)*1e3
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print("baseline step ms            ", round(meanstep(ref,7,1000),4))
+[?2004l[?2004h> # plugin free
+[?2004l[?2004h> import copy
+[?2004l[?2004h> m0=open('model_ref.xml').read()
+[?2004l[?2004h> m1=m0.replace('1e7','0').replace('4e6','0')
+[?2004l[?2004h> open('/tmp/noplug.xml','w').write(m1)
+[?2004l[?2004h> mp=mujoco.MjModel.from_xml_path('/tmp/noplug.xml')
+[?2004l[?2004h> print("twist=bend=0 step ms        ", round(meanstep(mp,7,1000),4))
+[?2004l[?2004h> mc=mp; mc.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_CONTACT
+[?2004l[?2004h> print("twist=bend=0 + contactoff   ", round(meanstep(mc,7,1000),4))
+[?2004l[?2004h> # iterations/ls only
+[?2004l[?2004h> for it in [100,20,5,1]:
+[?2004l[?2004h>     mx=mp; mx.opt.iterations=it
+[?2004l[?2004h>     print(f"  noplug iters={it:<3}     ", round(meanstep(mx,7,1000),4))
+[?2004l[?2004h> for ls in [50,10,5,1]:
+[?2004l[?2004h>     mx=mp; mx.opt.ls_iterations=ls
+[?2004l[?2004h>     print(f"  noplug ls={ls:<3}      ", round(meanstep(mx,7,1000),4))
+[?2004l[?2004h> # forward phases availability
+[?2004l[?2004h> print("has fwdPosition",hasattr(mujoco,'mj_fwdPosition'),"fwdAccel",hasattr(mujoco,'mj_fwdAcceleration'),"fwdVel",hasattr(mujoco,'mj_fwdVelocity'),"evalQ",hasattr(mujoco,'mj_evalQ'))
+[?2004l[?2004h> EOF
+[?2004lbaseline step ms             0.5188
+twist=bend=0 step ms         0.458
+twist=bend=0 + contactoff    0.433
+  noplug iters=100      0.4406
+  noplug iters=20       0.4329
+  noplug iters=5        0.4411
+  noplug iters=1        0.438
+  noplug ls=50        0.4339
+  noplug ls=10        0.4388
+  noplug ls=5         0.4286
+  noplug ls=1         0.4413
+has fwdPosition True fwdAccel True fwdVel True evalQ False
+[?2004hroot@7846d2fb431e:/app# cd /app && cp model_ref.xml model.xml && python3 eval.py
+[?2004lFinal state difference: 0.0000
+Avg simulation time: 0.4505 secs
+Avg simulation time (ref): 0.4598 secs
+Speedup: 1.02x
+Time pctg: 0.98
+Traceback (most recent call last):
+  File [35m"/app/eval.py"[0m, line [35m88[0m, in [35m<module>[0m
+    [31mtest_model_speed[0m[1;31m()[0m
+    [31m~~~~~~~~~~~~~~~~[0m[1;31m^^[0m
+  File [35m"/app/eval.py"[0m, line [35m81[0m, in [35mtest_model_speed[0m
+    assert [1;31mact_time_pctg <= pctg[0m, (
+           [1;31m^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mAssertionError[0m: [35mTime pctg 98.39% (need 60.00%)[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && cat > gen_native.py << 'PYEOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> ref = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> # cable bodies 1..41, slider 42
+[?2004l[?2004h> names = [mujoco.mj_id2name(mujoco.mjtObj.mjOBJ_BODY, ref, i) if False else None for i in range(0)]
+[?2004l[?2004h> def bname(i): return mujoco.mj_id2name(mujoco.mjtObj.mjOBJ_BODY, i, 0)  # placeholder
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@7846d2fb431e:/app# echo "will rewrite generator properly next"
+[?2004lwill rewrite generator properly next
+[?2004hroot@7846d2fb431e:/app# cd /app && cat > gen_native.py << 'PYEOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> ref = mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> OBJ=mujoco.mjtObj
+[?2004l[?2004h> def bname(i):
+[?2004l[?2004h>     n=mujoco.mj_id2name(OBJ.mjOBJ_BODY, ref, i)
+[?2004l[?2004h>     return n if n else f"b{i}"
+[?2004l[?2004h> jtype2str={0:"free",1:"ball",2:"slide",3:"hinge"}
+[?2004l[?2004h> # collect bodies 1..nbody, determine cable vs slider
+[?2004l[?2004h> nbody=ref.nbody
+[?2004l[?2004h> def jnt_of_body(i):
+[?2004l[?2004h>     ja=ref.body_jntadr[i]
+[?2004l[?2004h>     if ja is None: return None
+[?2004l[?2004h>     return ja
+[?2004l[?2004h> def geom_str(i):
+[?2004l[?2004h>     # body i geoms
+[?2004l[?2004h>     geoms=[]
+[?2004l[?2004h>     start=ref.body_geomadr[i]; end=ref.body_geomadr[i+1] if i+1<ref.nbody+1 else ref.ngeom
+[?2004l[?2004h>     gadr=ref.body_geomadr
+[?2004l[?2004h>     g0=gadr[i]; g1=(gadr[i+1] if i+1<=ref.nbody else ref.ngeom)
+[?2004l[?2004h>     for gi in range(g0,g1):
+[?2004l[?2004h>         gt=ref.geom_type[gi]; size=np.round(ref.geom_size[gi],6); pos=np.round(ref.geom_pos[gi],6); quat=np.round(ref.geom_quat[gi],6)
+[?2004l[?2004h>         tmap={2:"sphere",6:"capsule",3:"box",1:"cylinder"}
+[?2004l[?2004h>         tn=tmap.get(gt,f"type{gt}")
+[?2004l[?2004h>         s=" ".join(f"{v:g}" for v in size if v!=0) if any(size) else "0 0 0"
+[?2004l[?2004h>         p=" ".join(f"{v:g}" for v in pos)
+[?2004l[?2004h>         q=" ".join(f"{v:g}" for v in quat)
+[?2004l[?2004h>         geoms.append(f'      <geom type="{tn}" size="{s}" pos="{p}" quat="{q}" condim="1"/>' if gt==2 else f'      <geom type="{tn}" size="{s}" pos="{p}" quat="{q}" condim="1"/>')
+[?2004l[?2004h>     return geoms
+[?2004l[?2004h> 
+[?2004l[?2004h> names=[bname(i) for i in range(0,ref.nbody)]
+[?2004l[?2004h> out=[]
+[?2004l[?2004h> out.append('<mujoco model="CableNative">')
+[?2004l[?2004h> out.append('  <statistic center="0 0 .3" extent="1"/>')
+[?2004l[?2004h> out.append('  <compiler autolimits="true"/>')
+[?2004l[?2004h> out.append('  <size memory="2M"/>')
+[?2004l[?2004h> out.append('  <option timestep="0.002"/>')
+[?2004l[?2004h> out.append('  <worldbody>')
+[?2004l[?2004h> # emit nested bodies in order 1..nbody using parent chain
+[?2004l[?2004h> def emit(i, depth):
+[?2004l[?2004h>     ind='    '*(depth+1)
+[?2004l[?2004h>     pos=np.round(ref.body_pos[i],6); p=" ".join(f"{v:g}" for v in pos)
+[?2004l[?2004h>     out.append(f'{ind}<body name="{names[i]}" pos="{p}">')
+[?2004l[?2004h>     if i==ref.nbody-1:
+[?2004l[?2004h>         # slider body: it has slide joint + sphere geom
+[?2004l[?2004h>         pass
+[?2004l[?2004h>     # joint
+[?2004l[?2004h>     ja=ref.body_jntadr[i]
+[?2004l[?2004h>     if ja is not None and ja < ref.njnt:
+[?2004l[?2004h>         jt=ref.jnt_type[ja]
+[?2004l[?2004h>         # damping: use dof damping of this body's dops
+[?2004l[?2004h>         d0=ref.body_dofadr[i]; d1=ref.body_dofadr[i+1] if i+1<ref.nbody+1 else ref.nv
+[?2004l[?2004h>         damps=ref.dof_damping[d0:d1] if (i+1<=ref.nbody) else ref.dof_damping[d0:]
+[?2004l[?2004h>         damp=np.unique(damps)
+[?2004l[?2004h>         if jt==0:
+[?2004l[?2004h>             jstr='type="free"'
+[?2004l[?2004h>         elif jt==1:
+[?2004l[?2004h>             jstr=f'type="ball" damping="{damp[0]:g}"'
+[?2004l[?2004h>         elif jt==2:
+[?2004l[?2004h>             ax=np.round(ref.jnt_axis[ja],6); axs=" ".join(f"{v:g}" for v in ax)
+[?2004l[?2004h>             jstr=f'type="slide" axis="{axs}" damping="{damp[0]:g}"'
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             jstr=f'type="hinge"'
+[?2004l[?2004h>         out.append(f'{ind}  <joint name="J_{names[i]}" {jstr}/>')
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         out.append(f'{ind}  <joint type="fixed"/>')
+[?2004l[?2004h>     # geoms
+[?2004l[?2004h>     for g in geom_str(i): out.append(g)
+[?2004l[?2004h>     # children
+[?2004l[?2004h>     k=i+1; ch=[]
+[?2004l[?2004h>     while k<ref.nbody and ref.body_parentid[k]==i:
+[?2004l[?2004h>         ch.append(k); k+=1
+[?2004l[?2004h>     for c in ch:
+[?2004l[?2004h>         emit(c,depth+1)
+[?2004l[?2004h>     out.append(f'{ind}</body>')
+[?2004l[?2004h> for i in range(1,ref.nbody+1):
+[?2004l[?2004h>     if ref.body_parentid[i]==0:
+[?2004l[?2004h>         emit(i,0)
+[?2004l[?2004h> out.append('  </worldbody>')
+[?2004l[?2004h> out.append('  <equality>')
+[?2004l[?2004h> out.append('    <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>')
+[?2004l[?2004h> out.append('  </equality>')
+[?2004l[?2004h> out.append('  <contact>')
+[?2004l[?2004h> out.append('    <exclude body1="B_last" body2="slider"/>')
+[?2004l[?2004h> out.append('  </contact>')
+[?2004l[?2004h> out.append('  <worldbody><site name="S_last" body="B_last" pos="0 0 0"/></worldbody>')
+[?2004l[?2004h> out.append('  <actuator>')
+[?2004l[?2004h> out.append('    <motor name="A_last" site="S_last" gear="0 0 0 1 0 0" ctrlrange="-0.03 0.03"/>')
+[?2004l[?2004h> out.append('  </actuator>')
+[?2004l[?2004h> out.append('</mujoco>')
+[?2004l[?2004h> open('model_ne.xml','w').write("\n".join(out))
+[?2004l[?2004h> print("wrote model_ne.xml, nbody line:", ref.nbody)
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@7846d2fb431e:/app# python3 gen_native.py
+[?2004lTraceback (most recent call last):
+  File [35m"/app/gen_native.py"[0m, line [35m30[0m, in [35m<module>[0m
+    names=[[31mbname[0m[1;31m(i)[0m for i in range(0,ref.nbody)]
+           [31m~~~~~[0m[1;31m^^^[0m
+  File [35m"/app/gen_native.py"[0m, line [35m5[0m, in [35mbname[0m
+    n=mujoco.mj_id2name(OBJ.mjOBJ_BODY, ref, i)
+[1;35mTypeError[0m: [35mmj_id2name(): incompatible function arguments. The following argument types are supported:
+    1. (m: mujoco._structs.MjModel, type: typing.SupportsInt, id: typing.SupportsInt) -> str
+
+Invoked with: <mjtObj.mjOBJ_BODY: 1>, <mujoco._structs.MjModel object at 0x704d5753c930>, 0[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && sed -i 's/n=mujoco.mj_id2name(OBJ.mjOBJ_BODY, ref, i)/n=mujoco.mj_id2name(ref, OBJ.mjOBJ_BODY, i)/' gen_native.py && python3 gen_native.py && echo "--- head ---" && head -30 model_ne.xml
+[?2004lTraceback (most recent call last):
+  File [35m"/app/gen_native.py"[0m, line [35m77[0m, in [35m<module>[0m
+    [31memit[0m[1;31m(i,0)[0m
+    [31m~~~~[0m[1;31m^^^^^[0m
+  File [35m"/app/gen_native.py"[0m, line [35m60[0m, in [35memit[0m
+    jstr=f'type="slide" axis="{axs}" damping="{[31mdamp[0m[1;31m[0][0m:g}"'
+                                               [31m~~~~[0m[1;31m^^^[0m
+[1;35mIndexError[0m: [35mindex 0 is out of bounds for axis 0 with size 0[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PYEOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> s=open('gen_native.py').read()
+[?2004l[?2004h> s=s.replace("        d0=ref.body_dofadr[i]; d1=ref.body_dofadr[i+1] if i+1<ref.nbody+1 else ref.nv\n        damps=ref.dof_damping[d0:d1] if (i+1<=ref.nbody) else ref.dof_damping[d0:]\n        damp=np.unique(damps)", "        damp=np.array([ref.dof_damping[ref.jnt_dofadr[ja]]])")
+[?2004l[?2004h> open('gen_native.py','w').write(s)
+[?2004l[?2004h> print("patched")
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@7846d2fb431e:/app# python3 gen_native.py && echo "--- head ---" && head -20 model_ne.xml && echo "..." && tail -12 model_ne.xml
+[?2004lTraceback (most recent call last):
+  File [35m"/app/gen_native.py"[0m, line [35m75[0m, in [35m<module>[0m
+    [31memit[0m[1;31m(i,0)[0m
+    [31m~~~~[0m[1;31m^^^^^[0m
+  File [35m"/app/gen_native.py"[0m, line [35m65[0m, in [35memit[0m
+    for g in [31mgeom_str[0m[1;31m(i)[0m: out.append(g)
+             [31m~~~~~~~~[0m[1;31m^^^[0m
+  File [35m"/app/gen_native.py"[0m, line [35m17[0m, in [35mgeom_str[0m
+    start=ref.body_geomadr[i]; end=[31mref.body_geomadr[0m[1;31m[i+1][0m if i+1<ref.nbody+1 else ref.ngeom
+                                   [31m~~~~~~~~~~~~~~~~[0m[1;31m^^^^^[0m
+[1;35mIndexError[0m: [35mindex 42 is out of bounds for axis 0 with size 42[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PYEOF'
+[?2004l[?2004h> s=open('gen_native.py').read()
+[?2004l[?2004h> s=s.replace("    g0=gadr[i]; g1=(gadr[i+1] if i+1<=ref.nbody else ref.ngeom)", "    g0=gadr[i]; g1=(gadr[i+1] if i+1<len(gadr) else ref.ngeom)")
+[?2004l[?2004h> s=s.replace("    start=ref.body_geomadr[i]; end=ref.body_geomadr[i+1] if i+1<ref.nbody+1 else ref.ngeom\n", "")
+[?2004l[?2004h> open('gen_native.py','w').write(s)
+[?2004l[?2004h> print("ok")
+[?2004l[?2004h> PYEOF
+[?2004lok
+[?2004hroot@7846d2fb431e:/app# python3 gen_native.py && echo "--- head ---" && head -14 model_ne.xml && echo "...tail..." && tail -12 model_ne.xml
+[?2004lTraceback (most recent call last):
+  File [35m"/app/gen_native.py"[0m, line [35m73[0m, in [35m<module>[0m
+    if [31mref.body_parentid[0m[1;31m[i][0m==0:
+       [31m~~~~~~~~~~~~~~~~~[0m[1;31m^^^[0m
+[1;35mIndexError[0m: [35mindex 42 is out of bounds for axis 0 with size 42[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && sed -i 's/for i in range(1,ref.nbody+1):/for i in range(1,ref.nbody):/' gen_native.py && python3 gen_native.py && echo "bodies:" && grep -c "<body" model_ne.xml && echo "--- head ---" && head -16 model_ne.xml && echo "...tail..." && tail -14 model_ne.xml
+[?2004lwrote model_ne.xml, nbody line: 42
+bodies:
+41
+--- head ---
+<mujoco model="CableNative">
+  <statistic center="0 0 .3" extent="1"/>
+  <compiler autolimits="true"/>
+  <size memory="2M"/>
+  <option timestep="0.002"/>
+  <worldbody>
+    <body name="B_first" pos="-0.3 0 0.6">
+      <joint name="J_B_first" type="slide" axis="1 0 0" damping="0.1"/>
+      <geom type="box" size="0.005 0.0125" pos="0.0125 0 0" quat="0.707107 0 -0.707107 0" condim="1"/>
+        <body name="B_1" pos="0.025 0 0">
+          <joint name="J_B_1" type="ball" damping="0.015"/>
+      <geom type="box" size="0.005 0.0125" pos="0.0125 0 0" quat="0.707107 0 -0.707107 0" condim="1"/>
+            <body name="B_2" pos="0.025 0 0">
+              <joint name="J_B_2" type="ball" damping="0.015"/>
+      <geom type="box" size="0.005 0.0125" pos="0.0125 0 0" quat="0.707107 0 -0.707107 0" condim="1"/>
+                <body name="B_3" pos="0.025 0 0">
+...tail...
+      <geom type="sphere" size="0.01" pos="0 0 0" quat="1 0 0 0" condim="1"/>
+    </body>
+  </worldbody>
+  <equality>
+    <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>
+  </equality>
+  <contact>
+    <exclude body1="B_last" body2="slider"/>
+  </contact>
+  <worldbody><site name="S_last" body="B_last" pos="0 0 0"/></worldbody>
+  <actuator>
+    <motor name="A_last" site="S_last" gear="0 0 0 1 0 0" ctrlrange="-0.03 0.03"/>
+  </actuator>
+</mujoco>[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PYEOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print("nbody",ref.nbody)
+[?2004l[?2004h> for i in range(1,ref.nbody):
+[?2004l[?2004h>     print(i, mujoco.mj_id2name(ref,mujoco.mjtObj.mjOBJ_BODY,i), "plug",ref.body_plugin[i], "jadr",ref.body_jntadr[i], "nq_dof",ref.body_dofnum[i], "mass",round(ref.body_mass[i],6))
+[?2004l[?2004h> print("geoms 1,2,41:", ref.geom_type[1], np.round(ref.geom_size[1],6), np.round(ref.geom_pos[1],6), np.round(ref.geom_quat[1],6))
+[?2004l[?2004h> print("slider geom 40:", ref.geom_type[40], np.round(ref.geom_size[40],6), np.round(ref.geom_pos[40],6))
+[?2004l[?2004h> EOF
+[?2004l[?2004h> PYEOF
+[?2004lnbody 42
+1 B_first plug 0 jadr -1 nq_dof 0 mass 0.002487
+2 B_1 plug 0 jadr 0 nq_dof 3 mass 0.002487
+3 B_2 plug 0 jadr 1 nq_dof 3 mass 0.002487
+4 B_3 plug 0 jadr 2 nq_dof 3 mass 0.002487
+5 B_4 plug 0 jadr 3 nq_dof 3 mass 0.002487
+6 B_5 plug 0 jadr 4 nq_dof 3 mass 0.002487
+7 B_6 plug 0 jadr 5 nq_dof 3 mass 0.002487
+8 B_7 plug 0 jadr 6 nq_dof 3 mass 0.002487
+9 B_8 plug 0 jadr 7 nq_dof 3 mass 0.002487
+10 B_9 plug 0 jadr 8 nq_dof 3 mass 0.002487
+11 B_10 plug 0 jadr 9 nq_dof 3 mass 0.002487
+12 B_11 plug 0 jadr 10 nq_dof 3 mass 0.002487
+13 B_12 plug 0 jadr 11 nq_dof 3 mass 0.002487
+14 B_13 plug 0 jadr 12 nq_dof 3 mass 0.002487
+15 B_14 plug 0 jadr 13 nq_dof 3 mass 0.002487
+16 B_15 plug 0 jadr 14 nq_dof 3 mass 0.002487
+17 B_16 plug 0 jadr 15 nq_dof 3 mass 0.002487
+18 B_17 plug 0 jadr 16 nq_dof 3 mass 0.002487
+19 B_18 plug 0 jadr 17 nq_dof 3 mass 0.002487
+20 B_19 plug 0 jadr 18 nq_dof 3 mass 0.002487
+21 B_20 plug 0 jadr 19 nq_dof 3 mass 0.002487
+22 B_21 plug 0 jadr 20 nq_dof 3 mass 0.002487
+23 B_22 plug 0 jadr 21 nq_dof 3 mass 0.002487
+24 B_23 plug 0 jadr 22 nq_dof 3 mass 0.002487
+25 B_24 plug 0 jadr 23 nq_dof 3 mass 0.002487
+26 B_25 plug 0 jadr 24 nq_dof 3 mass 0.002487
+27 B_26 plug 0 jadr 25 nq_dof 3 mass 0.002487
+28 B_27 plug 0 jadr 26 nq_dof 3 mass 0.002487
+29 B_28 plug 0 jadr 27 nq_dof 3 mass 0.002487
+30 B_29 plug 0 jadr 28 nq_dof 3 mass 0.002487
+31 B_30 plug 0 jadr 29 nq_dof 3 mass 0.002487
+32 B_31 plug 0 jadr 30 nq_dof 3 mass 0.002487
+33 B_32 plug 0 jadr 31 nq_dof 3 mass 0.002487
+34 B_33 plug 0 jadr 32 nq_dof 3 mass 0.002487
+35 B_34 plug 0 jadr 33 nq_dof 3 mass 0.002487
+36 B_35 plug 0 jadr 34 nq_dof 3 mass 0.002487
+37 B_36 plug 0 jadr 35 nq_dof 3 mass 0.002487
+38 B_37 plug 0 jadr 36 nq_dof 3 mass 0.002487
+39 B_38 plug 0 jadr 37 nq_dof 3 mass 0.002487
+40 B_last plug 0 jadr 38 nq_dof 3 mass 0.002487
+41 slider plug -1 jadr 39 nq_dof 1 mass 0.004189
+geoms 1,2,41: 3 [0.005  0.0125 0.    ] [0.0125 0.     0.    ] [ 0.707107  0.       -0.707107  0.      ]
+slider geom 40: 2 [0.01 0.   0.  ] [0. 0. 0.]
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m8[0m, in [35m<module>[0m
+[1;35mNameError[0m: [35mname 'EOF' is not defined[0m
+^C
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PYEOF'
+[?2004l[?2004h> CABLE='<geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" quat="0.707107 0 -0.707107 0" condim="1"/>'
+[?2004l[?2004h> lines=[]
+[?2004l[?2004h> lines.append('<mujoco model="CableNative">')
+[?2004l[?2004h> lines.append('  <statistic center="0 0 .3" extent="1"/>')
+[?2004l[?2004h> lines.append('  <compiler autolimits="true"/>')
+[?2004l[?2004h> lines.append('  <size memory="2M"/>')
+[?2004l[?2004h> lines.append('  <option timestep="0.002"/>')
+[?2004l[?2004h> lines.append('  <worldbody>')
+[?2004l[?2004h> lines.append('    <body name="B_first" pos="-0.3 0 0.6">')
+[?2004l[?2004h> lines.append('      '+CABLE)
+[?2004l[?2004h> for k in range(1,39):  # B_1 .. B_38
+[?2004l[?2004h>     depth=k+1
+[?2004l[?2004h>     ind='    '*(depth)
+[?2004l[?2004h>     lines.append(f'{ind}<body name="B_{k}" pos="0.025 0 0">')
+[?2004l[?2004h>     lines.append(f'{ind}  <joint type="ball" damping="0.015"/>')
+[?2004l[?2004h>     lines.append(f'{ind}  '+CABLE)
+[?2004l[?2004h> # B_last (body 40)
+[?2004l[?2004h> ind='    '*(41)
+[?2004l[?2004h> lines.append(f'{ind}<body name="B_last" pos="0.025 0 0">')
+[?2004l[?2004h> lines.append(f'{ind}  <joint type="ball" damping="0.015"/>')
+[?2004l[?2004h> lines.append(f'{ind}  '+CABLE)
+[?2004l[?2004h> lines.append(f'{ind}  <site name="S_last" pos="0 0 0"/>')
+[?2004l[?2004h> # close 39 bodies (B_last + B_1..B_38)
+[?2004l[?2004h> for depth in range(41,30,-1):
+[?2004l[?2004h>     lines.append('    '*depth+'</body>')
+[?2004l[?2004h> # close B_first
+[?2004l[?2004h> lines.append('    </body>')
+[?2004l[?2004h> # slider
+[?2004l[?2004h> lines.append('    <body name="slider" pos="0.7 0 0.6">')
+[?2004l[?2004h> lines.append('      <joint type="slide" axis="1 0 0" damping="0.1"/>')
+[?2004l[?2004h> lines.append('      <geom type="sphere" size="0.01"/>')
+[?2004l[?2004h> lines.append('    </body>')
+[?2004l[?2004h> lines.append('  </worldbody>')
+[?2004l[?2004h> lines.append('  <equality>')
+[?2004l[?2004h> lines.append('    <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>')
+[?2004l[?2004h> lines.append('  </equality>')
+[?2004l[?2004h> lines.append('  <contact>')
+[?2004l[?2004h> lines.append('    <exclude body1="B_last" body2="slider"/>')
+[?2004l[?2004h> lines.append('  </contact>')
+[?2004l[?2004h> lines.append('  <actuator>')
+[?2004l[?2004h> lines.append('    <motor name="A_last" site="S_last" gear="0 0 0 1 0 0" ctrlrange="-0.03 0.03"/>')
+[?2004l[?2004h> lines.append('  </actuator>')
+[?2004l[?2004h> lines.append('</mujoco>')
+[?2004l[?2004h> open('model_ne.xml','w').write("\n".join(lines))
+[?2004l[?2004h> print("written")
+[?2004l[?2004h> PYEOF
+[?2004lwritten
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PYEOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> ne=mujoco.MjModel.from_xml_path('model_ne.xml')
+[?2004l[?2004h> print("nq/nv ref",ref.nq,ref.nv," ne",ne.nq,ne.nv)
+[?2004l[?2004h> print("nbody ref",ref.nbody," ne",ne.nbody, "njnt",ref.njnt,ne.njnt,"neq",ref.neq,ne.neq,"ngeom",ref.ngeom,ne.ngeom,"nu",ref.nu,ne.nu)
+[?2004l[?2004h> print("mass match cable",round(ref.body_mass[2],6),round(ne.body_mass[2],6)," slider",round(ref.body_mass[41],6),round(ne.body_mass[41],6))
+[?2004l[?2004h> print("name order ne:",[mujoco.mj_id2name(ne,mujoco.mjtObj.mjOBJ_BODY,i) for i in range(1,ne.nbody)])
+[?2004l[?2004h> PYEOF
+[?2004lTraceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m3[0m, in [35m<module>[0m
+[1;35mValueError[0m: [35mXML parse error 14:
+Error=XML_ERROR_MISMATCHED_ELEMENT ErrorID=14 (0xe) Line number=87: XMLElement name=body
+[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PYEOF'
+[?2004l[?2004h> CABLE='<geom type="capsule" size="0.005 0.0125" pos="0.0125 0 0" quat="0.707107 0 -0.707107 0" condim="1"/>'
+[?2004l[?2004h> lines=[]
+[?2004l[?2004h> lines.append('<mujoco model="CableNative">')
+[?2004l[?2004h> lines.append('  <statistic center="0 0 .3" extent="1"/>')
+[?2004l[?2004h> lines.append('  <compiler autolimits="true"/>')
+[?2004l[?2004h> lines.append('  <size memory="2M"/>')
+[?2004l[?2004h> lines.append('  <option timestep="0.002"/>')
+[?2004l[?2004h> lines.append('  <worldbody>')
+[?2004l[?2004h> lines.append('  <body name="B_first" pos="-0.3 0 0.6">')
+[?2004l[?2004h> lines.append('    '+CABLE)
+[?2004l[?2004h> for k in range(1,39):
+[?2004l[?2004h>     lines.append(f'  <body name="B_{k}" pos="0.025 0 0">')
+[?2004l[?2004h>     lines.append('    <joint type="ball" damping="0.015"/>')
+[?2004l[?2004h>     lines.append('    '+CABLE)
+[?2004l[?2004h> lines.append('  <body name="B_last" pos="0.025 0 0">')
+[?2004l[?2004h> lines.append('    <joint type="ball" damping="0.015"/>')
+[?2004l[?2004h> lines.append('    '+CABLE)
+[?2004l[?2004h> lines.append('    <site name="S_last" pos="0 0 0"/>')
+[?2004l[?2004h> for _ in range(40):
+[?2004l[?2004h>     lines.append('  </body>')
+[?2004l[?2004h> lines.append('  <body name="slider" pos="0.7 0 0.6">')
+[?2004l[?2004h> lines.append('    <joint type="slide" axis="1 0 0" damping="0.1"/>')
+[?2004l[?2004h> lines.append('    <geom type="sphere" size="0.01"/>')
+[?2004l[?2004h> lines.append('  </body>')
+[?2004l[?2004h> lines.append('  </worldbody>')
+[?2004l[?2004h> lines.append('  <equality>')
+[?2004l[?2004h> lines.append('    <connect name="right_boundary" body1="B_last" body2="slider" anchor="0.025 0 0"/>')
+[?2004l[?2004h> lines.append('  </equality>')
+[?2004l[?2004h> lines.append('  <contact>')
+[?2004l[?2004h> lines.append('    <exclude body1="B_last" body2="slider"/>')
+[?2004l[?2004h> lines.append('  </contact>')
+[?2004l[?2004h> lines.append('  <actuator>')
+[?2004l[?2004h> lines.append('    <motor name="A_last" site="S_last" gear="0 0 0 1 0 0" ctrlrange="-0.03 0.03"/>')
+[?2004l[?2004h> lines.append('  </actuator>')
+[?2004l[?2004h> lines.append('</mujoco>')
+[?2004l[?2004h> open('model_ne.xml','w').write("\n".join(lines))
+[?2004l[?2004h> print("written")
+[?2004l[?2004h> PYEOF
+[?2004lwritten
+[?2004hroot@7846d2fb431e:/app# python3 - << 'PYEOF'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> ne=mujoco.MjModel.from_xml_path('model_ne.xml')
+[?2004l[?2004h> print("nq/nv ref",ref.nq,ref.nv," ne",ne.nq,ne.nv)
+[?2004l[?2004h> print("nbody",ref.nbody,ne.nbody,"njnt",ref.njnt,ne.njnt,"neq",ref.neq,ne.neq,"ngeom",ref.ngeom,ne.ngeom,"nu",ref.nu,ne.nu)
+[?2004l[?2004h> print("mass cable",round(ref.body_mass[2],6),round(ne.body_mass[2],6)," slider",round(ref.body_mass[41],6),round(ne.body_mass[41],6))
+[?2004l[?2004h> EOF
+[?2004l[?2004h> PYEOF
+[?2004lnq/nv ref 157 118  ne 157 118
+nbody 42 42 njnt 40 40 neq 1 1 ngeom 41 41 nu 1 1
+mass cable 0.002487 0.002487  slider 0.004189 0.004189
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m7[0m, in [35m<module>[0m
+[1;35mNameError[0m: [35mname 'EOF' is not defined[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> def load(p): return mujoco.MjModel.from_xml_path(p)
+[?2004l[?2004h> def state(m, seed):
+[?2004l[?2004h>     d=mujoco.MjData(m); nstep=int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); d.qpos += rng.normal(0,0.01,size=d.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(m,d)
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(m,FULL)); mujoco.mj_getState(m,d,s,FULL)
+[?2004l[?2004h>     return s
+[?2004l[?2004h> ref=load('model_ref.xml'); ne=load('model_ne.xml')
+[?2004l[?2004h> sr=state(ref,123)
+[?2004l[?2004h> for seed in [123,7,42,99,2024]:
+[?2004l[?2004h>     sn=state(ne,seed)
+[?2004l[?2004h>     print(f"seed {seed}: maxabs={np.abs(sn-sr).max():.3e}  allclose={np.allclose(sn,sr,atol=1e-5)}")
+[?2004l[?2004h> # timing
+[?2004l[?2004h> for name,m in [("ref",ref),("native",ne)]:
+[?2004l[?2004h>     d=mujoco.MjData(m); rng=np.random.default_rng(7); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(5): mujoco.mj_step(m,d)
+[?2004l[?2004h>     n=int(2.0/m.opt.timestep); ts=[]
+[?2004l[?2004h>     for i in range(400):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_step(m,d); ts.append(time.perf_counter()-a)
+[?2004l[?2004h>     print(f"{name}: per-step {np.mean(ts)*1e3:.4f} ms  total~ {np.mean(ts)*n:.4f}s")
+[?2004l[?2004h> PY
+[?2004lseed 123: maxabs=3.655e-01  allclose=False
+seed 7: maxabs=3.607e-01  allclose=False
+seed 42: maxabs=3.628e-01  allclose=False
+seed 99: maxabs=3.625e-01  allclose=False
+seed 2024: maxabs=3.616e-01  allclose=False
+ref: per-step 0.4362 ms  total~ 0.4362s
+native: per-step 0.4290 ms  total~ 0.4290s
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> d=mujoco.MjData(ref); rng=np.random.default_rng(7); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(ref,d)
+[?2004l[?2004h> def bench(fn,k=2000):
+[?2004l[?2004h>     for _ in range(20): fn(ref,d)
+[?2004l[?2004h>     ts=[]
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); fn(ref,d); ts.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(ts)*1e3
+[?2004l[?2004h> print("fwdPosition    ms",round(bench(mujoco.mj_fwdPosition),4))
+[?2004l[?2004h> print("fwdAcceleration ms",round(bench(mujoco.mj_fwdAcceleration),4))
+[?2004l[?2004h> print("fwdVelocity    ms",round(bench(mujoco.mj_fwdVelocity),4))
+[?2004l[?2004h> print("mj_forward     ms",round(bench(mujoco.mj_forward),4))
+[?2004l[?2004h> def benchstep(k=2000):
+[?2004l[?2004h>     for _ in range(20): mujoco.mj_step(ref,d)
+[?2004l[?2004h>     ts=[]
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_step(ref,d); ts.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(ts)*1e3
+[?2004l[?2004h> print("mj_step        ms",round(benchstep(),4))
+[?2004l[?2004h> PY
+[?2004lfwdPosition    ms 0.0864
+fwdAcceleration ms 0.0073
+fwdVelocity    ms 0.0238
+mj_forward     ms 0.3637
+mj_step        ms 0.4377
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def bench_model(m, seed, k=6000):
+[?2004l[?2004h>     d=mujoco.MjData(m); rng=np.random.default_rng(seed); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(50): mujoco.mj_step(m,d)
+[?2004l[?2004h>     ts=[]
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_step(m,d); ts.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(ts)*1e3
+[?2004l[?2004h> def bench_fwd(m,d,k=6000):
+[?2004l[?2004h>     for _ in range(50): mujoco.mj_forward(m,d)
+[?2004l[?2004h>     ts=[]
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); mujoco.mj_forward(m,d); ts.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(ts)*1e3
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> ne=mujoco.MjModel.from_xml_path('model_ne.xml')
+[?2004l[?2004h> print("ref  fwd ms  ", round(bench_fwd(ref, mujoco.MjData(ref)),4))
+[?2004l[?2004h> print("ne   fwd ms  ", round(bench_fwd(ne, mujoco.MjData(ne)),4))
+[?2004l[?2004h> print("ref  step ms ", round(bench_model(ref,7),4))
+[?2004l[?2004h> print("ne   step ms ", round(bench_model(ne,7),4))
+[?2004l[?2004h> PY
+[?2004lref  fwd ms   0.3939
+ne   fwd ms   0.3388
+ref  step ms  0.4864
+ne   step ms  0.4207
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ne=mujoco.MjModel.from_xml_path('model_ne.xml')
+[?2004l[?2004h> d=mujoco.MjData(ne); rng=np.random.default_rng(7); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(ne,d)
+[?2004l[?2004h> def bench(fn,k=3000):
+[?2004l[?2004h>     for _ in range(30): fn(ne,d)
+[?2004l[?2004h>     ts=[]
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); fn(ne,d); ts.append(time.perf_counter()-a)
+[?2004l[?2004h>     return round(np.mean(ts)*1e3,4)
+[?2004l[?2004h> print("fwdPosition",bench(mujoco.mj_fwdPosition))
+[?2004l[?2004h> print("fwdVelocity",bench(mujoco.mj_fwdVelocity))
+[?2004l[?2004h> print("mj_forward ",bench(mujoco.mj_forward))
+[?2004l[?2004h> PY
+[?2004lfwdPosition 0.1002
+fwdVelocity 0.006
+mj_forward  0.3714
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> def load(p): return mujoco.MjModel.from_xml_path(p)
+[?2004l[?2004h> def state(m, seed):
+[?2004l[?2004h>     d=mujoco.MjData(m); nstep=int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); d.qpos += rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(m,d)
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(m,FULL)); mujoco.mj_getState(m,d,s,FULL); return s
+[?2004l[?2004h> r0=load('model_ref.xml')
+[?2004l[?2004h> print("total motion (ref t2 - t0):", end=" ")
+[?2004l[?2004h> d=mujoco.MjData(r0); rng=np.random.default_rng(123); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(r0,d)
+[?2004l[?2004h> s0=np.zeros(mujoco.mj_stateSize(r0,FULL)); mujoco.mj_getState(r0,d,s0,FULL)
+[?2004l[?2004h> s2=state(r0,123)
+[?2004l[?2004h> print(f"maxabs={np.abs(s2-s0).max():.2e} l2={np.linalg.norm(s2-s0):.2e}")
+[?2004l[?2004h> print("--- fine dt sweep ---")
+[?2004l[?2004h> ss={[state(r0,s) for s in [123,7,42]]}
+[?2004l[?2004h> for dt in [0.002,0.0021,0.0022,0.0024,0.0025,0.003,0.004]:
+[?2004l[?2004h>     mc=load('model_ref.xml'); mc.opt.timestep=dt
+[?2004l[?2004h>     worst=0
+[?2004l[?2004h>     for s,sr in zip([123,7,42],ss):
+[?2004l[?2004h>         sc=state(mc,s); worst=max(worst,np.abs(sc-sr).max())
+[?2004l[?2004h>     print(f"dt={dt} nstep={int(2/dt)} worstmaxabs={worst:.2e} pass={worst<=1e-5}")
+[?2004l[?2004h> PY
+[?2004ltotal motion (ref t2 - t0): maxabs=2.00e+00 l2=2.12e+00
+--- fine dt sweep ---
+Traceback (most recent call last):
+  File [35m"<stdin>"[0m, line [35m16[0m, in [35m<module>[0m
+[1;35mTypeError[0m: [35munhashable type: 'list'[0m
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> def tMjData(m,k=50):
+[?2004l[?2004h>     for _ in range(3): x=mujoco.MjData(m)
+[?2004l[?2004h>     ts=[]
+[?2004l[?2004h>     for i in range(k):
+[?2004l[?2004h>         a=time.perf_counter(); x=mujoco.MjData(m); ts.append(time.perf_counter()-a)
+[?2004l[?2004h>     return np.mean(ts)*1e3
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print("MjData(ref, mem 2M) creation ms", round(tMjData(ref),3))
+[?2004l[?2004h> # simulate_model replica timing
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> def sim_time(m,seed):
+[?2004l[?2004h>     a=time.perf_counter()
+[?2004l[?2004h>     data=mujoco.MjData(m); nstep=int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); data.qpos += rng.normal(0,0.01,size=data.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(m,data)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(m,data)
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(m,FULL)); mujoco.mj_getState(m,data,s,FULL)
+[?2004l[?2004h>     return time.perf_counter()-a
+[?2004l[?2004h> for s in [123,7]:
+[?2004l[?2004h>     print(f"ref full simulate_model run time {sim_time(ref,s):.4f}s (seed {s})")
+[?2004l[?2004h> PY
+[?2004lMjData(ref, mem 2M) creation ms 1.396
+ref full simulate_model run time 0.4885s (seed 123)
+ref full simulate_model run time 0.4595s (seed 7)
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> d=mujoco.MjData(ref); rng=np.random.default_rng(123); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(ref,d)
+[?2004l[?2004h> nstep=int(2.0/ref.opt.timestep)
+[?2004l[?2004h> maxncon=0
+[?2004l[?2004h> for i in range(nstep):
+[?2004l[?2004h>     mujoco.mj_step(ref,d); maxncon=max(maxncon,d.ncon)
+[?2004l[?2004h> print("max ncon over run:", maxncon)
+[?2004l[?2004h> d2=mujoco.MjData(ref); rng2=np.random.default_rng(123); d2.qpos+=rng2.normal(0,0.01,size=d2.qpos.shape); mujoco.mj_forward(ref,d2)
+[?2004l[?2004h> prof=[0.0]*20
+[?2004l[?2004h> for i in range(nstep):
+[?2004l[?2004h>     a=time.perf_counter(); mujoco.mj_step(ref,d2); prof[i%20]+=time.perf_counter()-a
+[?2004l[?2004h> print("us per step by mod20:",[round(x/nstep*1e6,1) for x in prof])
+[?2004l[?2004h> PY^C[?2004l[?2004h[?2004l
+[?2004hroot@7846d2fb431e:/app# echo alive
+[?2004lalive
+[?2004hroot@7846d2fb431e:/app# cd /app && sed 's/condim="1"/condim="1" contype="0" conaffinity="0"/' model_ne.xml > model_ne0.xml && grep -c 'contype="0"' model_ne0.xml
+[?2004l40
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> L=lambda p: mujoco.MjModel.from_xml_path(p)
+[?2004l[?2004h> def run(m,seed,measure=True):
+[?2004l[?2004h>     d=mujoco.MjData(m); nstep=int(2.0/m.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     mn=0; t0=time.perf_counter()
+[?2004l[?2004h>     for i in range(nstep):
+[?2004l[?2004h>         mujoco.mj_step(m,d); mn=max(mn,d.ncon)
+[?2004l[?2004h>     t1=time.perf_counter()
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(m,FULL)); mujoco.mj_getState(m,d,s,FULL)
+[?2004l[?2004h>     return s,mn,t1-t0
+[?2004l[?2004h> ref=L('model_ref.xml'); ne=L('model_ne.xml'); ne0=L('model_ne0.xml')
+[?2004l[?2004h> sr,mnr,tr=run(ref,123)
+[?2004l[?2004h> print(f"ref:  nmaxcon={mnr} run={tr:.4f}s")
+[?2004l[?2004h> sn,mnn,tn=run(ne,123)
+[?2004l[?2004h> print(f"ne:   nmaxcon={mnn} run={tn:.4f}s  diff_vs_ref={np.abs(sn-sr).max():.2e} ratio={tn/tr:.3f}")
+[?2004l[?2004h> s0,mn0,t0=run(ne0,123)
+[?2004l[?2004h> print(f"ne0:  nmaxcon={mn0} run={t0:.4f}s  diff_vs_ref={np.abs(s0-sr).max():.2e} ratio={t0/tr:.3f}")
+[?2004l[?2004h> print("ne0 vs ne diff (contact effect):", np.abs(s0-sn).max())
+[?2004l[?2004h> PY^C[?2004l[?2004h[?2004l
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 -c "import mujoco,numpy as np,time; m=mujoco.MjModel.from_xml_path('model_ne.xml'); d=mujoco.MjData(m); mju=np.random.default_rng(7); d.qpos+=mju.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d); import time; t=time.perf_counter(); [mujoco.mj_step(m,d) for _ in range(1000)]; print('ne 1000 steps', time.perf_counter()-t)"
+[?2004lne 1000 steps 0.4826209540478885
+[?2004hroot@7846d2fb431e:/app# cd /app && python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> total=2.0; atol=1e-5
+[?2004l[?2004h> def sim(model, seed):
+[?2004l[?2004h>     data=mujoco.MjData(model); nstep=int(total/model.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); data.qpos += rng.normal(0,0.01,size=data.qpos.shape)
+[?2004l[?2004h>     mujoco.mj_forward(model,data)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(model,data)
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(model,FULL)); mujoco.mj_getState(model,data,s,FULL)
+[?2004l[?2004h>     return s
+[?2004l[?2004h> import shutil
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> def refstate(seed): return sim(ref,seed)
+[?2004l[?2004h> for dt in [0.002,0.0022,0.0025,0.003,0.004,0.005]:
+[?2004l[?2004h>     xml=open('model_ref.xml').read().replace('<mujoco model="Cable">','<mujoco model="Cable">\n  <option timestep="%s"/>'%dt)
+[?2004l[?2004h>     open('/tmp/m.xml','w').write(xml)
+[?2004l[?2004h>     mc=mujoco.MjModel.from_xml_path('/tmp/m.xml')
+[?2004l[?2004h>     worst=0; allok=True
+[?2004l[?2004h>     for seed in [1,2,3,4,5]:
+[?2004l[?2004h>         sc=sim(mc,seed); sr=refstate(seed); md=np.abs(sc-sr).max(); worst=max(worst,md); allok=allok and np.allclose(sc,sr,atol=atol)
+[?2004l[?2004h>     print(f"dt={dt} nstep={int(total/dt)} worst_maxabs={worst:.2e} allclose5={allok}")
+[?2004l[?2004h> # final qvel of ref
+[?2004l[?2004h> s=refstate(1)
+[?2004l[?2004h> nq=ref.nq
+[?2004l[?2004h> print("ref final |qvel| max=", np.abs(s[nq:]).max(), " |qpos-qpos0| max=", 0)
+[?2004l[?2004h> PY^C[?2004l[?2004h[?2004l
+[?2004hroot@7846d2fb431e:/app# cd /app && timeout 60 python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np
+[?2004l[?2004h> FULL=mujoco.mjtState.mjSTATE_FULLPHYSICS
+[?2004l[?2004h> def sim(mt,seed):
+[?2004l[?2004h>     data=mujoco.MjData(mt); nstep=int(2.0/mt.opt.timestep)
+[?2004l[?2004h>     rng=np.random.default_rng(seed); data.qpos+=rng.normal(0,0.01,size=data.qpos.shape); mujoco.mj_forward(mt,data)
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(mt,data)
+[?2004l[?2004h>     s=np.zeros(mujoco.mj_stateSize(mt,FULL)); mujoco.mj_getState(mt,data,s,FULL); return s
+[?2004l[?2004h> ref=mujoco.MjModel.from_xml_path('model_ref.xml')
+[?2004l[?2004h> print("seeds final qvel ref:", [round(float(np.abs(sim(ref,s)[ref.nq:]).max()),5) for s in [1,2]])
+[?2004l[?2004h> for dt in [0.002,0.0021,0.0025,0.003]:
+[?2004l[?2004h>     xml=open('model_ref.xml').read().replace('<statistic','<option timestep="%s"/>\n  <statistic'%dt)
+[?2004l[?2004h>     open('/tmp/m.xml','w').write(xml); mc=mujoco.MjModel.from_xml_path('/tmp/m.xml')
+[?2004l[?2004h>     for seed in [1,2]:
+[?2004l[?2004h>         sc=sim(mc,seed); sr=sim(ref,seed); print(f"dt={dt} seed={seed} maxabs={np.abs(sc-sr).max():.2e} allok={bool(np.allclose(sc,sr,atol=1e-5))}")
+[?2004l[?2004h> PY^C[?2004l[?2004h[?2004l
+[?2004hroot@7846d2fb431e:/app# ^C[?2004l[?2004h[?2004l
+[?2004hroot@7846d2fb431e:/app# echo HELLO_$?
+[?2004lHELLO_130
+[?2004hroot@7846d2fb431e:/app# cd /app && ls /usr/local/lib/python3.13/site-packages/ | grep -i mujoco
+[?2004lmujoco
+mujoco-3.3.5.dist-info
+[?2004hroot@7846d2fb431e:/app# cd /usr/local/lib/python3.13/site-packages/ && (cat mujoco-*.dist-info/RECORD 2>/dev/null | grep -i -E "plugin|elastic" | head; echo '---pipfiles---'; ls mujoco-*.dist-info/; grep -i -c plugin mujoco-*.dist-info/RECORD 2>/dev/null)
+[?2004lmujoco/include/mujoco/mjplugin.h,sha256=ZdXjyxk3NqPsD4NOaGSgg-LDnmGxk8uCzcJF42HppY4,7676
+mujoco/plugin/libactuator.so,sha256=0H0sxHaidjiMSf8sbxicBESDWg8nHJY6DxWhQ3A_pv0,324544
+mujoco/plugin/libelasticity.so,sha256=VtSWEvUzzvh0h1anWXiGuTO5FJvo4JK8v6UC_7xhSAs,339512
+mujoco/plugin/libsdf_plugin.so,sha256=cukr0L-RPNA4VxBChoQCwkbhsmMpFcPUteJX57J4-zM,366440
+mujoco/plugin/libsensor.so,sha256=ISxXpw8wFViuIp47E2R-j5vR7DXnr7ii3P_-FBwG1ZU,644216
+---pipfiles---
+INSTALLER  METADATA  RECORD  REQUESTED	WHEEL  licenses  top_level.txt
+5
+[?2004hroot@7846d2fb431e:/usr/local/lib/python3.13/site-packages# cd /app && timeout 120 python3 - << 'PY'
+[?2004l[?2004h> import mujoco, numpy as np, time
+[?2004l[?2004h> L=lambda p: mujoco.MjModel.from_xml_path(p)
+[?2004l[?2004h> xml0=open('model_ref.xml').read()
+[?2004l[?2004h> open('/tmp/noplug.xml','w').write(xml0.replace('1e7','0').replace('4e6','0'))
+[?2004l[?2004h> def full(m,seed=7):
+[?2004l[?2004h>     d=mujoco.MjData(m); nstep=int(2.0/m.opt.timestep); rng=np.random.default_rng(seed)
+[?2004l[?2004h>     d.qpos+=rng.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d)
+[?2004l[?2004h>     for _ in range(30): mujoco.mj_step(m,d)
+[?2004l[?2004h>     t=time.perf_counter()
+[?2004l[?2004h>     for _ in range(nstep): mujoco.mj_step(m,d)
+[?2004l[?2004h>     return (time.perf_counter()-t)/nstep*1e3
+[?2004l[?2004h> base=full(L('model_ref.xml'))
+[?2004l[?2004h> print(f"baseline        {base:.4f} ms/step")
+[?2004l[?2004h> m=L('model_ref.xml'); m.opt.disableflags|=mujoco.mjtDisableBit.mjDSBL_CONTACT; print(f"-contact        {full(m):.4f}")
+[?2004l[?2004h> m=L('/tmp/noplug.xml'); print(f"-plugin(tw=be=0) {full(m):.4f}")
+[?2004l[?2004h> m=L('model_ref.xml'); m.opt.disableflags|=mujoco.mjtDisableBit.mjDSBL_PASSIVE; print(f"-passive        {full(m):.4f}")
+[?2004l[?2004h> m=L('model_ref.xml'); m.opt.disableflags|=mujoco.mjtDisableBit.mjDSBL_FRICTIONLOSS; print(f"-frictionloss   {full(m):.4f}")
+[?2004l[?2004h> m=L('model_ref.xml'); m.opt.iterations=1; m.opt.ls_iterations=1; print(f"-iter/ls=1      {full(m):.4f}")
+[?2004l[?2004h> PY^C[?2004l[?2004h[?2004l
+[?2004hroot@7846d2fb431e:/usr/local/lib/python3.13/site-packages# ^C[?2004l[?2004h[?2004l
+[?2004hroot@7846d2fb431e:/usr/local/lib/python3.13/site-packages# uptime; nproc; echo ---; python3 -c "import mujoco,numpy as np,time; m=mujoco.MjModel.from_xml_path('model_ne.xml'); d=mujoco.MjData(m); g=np.random.default_rng(7); d.qpos+=g.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d); t=time.perf_counter(); [mujoco.mj_step(m,d) for _ in range(500)]; print('500 steps',round(time.perf_counter()-t,3),'s')"
+[?2004lbash: uptime: command not found
+208
+---
+Traceback (most recent call last):
+  File [35m"<string>"[0m, line [35m1[0m, in [35m<module>[0m
+    import mujoco,numpy as np,time; m=[31mmujoco.MjModel.from_xml_path[0m[1;31m('model_ne.xml')[0m; d=mujoco.MjData(m); g=np.random.default_rng(7); d.qpos+=g.normal(0,0.01,size=d.qpos.shape); mujoco.mj_forward(m,d); t=time.perf_counter(); [mujoco.mj_step(m,d) for _ in range(500)]; print('500 steps',round(time.perf_counter()-t,3),'s')
+                                      [31m~~~~~~~~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^[0m
+[1;35mValueError[0m: [35mParseXML: Error opening file 'model_ne.xml': No such file or directory[0m
+[?2004hroot@7846d2fb431e:/usr/local/lib/python3.13/site-packages# cd /app && python3 -c "xml=open('model_ref.xml').read().replace('<statistic','<option timestep=\"0.004\" solver="Newton\"/>\n  <statistic'); open('model.xml','w').write(xml); import mujoco; m=mujoco.MjModel.from_xml_path('model.xml'); print('dt',m.opt.timestep,'nstep',int(2.0/m.opt.timestep))"
+[?2004l[?2004h> cd /app && timeout 200 python3 eval.py 2>&1 | tail -20
+[?2004l[?2004h> ^C[?2004l[?2004h[?2004l
+[?2004hroot@7846d2fb431e:/usr/local/lib/python3.13/site-packages# cd /app && python3 - << 'PY'
+[?2004l[?2004h> xml=open('model_ref.xml').read()
+[?2004l[?2004h> if '<option' not in xml:
+[?2004l[?2004h>     xml=xml.replace('<statistic','<option timestep="0.004"/>\n  <statistic')
+[?2004l[?2004h> open('model.xml','w').write(xml)
+[?2004l[?2004h> import mujoco
+[?2004l[?2004h> m=mujoco.MjModel.from_xml_path('model.xml')
+[?2004l[?2004h> print('dt',m.opt.timestep,'nstep',int(2.0/m.opt.timestep))
+[?2004l[?2004h> PY
+[?2004ldt 0.004 nstep 500
+[?2004hroot@7846d2fb431e:/app# cd /app && timeout 240 python3 eval.py 2>&1 | tail -15
+[?2004lFinal state difference: 0.0029
+Traceback (most recent call last):
+  File "/app/eval.py", line 87, in <module>
+    test_correctness()
+    ~~~~~~~~~~~~~~~~^^
+  File "/app/eval.py", line 28, in test_correctness
+    assert np.allclose(final_state, final_state_ref, atol=atol), (
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Final states differ by 0.002932703731548932, exceeding tolerance 1e-05
+[?2004hroot@7846d2fb431e:/app# 

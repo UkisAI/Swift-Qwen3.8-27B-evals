@@ -1,0 +1,908 @@
+[?2004hroot@7f4ec1ab08a1:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@7f4ec1ab08a1:/app# clear
+[?2004l[H[J[3J[?2004hroot@7f4ec1ab08a1:/app# ls -la /app
+[?2004ltotal 0
+drwxr-xr-x 2 root root  10 Oct 22  2025 [0m[01;34m.[0m
+drwxr-xr-x 1 root root 102 Sep  6 17:08 [01;34m..[0m
+[?2004hroot@7f4ec1ab08a1:/app# python3 --version && python3 -c "import torch, torch.distributed as dist; print('torch', torch.__version__); print('dist available', dist.is_available()); print('is nccl', torch.cuda.is_available())"
+[?2004lPython 3.12.3
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+ModuleNotFoundError: No module named 'torch'
+[?2004hroot@7f4ec1ab08a1:/app# cat > /app/parallel_linear.py <<'PYEOF'
+[?2004l[?2004h> import torch
+[?2004l_[?2004h> import torch.nn as nn
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004le[?2004h> 
+[?2004ll[?2004h> 
+[?2004lf[?2004h> def _world_size():
+[?2004l[?2004h>     if dist.is_available() and dist.is_initialized():
+[?2004l[?2004h>         return dist.get_world_size()
+[?2004l[[?2004h>     return 1
+[?2004l[?2004h> 
+[?2004l.[?2004h> 
+[?2004l[?2004h> def _rank():
+[?2004l[?2004h>     if dist.is_available() and dist.is_initialized():
+[?2004l [?2004h>         return dist.get_rank()
+[?2004l[?2004h>     return 0
+[?2004l[?2004h> 
+[?2004lm[?2004h> 
+[?2004le[?2004h> class _AllGatherLastDim(torch.autograd.Function):
+[?2004l[?2004h>     """Concatenate per-rank tensors along the last dimension via all_gather.
+[?2004l[?2004h> 
+[?2004l [?2004h>     Each rank holds a contiguous slice of the final tensor along its last dim.
+[?2004l[?2004h>     Forward returns the full concatenation; backward returns this rank's slice
+[?2004l[?2004h>     of the upstream gradient.
+[?2004l [?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, x):
+[?2004l[?2004h>         ctx.rank = _rank()
+[?2004l[?2004h>         ctx.per = x.shape[-1]
+[?2004l[?2004h>         ws = _world_size()
+[?2004l[?2004h>         if ws <= 1:
+[?2004l[?2004h>             return x
+[?2004l[?2004h>         gathered = [torch.empty_like(x) for _ in range(ws)]
+[?2004l[?2004h>         dist.all_gather(gathered, x.contiguous())
+[?2004l[?2004h>         return torch.cat(gathered, dim=-1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         start = ctx.rank * ctx.per
+[?2004l[?2004h>         end = start + ctx.per
+[?2004l[?2004h>         return grad_output[..., start:end].contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _AllReduceSum(torch.autograd.Function):
+[?2004l[?2004h>     """Sum a tensor across all ranks via all_reduce (SUM).
+[?2004l[?2004h> 
+[?2004l[?2004h>     Forward returns the summed tensor (identical on every rank); backward
+[?2004l[?2004h>     passes the upstream gradient through unchanged.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, x):
+[?2004l[?2004h>         ws = _world_size()
+[?2004l[?2004h>         if ws <= 1:
+[?2004l[?2004h>             return x
+[?2004l[?2004h>         y = x.contiguous().clone()
+[?2004l[?2004h>         dist.all_reduce(y, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>         return y
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         return grad_output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with column (output) parallelism.
+[?2004l[?2004h> 
+[?2004l[?2004h>     The full weight W [out_features, in_features] is split along the output
+[?2004l[?2004h>     dimension (the conceptual columns of the [in, out] matrix). Rank r owns
+[?2004l[?2004h>     rows [r*out_per, (r+1)*out_per). The forward output is the full tensor,
+[?2004l[?2004h>     obtained by all-gathering each rank's local slice along the last dim. The
+[?2004l[?2004h>     bias is sharded in the same way as the output dimension.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias=False, master_weight=None):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         assert master_weight is not None, 'master_weight must be provided'
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.world_size = _world_size()
+[?2004l[?2004h>         self.rank = _rank()
+[?2004l[?2004h>         self.out_features_per_partition = out_features // self.world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         start = self.rank * self.out_features_per_partition
+[?2004l[?2004h>         end = start + self.out_features_per_partition
+[?2004l[?2004h>         shard = master_weight[start:end, :].clone().contiguous()
+[?2004l[?2004h>         self.weight = nn.Parameter(shard)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(self.out_features_per_partition,
+[?2004l[?2004h>                             dtype=shard.dtype, device=shard.device)
+[?2004l[?2004h>             )
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         local = F.linear(x, self.weight)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             local = local + self.bias
+[?2004l[?2004h>         return _AllGatherLastDim.apply(local)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with row (input) parallelism.
+[?2004l[?2004h> 
+[?2004l[?2004h>     The full weight W [out_features, in_features] is split along the input
+[?2004l[?2004h>     dimension (the conceptual rows of the [in, out] matrix). Rank r owns
+[?2004l[?2004h>     columns [r*in_per, (r+1)*in_per). Each rank's forward receives its input
+[?2004l[?2004h>     slice [*, in_per]; the local [*, out_features] partial products are summed
+[?2004l[?2004h>     with an all-reduce. The bias stays full [out_features] on every rank and
+[?2004l[?2004h>     is added after the reduce.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias=False, master_weight=None):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         assert master_weight is not None, 'master_weight must be provided'
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.world_size = _world_size()
+[?2004l[?2004h>         self.rank = _rank()
+[?2004l[?2004h>         self.in_features_per_partition = in_features // self.world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         start = self.rank * self.in_features_per_partition
+[?2004l[?2004h>         end = start + self.in_features_per_partition
+[?2004l[?2004h>         shard = master_weight[:, start:end].clone().contiguous()
+[?2004l[?2004h>         self.weight = nn.Parameter(shard)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(self.out_features,
+[?2004l[?2004h>                             dtype=shard.dtype, device=shard.device)
+[?2004l[?2004h>             )
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         partial = F.linear(x, self.weight)
+[?2004l[?2004h>         output = _AllReduceSum.apply(partial)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             output = output + self.bias
+[?2004l[?2004h>         return output
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@7f4ec1ab08a1:/app# cat > /app/test_parallel.py <<'PYEOF'
+[?2004l[?2004h> import os
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l[?2004h> 
+[?2004l[?2004h> from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def run_col(rank, world_size):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = '29512'
+[?2004l[?2004h>     dist.init_process_group('gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     torch.manual_seed(0)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     layer = ColumnParallelLinear(in_f, out_f, bias=True, master_weight=W)
+[?2004l[?2004h> 
+[?2004l[?2004h>     per = out_f // world_size
+[?2004l[?2004h>     exp_w = W[rank * per:(rank + 1) * per, :]
+[?2004l[?2004h>     assert layer.weight.shape == (per, in_f), 'col weight shape'
+[?2004l[?2004h>     assert torch.allclose(layer.weight.data, exp_w), 'col weight shard'
+[?2004l[?2004h>     assert layer.bias.shape == (per,), 'col bias shape'
+[?2004l[?2004h>     assert torch.allclose(layer.bias.data, torch.zeros(per)), 'col bias zeros'
+[?2004l[?2004h> 
+[?2004l[?2004h>     y = layer(x)
+[?2004l[?2004h>     assert y.shape == (4, out_f), 'col out shape %s' % (y.shape,)
+[?2004l[?2004h>     expected = F.linear(x, W, torch.zeros(out_f))
+[?2004l[?2004h>     assert torch.allclose(y, expected, atol=1e-5), 'col out value'
+[?2004l[?2004h> 
+[?2004l[?2004h>     y.backward(torch.ones(4, out_f))
+[?2004l[?2004h>     g = torch.ones(4, out_f)
+[?2004l[?2004h>     assert torch.allclose(layer.weight.grad, g[rank * per:(rank + 1) * per, :].T @ x, atol=1e-5), 'col dw r%d' % rank
+[?2004l[?2004h>     assert torch.allclose(layer.bias.grad, g[rank * per:(rank + 1) * per, :].sum(0), atol=1e-5), 'col db r%d' % rank
+[?2004l[?2004h> 
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h>     print('[col ws=%d rank=%d] OK' % (world_size, rank), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def run_row(rank, world_size):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = '29514'
+[?2004l[?2004h>     dist.init_process_group('gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     torch.manual_seed(0)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     per = in_f // world_size
+[?2004l[?2004h>     x_r = x[:, rank * per:(rank + 1) * per]
+[?2004l[?2004h>     layer = RowParallelLinear(in_f, out_f, bias=True, master_weight=W)
+[?2004l[?2004h> 
+[?2004l[?2004h>     exp_w = W[:, rank * per:(rank + 1) * per]
+[?2004l[?2004h>     assert layer.weight.shape == (out_f, per), 'row weight shape'
+[?2004l[?2004h>     assert torch.allclose(layer.weight.data, exp_w), 'row weight shard'
+[?2004l[?2004h>     assert layer.bias.shape == (out_f,), 'row bias shape'
+[?2004l[?2004h>     assert torch.allclose(layer.bias.data, torch.zeros(out_f)), 'row bias zeros'
+[?2004l[?2004h> 
+[?2004l[?2004h>     y = layer(x_r)
+[?2004l[?2004h>     assert y.shape == (4, out_f), 'row out shape %s' % (y.shape,)
+[?2004l[?2004h>     expected = F.linear(x, W, torch.zeros(out_f))
+[?2004l[?2004h>     assert torch.allclose(y, expected, atol=1e-5), 'row out value'
+[?2004l[?2004h> 
+[?2004l[?2004h>     y.backward(torch.ones(4, out_f))
+[?2004l[?2004h>     g = torch.ones(4, out_f)
+[?2004l[?2004h>     assert torch.allclose(layer.weight.grad, g.T @ x_r, atol=1e-5), 'row dw r%d' % rank
+[?2004l[?2004h>     assert torch.allclose(layer.bias.grad, g.sum(0), atol=1e-5), 'row db r%d' % rank
+[?2004l[?2004h> 
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h>     print('[row ws=%d rank=%d] OK' % (world_size, rank), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def test_local():
+[?2004l[?2004h>     torch.manual_seed(0)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     g = torch.ones(4, out_f)
+[?2004l[?2004h>     cl = ColumnParallelLinear(in_f, out_f, bias=True, master_weight=W)
+[?2004l[?2004h>     assert torch.allclose(cl(x), F.linear(x, W, torch.zeros(out_f))), 'col local out'
+[?2004l[?2004h>     cl(x).backward(g)
+[?2004l[?2004h>     assert torch.allclose(cl.weight.grad, g.T @ x, atol=1e-5), 'col local dw'
+[?2004l[?2004h>     assert torch.allclose(cl.bias.grad, g.sum(0), atol=1e-5), 'col local db'
+[?2004l[?2004h>     rl = RowParallelLinear(in_f, out_f, bias=True, master_weight=W)
+[?2004l[?2004h>     assert torch.allclose(rl(x), F.linear(x, W, torch.zeros(out_f))), 'row local out'
+[?2004l[?2004h>     rl(x).backward(g)
+[?2004l[?2004h>     assert torch.allclose(rl.weight.grad, g.T @ x, atol=1e-5), 'row local dw'
+[?2004l[?2004h>     assert torch.allclose(rl.bias.grad, g.sum(0), atol=1e-5), 'row local db'
+[?2004l[?2004h>     print('[ws=1 local] OK', flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     test_local()
+[?2004l[?2004h>     for ws in (1, 2, 4):
+[?2004l[?2004h>         mp.spawn(run_col, args=(ws,), nprocs=ws, join=True)
+[?2004l[?2004h>         mp.spawn(run_row, args=(ws,), nprocs=ws, join=True)
+[?2004l[?2004h>     print('ALL PASSED', flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@7f4ec1ab08a1:/app# wc -l /app/parallel_linear.py /app/test_parallel.py
+[?2004l 143 /app/parallel_linear.py
+ 101 /app/test_parallel.py
+ 244 total
+[?2004hroot@7f4ec1ab08a1:/app# python3 -m pip --version
+[?2004l/usr/bin/python3: No module named pip
+[?2004hroot@7f4ec1ab08a1:/app# timeout 10 python3 -c "import urllib.request as u; print('pypi', u.urlopen('https://pypi.org/simple/', timeout=8).status)" 2>&1 | tail -5
+[?2004lpypi 200
+[?2004hroot@7f4ec1ab08a1:/app# timeout 10 python3 -c "import urllib.request as u; print('pt-cpu', u.urlopen('https://download.pytorch.org/whl/cpu/torch/', timeout=8).status)" 2>&1 | tail -5
+[?2004lpt-cpu 200
+[?2004hroot@7f4ec1ab08a1:/app# python3 -m ensurepip --upgrade 2>&1 | tail -8; echo "=== pip check ==="; python3 -m pip --version 2>&1 | tail -3; echo "=== prefix ==="; which python3; python3 -c "import sys; print('prefix', sys.prefix); print('base', sys.base_prefix)" 2>&1
+[?2004l/usr/bin/python3: No module named ensurepip
+=== pip check ===
+/usr/bin/python3: No module named pip
+=== prefix ===
+/usr/bin/python3
+prefix /usr
+base /usr
+[?2004hroot@7f4ec1ab08a1:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> import urllib.request
+[?2004l[?2004h> data = urllib.request.urlopen('https://bootstrap.pypa.io/get-pip.py', timeout=60).read()
+[?2004l[?2004h> open('/tmp/get-pip.py','wb').write(data)
+[?2004l[?2004h> print('downloaded get-pip.py bytes:', len(data))
+[?2004l[?2004h> PYEOF
+[?2004ldownloaded get-pip.py bytes: 2230488
+[?2004hroot@7f4ec1ab08a1:/app# find /usr -name EXTERNALLY-MANAGED 2>/dev/null | xargs -r rm -f; echo 'marker removed (if any)'; python3 /tmp/get-pip.py 2>&1 | tail -15; echo '=== pip check ==='; python3 -m pip --version 2>&1 | tail -3
+[?2004lmarker removed (if any)
+Collecting pip
+  Downloading pip-26.2.1-py3-none-any.whl.metadata (4.6 kB)
+Downloading pip-26.2.1-py3-none-any.whl (1.8 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.8/1.8 MB 15.4 MB/s  0:00:00
+Installing collected packages: pip
+Successfully installed pip-26.2.1
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+=== pip check ===
+pip 26.2.1 from /usr/local/lib/python3.12/dist-packages/pip (python 3.12)
+[?2004hroot@7f4ec1ab08a1:/app# nohup python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu > /tmp/torch_install.log 2>&1 & echo "started pid $!"
+[?2004l[1] 2879
+started pid 2879
+[?2004hroot@7f4ec1ab08a1:/app# sleep 45; echo '=== log tail ==='; tail -n 20 /tmp/torch_install.log; echo '=== status ==='; if pgrep -f 'pip install torch' >/dev/null; then echo RUNNING; else echo DONE; fi
+[?2004l[1]+  Done                    nohup python3 -m pip install torch --index-url https://download.pytorch.org/whl/cpu > /tmp/torch_install.log 2>&1
+=== log tail ===
+  Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.7 kB)
+Downloading torch-2.14.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl (196.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 196.3/196.3 MB 203.8 MB/s  0:00:00
+Downloading fsspec-2026.7.0-py3-none-any.whl (206 kB)
+Downloading networkx-3.6.1-py3-none-any.whl (2.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 65.8 MB/s  0:00:00
+Downloading setuptools-78.1.0-py3-none-any.whl (1.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.3/1.3 MB 43.0 MB/s  0:00:00
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 201.5 MB/s  0:00:00
+Downloading mpmath-1.3.0-py3-none-any.whl (536 kB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 536.2/536.2 kB 35.6 MB/s  0:00:00
+Downloading typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+Downloading filelock-3.32.3-py3-none-any.whl (98 kB)
+Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+Downloading markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
+Installing collected packages: mpmath, typing-extensions, sympy, setuptools, networkx, MarkupSafe, fsspec, filelock, jinja2, torch
+
+Successfully installed MarkupSafe-3.0.3 filelock-3.32.3 fsspec-2026.7.0 jinja2-3.1.6 mpmath-1.3.0 networkx-3.6.1 setuptools-78.1.0 sympy-1.14.0 torch-2.14.0+cpu typing-extensions-4.16.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+=== status ===
+DONE
+[?2004hroot@7f4ec1ab08a1:/app# python3 -c "import torch, torch.distributed as dist; print('torch', torch.__version__); print('gloo', dist.is_gloo_available()); print('dist avail', dist.is_available())"
+[?2004l/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+torch 2.14.0+cpu
+gloo True
+dist avail True
+[?2004hroot@7f4ec1ab08a1:/app# cd /app && python3 test_parallel.py 2>&1 | tee /tmp/test_run.log
+[?2004l/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[ws=1 local] OK
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[col ws=1 rank=0] OK
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[row ws=1 rank=0] OK
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+/usr/local/lib/python3.12/dist-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+W0906 17:49:50.284000 2922 torch/multiprocessing/spawn.py:165] Terminating process 2936 via signal SIGTERM
+Traceback (most recent call last):
+  File "/app/test_parallel.py", line 101, in <module>
+    main()
+  File "/app/test_parallel.py", line 95, in main
+    mp.spawn(run_col, args=(ws,), nprocs=ws, join=True)
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 340, in spawn
+    return start_processes(fn, args, nprocs, join, daemon, start_method="spawn")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 296, in start_processes
+    while not context.join():
+              ^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 211, in join
+    raise ProcessRaisedException(msg, error_index, failed_process.pid)
+torch.multiprocessing.spawn.ProcessRaisedException: 
+
+-- Process 0 terminated with the following error:
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.12/dist-packages/torch/multiprocessing/spawn.py", line 87, in _wrap
+    fn(i, *args)
+  File "/app/test_parallel.py", line 34, in run_col
+    assert torch.allclose(layer.weight.grad, g[rank * per:(rank + 1) * per, :].T @ x, atol=1e-5), 'col dw r%d' % rank
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (4) must match the size of tensor b (8) at non-singleton dimension 0
+
+[?2004hroot@7f4ec1ab08a1:/app# cat > /app/test_parallel.py <<'PYEOF'
+[?2004l[?2004h> import os
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l[?2004h> 
+[?2004l[?2004h> from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def run_col(rank, world_size):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = '29512'
+[?2004l[?2004h>     dist.init_process_group('gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     torch.manual_seed(0)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     layer = ColumnParallelLinear(in_f, out_f, bias=True, master_weight=W)
+[?2004l[?2004h> 
+[?2004l[?2004h>     per = out_f // world_size
+[?2004l[?2004h>     exp_w = W[rank * per:(rank + 1) * per, :]
+[?2004l[?2004h>     assert layer.weight.shape == (per, in_f), 'col weight shape'
+[?2004l[?2004h>     assert torch.allclose(layer.weight.data, exp_w), 'col weight shard'
+[?2004l[?2004h>     assert layer.bias.shape == (per,), 'col bias shape'
+[?2004l[?2004h>     assert torch.allclose(layer.bias.data, torch.zeros(per)), 'col bias zeros'
+[?2004l[?2004h> 
+[?2004l[?2004h>     y = layer(x)
+[?2004l[?2004h>     assert y.shape == (4, out_f), 'col out shape %s' % (y.shape,)
+[?2004l[?2004h>     expected = F.linear(x, W, torch.zeros(out_f))
+[?2004l[?2004h>     assert torch.allclose(y, expected, atol=1e-5), 'col out value'
+[?2004l[?2004h> 
+[?2004l[?2004h>     y.backward(torch.ones(4, out_f))
+[?2004l[?2004h>     g = torch.ones(4, out_f)
+[?2004l[?2004h>     gs = g[:, rank * per:(rank + 1) * per]
+[?2004l[?2004h>     assert torch.allclose(layer.weight.grad, gs.T @ x, atol=1e-5), 'col dw r%d' % rank
+[?2004l[?2004h>     assert torch.allclose(layer.bias.grad, gs.sum(0), atol=1e-5), 'col db r%d' % rank
+[?2004l[?2004h> 
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h>     print('[col ws=%d rank=%d] OK' % (world_size, rank), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def run_row(rank, world_size):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = '29514'
+[?2004l[?2004h>     dist.init_process_group('gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     torch.manual_seed(0)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     per = in_f // world_size
+[?2004l[?2004h>     x_r = x[:, rank * per:(rank + 1) * per]
+[?2004l[?2004h>     layer = RowParallelLinear(in_f, out_f, bias=True, master_weight=W)
+[?2004l[?2004h> 
+[?2004l[?2004h>     exp_w = W[:, rank * per:(rank + 1) * per]
+[?2004l[?2004h>     assert layer.weight.shape == (out_f, per), 'row weight shape'
+[?2004l[?2004h>     assert torch.allclose(layer.weight.data, exp_w), 'row weight shard'
+[?2004l[?2004h>     assert layer.bias.shape == (out_f,), 'row bias shape'
+[?2004l[?2004h>     assert torch.allclose(layer.bias.data, torch.zeros(out_f)), 'row bias zeros'
+[?2004l[?2004h> 
+[?2004l[?2004h>     y = layer(x_r)
+[?2004l[?2004h>     assert y.shape == (4, out_f), 'row out shape %s' % (y.shape,)
+[?2004l[?2004h>     expected = F.linear(x, W, torch.zeros(out_f))
+[?2004l[?2004h>     assert torch.allclose(y, expected, atol=1e-5), 'row out value'
+[?2004l[?2004h> 
+[?2004l[?2004h>     y.backward(torch.ones(4, out_f))
+[?2004l[?2004h>     g = torch.ones(4, out_f)
+[?2004l[?2004h>     assert torch.allclose(layer.weight.grad, g.T @ x_r, atol=1e-5), 'row dw r%d' % rank
+[?2004l[?2004h>     assert torch.allclose(layer.bias.grad, g.sum(0), atol=1e-5), 'row db r%d' % rank
+[?2004l[?2004h> 
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h>     print('[row ws=%d rank=%d] OK' % (world_size, rank), flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def test_local():
+[?2004l[?2004h>     torch.manual_seed(0)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     g = torch.ones(4, out_f)
+[?2004l[?2004h>     cl = ColumnParallelLinear(in_f, out_f, bias=True, master_weight=W)
+[?2004l[?2004h>     assert torch.allclose(cl(x), F.linear(x, W, torch.zeros(out_f))), 'col local out'
+[?2004l[?2004h>     cl(x).backward(g)
+[?2004l[?2004h>     assert torch.allclose(cl.weight.grad, g.T @ x, atol=1e-5), 'col local dw'
+[?2004l[?2004h>     assert torch.allclose(cl.bias.grad, g.sum(0), atol=1e-5), 'col local db'
+[?2004l[?2004h>     rl = RowParallelLinear(in_f, out_f, bias=True, master_weight=W)
+[?2004l[?2004h>     assert torch.allclose(rl(x), F.linear(x, W, torch.zeros(out_f))), 'row local out'
+[?2004l[?2004h>     rl(x).backward(g)
+[?2004l[?2004h>     assert torch.allclose(rl.weight.grad, g.T @ x, atol=1e-5), 'row local dw'
+[?2004l[?2004h>     assert torch.allclose(rl.bias.grad, g.sum(0), atol=1e-5), 'row local db'
+[?2004l[?2004h>     print('[ws=1 local] OK', flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     test_local()
+[?2004l[?2004h>     for ws in (1, 2, 4):
+[?2004l[?2004h>         mp.spawn(run_col, args=(ws,), nprocs=ws, join=True)
+[?2004l[?2004h>         mp.spawn(run_row, args=(ws,), nprocs=ws, join=True)
+[?2004l[?2004h>     print('ALL PASSED', flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@7f4ec1ab08a1:/app# cd /app && python3 test_parallel.py 2>/dev/null
+[?2004l[ws=1 local] OK
+[col ws=1 rank=0] OK
+[row ws=1 rank=0] OK
+[col ws=2 rank=1] OK
+[col ws=2 rank=0] OK
+[row ws=2 rank=0] OK
+[row ws=2 rank=1] OK
+[col ws=4 rank=0] OK
+[col ws=4 rank=2] OK
+[col ws=4 rank=1] OK
+[col ws=4 rank=3] OK
+[row ws=4 rank=1] OK
+[row ws=4 rank=2] OK
+[row ws=4 rank=0] OK
+[row ws=4 rank=3] OK
+ALL PASSED
+[?2004hroot@7f4ec1ab08a1:/app# cat > /app/parallel_linear.py <<'PYEOF'
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn as nn
+[?2004l_[?2004h> import torch.nn.functional as F
+[?2004llf.[?2004h> import torch.distributed as dist
+[?2004l.[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _world_size():
+[?2004l[?2004h>     if dist.is_available() and dist.is_initialized():
+[?2004l[?2004h>         return dist.get_world_size()
+[?2004l[?2004h>     return 1
+[?2004l[?2004h> 
+[?2004lt[?2004h> 
+[?2004l[?2004h> def _rank():
+[?2004letac[?2004h>     if dist.is_available() and dist.is_initialized():
+[?2004l[?2004h>         return dist.get_rank()
+[?2004l[?2004h>     return 0
+[?2004l[?2004h> 
+[?2004le[?2004h> 
+[?2004ll[?2004h> class _AllGatherLastDim(torch.autograd.Function):
+[?2004l[?2004h>     """Concatenate per-rank tensors along the last dimension via all_gather.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Each rank holds a contiguous slice of the final tensor along its last dim.
+[?2004l[?2004h>     Forward returns the full concatenation; backward returns this rank's slice
+[?2004l[?2004h>     of the upstream gradient.
+[?2004lum[?2004h>     """
+[?2004l[?2004h> 
+[?2004la[?2004h>     @staticmethod
+[?2004l [?2004h>     def forward(ctx, x):
+[?2004l [?2004h>         ctx.rank = _rank()
+[?2004l[?2004h>         ctx.per = x.shape[-1]
+[?2004l[?2004h>         ws = _world_size()
+[?2004l[?2004h>         if ws <= 1:
+[?2004l[?2004h>             return x
+[?2004l[?2004h>         gathered = [torch.empty_like(x) for _ in range(ws)]
+[?2004l[?2004h>         dist.all_gather(gathered, x.contiguous())
+[?2004l[?2004h>         return torch.cat(gathered, dim=-1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         start = ctx.rank * ctx.per
+[?2004l[?2004h>         end = start + ctx.per
+[?2004l[?2004h>         return grad_output[..., start:end].contiguous()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class _AllReduceSum(torch.autograd.Function):
+[?2004l[?2004h>     """Sum a tensor across all ranks via all_reduce (SUM).
+[?2004l[?2004h> 
+[?2004l[?2004h>     Forward returns the summed tensor (identical on every rank); backward
+[?2004l[?2004h>     passes the upstream gradient through unchanged.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def forward(ctx, x):
+[?2004l[?2004h>         ws = _world_size()
+[?2004l[?2004h>         if ws <= 1:
+[?2004l[?2004h>             return x
+[?2004l[?2004h>         y = x.contiguous().clone()
+[?2004l[?2004h>         dist.all_reduce(y, op=dist.ReduceOp.SUM)
+[?2004l[?2004h>         return y
+[?2004l[?2004h> 
+[?2004l[?2004h>     @staticmethod
+[?2004l[?2004h>     def backward(ctx, grad_output):
+[?2004l[?2004h>         return grad_output
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class ColumnParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with column (output) parallelism.
+[?2004l[?2004h> 
+[?2004l[?2004h>     The full weight W [out_features, in_features] is split along the output
+[?2004l[?2004h>     dimension (the conceptual columns of the [in, out] matrix). Rank r owns
+[?2004l[?2004h>     rows [r*out_per, (r+1)*out_per). The forward output is the full tensor,
+[?2004l[?2004h>     obtained by all-gathering each rank's local slice along the last dim. The
+[?2004l[?2004h>     bias is sharded in the same way as the output dimension.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias=False, master_weight=None):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         assert master_weight is not None, 'master_weight must be provided'
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.world_size = _world_size()
+[?2004l[?2004h>         self.rank = _rank()
+[?2004l[?2004h>         self.out_features_per_partition = out_features // self.world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         start = self.rank * self.out_features_per_partition
+[?2004l[?2004h>         end = start + self.out_features_per_partition
+[?2004l[?2004h>         shard = master_weight[start:end, :].detach().clone().contiguous()
+[?2004l[?2004h>         self.weight = nn.Parameter(shard)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(self.out_features_per_partition,
+[?2004l[?2004h>                             dtype=shard.dtype, device=shard.device)
+[?2004l[?2004h>             )
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         local = F.linear(x, self.weight)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             local = local + self.bias
+[?2004l[?2004h>         return _AllGatherLastDim.apply(local)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class RowParallelLinear(nn.Module):
+[?2004l[?2004h>     """Linear layer with row (input) parallelism.
+[?2004l[?2004h> 
+[?2004l[?2004h>     The full weight W [out_features, in_features] is split along the input
+[?2004l[?2004h>     dimension (the conceptual rows of the [in, out] matrix). Rank r owns
+[?2004l[?2004h>     columns [r*in_per, (r+1)*in_per). Each rank's forward receives its input
+[?2004l[?2004h>     slice [*, in_per]; the local [*, out_features] partial products are summed
+[?2004l[?2004h>     with an all-reduce. The bias stays full [out_features] on every rank and
+[?2004l[?2004h>     is added after the reduce.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self, in_features, out_features, bias=False, master_weight=None):
+[?2004l[?2004h>         super().__init__()
+[?2004l[?2004h>         assert master_weight is not None, 'master_weight must be provided'
+[?2004l[?2004h>         self.in_features = in_features
+[?2004l[?2004h>         self.out_features = out_features
+[?2004l[?2004h>         self.world_size = _world_size()
+[?2004l[?2004h>         self.rank = _rank()
+[?2004l[?2004h>         self.in_features_per_partition = in_features // self.world_size
+[?2004l[?2004h> 
+[?2004l[?2004h>         start = self.rank * self.in_features_per_partition
+[?2004l[?2004h>         end = start + self.in_features_per_partition
+[?2004l[?2004h>         shard = master_weight[:, start:end].detach().clone().contiguous()
+[?2004l[?2004h>         self.weight = nn.Parameter(shard)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if bias:
+[?2004l[?2004h>             self.bias = nn.Parameter(
+[?2004l[?2004h>                 torch.zeros(self.out_features,
+[?2004l[?2004h>                             dtype=shard.dtype, device=shard.device)
+[?2004l[?2004h>             )
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.register_parameter('bias', None)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def forward(self, x):
+[?2004l[?2004h>         partial = F.linear(x, self.weight)
+[?2004l[?2004h>         output = _AllReduceSum.apply(partial)
+[?2004l[?2004h>         if self.bias is not None:
+[?2004l[?2004h>             output = output + self.bias
+[?2004l[?2004h>         return output
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@7f4ec1ab08a1:/app# cat > /app/test_extra.py <<'PYEOF'
+[?2004l[?2004h> import os
+[?2004l[?2004h> import torch
+[?2004l[?2004h> import torch.nn.functional as F
+[?2004l[?2004h> import torch.distributed as dist
+[?2004l[?2004h> import torch.multiprocessing as mp
+[?2004l[?2004h> 
+[?2004l[?2004h> from parallel_linear import ColumnParallelLinear, RowParallelLinear
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def run_col(rank, world_size, use_bias):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = '29522'
+[?2004l[?2004h>     dist.init_process_group('gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     torch.manual_seed(123)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     g = torch.randn(4, out_f)
+[?2004l[?2004h>     layer = ColumnParallelLinear(in_f, out_f, bias=use_bias, master_weight=W)
+[?2004l[?2004h>     per = out_f // world_size
+[?2004l[?2004h>     assert layer.weight.shape == (per, in_f), 'col w shape'
+[?2004l[?2004h>     assert torch.allclose(layer.weight.data, W[rank * per:(rank + 1) * per, :]), 'col w shard'
+[?2004l[?2004h>     if use_bias:
+[?2004l[?2004h>         assert layer.bias is not None and torch.allclose(layer.bias.data, torch.zeros(per)), 'col b'
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         assert layer.bias is None, 'col b none'
+[?2004l[?2004h>     y = layer(x)
+[?2004l[?2004h>     expected = F.linear(x, W, torch.zeros(out_f) if use_bias else None)
+[?2004l[?2004h>     assert torch.allclose(y, expected, atol=1e-5), 'col out'
+[?2004l[?2004h>     y.backward(g)
+[?2004l[?2004h>     gs = g[:, rank * per:(rank + 1) * per]
+[?2004l[?2004h>     assert torch.allclose(layer.weight.grad, gs.T @ x, atol=1e-5), 'col dw r%d' % rank
+[?2004l[?2004h>     if use_bias:
+[?2004l[?2004h>         assert torch.allclose(layer.bias.grad, gs.sum(0), atol=1e-5), 'col db r%d' % rank
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def run_row(rank, world_size, use_bias):
+[?2004l[?2004h>     os.environ['MASTER_ADDR'] = '127.0.0.1'
+[?2004l[?2004h>     os.environ['MASTER_PORT'] = '29524'
+[?2004l[?2004h>     dist.init_process_group('gloo', rank=rank, world_size=world_size)
+[?2004l[?2004h>     torch.manual_seed(123)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     g = torch.randn(4, out_f)
+[?2004l[?2004h>     per = in_f // world_size
+[?2004l[?2004h>     x_r = x[:, rank * per:(rank + 1) * per]
+[?2004l[?2004h>     layer = RowParallelLinear(in_f, out_f, bias=use_bias, master_weight=W)
+[?2004l[?2004h>     assert layer.weight.shape == (out_f, per), 'row w shape'
+[?2004l[?2004h>     assert torch.allclose(layer.weight.data, W[:, rank * per:(rank + 1) * per]), 'row w shard'
+[?2004l[?2004h>     if use_bias:
+[?2004l[?2004h>         assert layer.bias is not None and torch.allclose(layer.bias.data, torch.zeros(out_f)), 'row b'
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         assert layer.bias is None, 'row b none'
+[?2004l[?2004h>     y = layer(x_r)
+[?2004l[?2004h>     expected = F.linear(x, W, torch.zeros(out_f) if use_bias else None)
+[?2004l[?2004h>     assert torch.allclose(y, expected, atol=1e-5), 'row out'
+[?2004l[?2004h>     y.backward(g)
+[?2004l[?2004h>     assert torch.allclose(layer.weight.grad, g.T @ x_r, atol=1e-5), 'row dw r%d' % rank
+[?2004l[?2004h>     if use_bias:
+[?2004l[?2004h>         assert torch.allclose(layer.bias.grad, g.sum(0), atol=1e-5), 'row db r%d' % rank
+[?2004l[?2004h>     dist.destroy_process_group()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def test_local():
+[?2004l[?2004h>     torch.manual_seed(5)
+[?2004l[?2004h>     in_f, out_f = 16, 8
+[?2004l[?2004h>     W = torch.randn(out_f, in_f)
+[?2004l[?2004h>     x = torch.randn(4, in_f)
+[?2004l[?2004h>     g = torch.randn(4, out_f)
+[?2004l[?2004h>     for ub in (False, True):
+[?2004l[?2004h>         cl = ColumnParallelLinear(in_f, out_f, bias=ub, master_weight=W)
+[?2004l[?2004h>         y = cl(x)
+[?2004l[?2004h>         assert torch.allclose(y, F.linear(x, W, torch.zeros(out_f) if ub else None), atol=1e-5)
+[?2004l[?2004h>         y.backward(g)
+[?2004l[?2004h>         assert torch.allclose(cl.weight.grad, g.T @ x, atol=1e-5)
+[?2004l[?2004h>         if ub:
+[?2004l[?2004h>             assert torch.allclose(cl.bias.grad, g.sum(0), atol=1e-5)
+[?2004l[?2004h>         rl = RowParallelLinear(in_f, out_f, bias=ub, master_weight=W)
+[?2004l[?2004h>         y = rl(x)
+[?2004l[?2004h>         assert torch.allclose(y, F.linear(x, W, torch.zeros(out_f) if ub else None), atol=1e-5)
+[?2004l[?2004h>         y.backward(g)
+[?2004l[?2004h>         assert torch.allclose(rl.weight.grad, g.T @ x, atol=1e-5)
+[?2004l[?2004h>         if ub:
+[?2004l[?2004h>             assert torch.allclose(rl.bias.grad, g.sum(0), atol=1e-5)
+[?2004l[?2004h>     print('extra local OK', flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     test_local()
+[?2004l[?2004h>     for ws in (2, 4):
+[?2004l[?2004h>         for ub in (False, True):
+[?2004l[?2004h>             mp.spawn(run_col, args=(ws, ub), nprocs=ws, join=True)
+[?2004l[?2004h>             mp.spawn(run_row, args=(ws, ub), nprocs=ws, join=True)
+[?2004l[?2004h>     print('EXTRA PASSED', flush=True)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@7f4ec1ab08a1:/app# cd /app && python3 test_parallel.py 2>/dev/null && echo 'PARALLEL OK' && python3 test_extra.py 2>/dev/null && echo 'EXTRA OK'
+[?2004l[ws=1 local] OK
+[col ws=1 rank=0] OK
+[row ws=1 rank=0] OK
+[col ws=2 rank=1] OK
+[col ws=2 rank=0] OK
+[row ws=2 rank=1] OK
+[row ws=2 rank=0] OK
+[col ws=4 rank=1] OK
+[col ws=4 rank=2] OK
+[col ws=4 rank=3] OK
+[col ws=4 rank=0] OK
+[row ws=4 rank=2] OK
+[row ws=4 rank=0] OK
+[row ws=4 rank=1] OK
+[row ws=4 rank=3] OK
+ALL PASSED
+PARALLEL OK
+extra local OK
+EXTRA PASSED
+EXTRA OK
+[?2004hroot@7f4ec1ab08a1:/app# echo '================= /app/parallel_linear.py ================='; cat -n /app/parallel_linear.py
+[?2004l================= /app/parallel_linear.py =================
+     1	import torch
+     2	import torch.nn as nn
+     3	import torch.nn.functional as F
+     4	import torch.distributed as dist
+     5	
+     6	
+     7	def _world_size():
+     8	    if dist.is_available() and dist.is_initialized():
+     9	        return dist.get_world_size()
+    10	    return 1
+    11	
+    12	
+    13	def _rank():
+    14	    if dist.is_available() and dist.is_initialized():
+    15	        return dist.get_rank()
+    16	    return 0
+    17	
+    18	
+    19	class _AllGatherLastDim(torch.autograd.Function):
+    20	    """Concatenate per-rank tensors along the last dimension via all_gather.
+    21	
+    22	    Each rank holds a contiguous slice of the final tensor along its last dim.
+    23	    Forward returns the full concatenation; backward returns this rank's slice
+    24	    of the upstream gradient.
+    25	    """
+    26	
+    27	    @staticmethod
+    28	    def forward(ctx, x):
+    29	        ctx.rank = _rank()
+    30	        ctx.per = x.shape[-1]
+    31	        ws = _world_size()
+    32	        if ws <= 1:
+    33	            return x
+    34	        gathered = [torch.empty_like(x) for _ in range(ws)]
+    35	        dist.all_gather(gathered, x.contiguous())
+    36	        return torch.cat(gathered, dim=-1)
+    37	
+    38	    @staticmethod
+    39	    def backward(ctx, grad_output):
+    40	        start = ctx.rank * ctx.per
+    41	        end = start + ctx.per
+    42	        return grad_output[..., start:end].contiguous()
+    43	
+    44	
+    45	class _AllReduceSum(torch.autograd.Function):
+    46	    """Sum a tensor across all ranks via all_reduce (SUM).
+    47	
+    48	    Forward returns the summed tensor (identical on every rank); backward
+    49	    passes the upstream gradient through unchanged.
+    50	    """
+    51	
+    52	    @staticmethod
+    53	    def forward(ctx, x):
+    54	        ws = _world_size()
+    55	        if ws <= 1:
+    56	            return x
+    57	        y = x.contiguous().clone()
+    58	        dist.all_reduce(y, op=dist.ReduceOp.SUM)
+    59	        return y
+    60	
+    61	    @staticmethod
+    62	    def backward(ctx, grad_output):
+    63	        return grad_output
+    64	
+    65	
+    66	class ColumnParallelLinear(nn.Module):
+    67	    """Linear layer with column (output) parallelism.
+    68	
+    69	    The full weight W [out_features, in_features] is split along the output
+    70	    dimension (the conceptual columns of the [in, out] matrix). Rank r owns
+    71	    rows [r*out_per, (r+1)*out_per). The forward output is the full tensor,
+    72	    obtained by all-gathering each rank's local slice along the last dim. The
+    73	    bias is sharded in the same way as the output dimension.
+    74	    """
+    75	
+    76	    def __init__(self, in_features, out_features, bias=False, master_weight=None):
+    77	        super().__init__()
+    78	        assert master_weight is not None, 'master_weight must be provided'
+    79	        self.in_features = in_features
+    80	        self.out_features = out_features
+    81	        self.world_size = _world_size()
+    82	        self.rank = _rank()
+    83	        self.out_features_per_partition = out_features // self.world_size
+    84	
+    85	        start = self.rank * self.out_features_per_partition
+    86	        end = start + self.out_features_per_partition
+    87	        shard = master_weight[start:end, :].detach().clone().contiguous()
+    88	        self.weight = nn.Parameter(shard)
+    89	
+    90	        if bias:
+    91	            self.bias = nn.Parameter(
+    92	                torch.zeros(self.out_features_per_partition,
+    93	                            dtype=shard.dtype, device=shard.device)
+    94	            )
+    95	        else:
+    96	            self.register_parameter('bias', None)
+    97	
+    98	    def forward(self, x):
+    99	        local = F.linear(x, self.weight)
+   100	        if self.bias is not None:
+   101	            local = local + self.bias
+   102	        return _AllGatherLastDim.apply(local)
+   103	
+   104	
+   105	class RowParallelLinear(nn.Module):
+   106	    """Linear layer with row (input) parallelism.
+   107	
+   108	    The full weight W [out_features, in_features] is split along the input
+   109	    dimension (the conceptual rows of the [in, out] matrix). Rank r owns
+   110	    columns [r*in_per, (r+1)*in_per). Each rank's forward receives its input
+   111	    slice [*, in_per]; the local [*, out_features] partial products are summed
+   112	    with an all-reduce. The bias stays full [out_features] on every rank and
+   113	    is added after the reduce.
+   114	    """
+   115	
+   116	    def __init__(self, in_features, out_features, bias=False, master_weight=None):
+   117	        super().__init__()
+   118	        assert master_weight is not None, 'master_weight must be provided'
+   119	        self.in_features = in_features
+   120	        self.out_features = out_features
+   121	        self.world_size = _world_size()
+   122	        self.rank = _rank()
+   123	        self.in_features_per_partition = in_features // self.world_size
+   124	
+   125	        start = self.rank * self.in_features_per_partition
+   126	        end = start + self.in_features_per_partition
+   127	        shard = master_weight[:, start:end].detach().clone().contiguous()
+   128	        self.weight = nn.Parameter(shard)
+   129	
+   130	        if bias:
+   131	            self.bias = nn.Parameter(
+   132	                torch.zeros(self.out_features,
+   133	                            dtype=shard.dtype, device=shard.device)
+   134	            )
+   135	        else:
+   136	            self.register_parameter('bias', None)
+   137	
+   138	    def forward(self, x):
+   139	        partial = F.linear(x, self.weight)
+   140	        output = _AllReduceSum.apply(partial)
+   141	        if self.bias is not None:
+   142	            output = output + self.bias
+   143	        return output
+[?2004hroot@7f4ec1ab08a1:/app# python3 -c "from parallel_linear import ColumnParallelLinear, RowParallelLinear; import inspect; print('Column sig:', inspect.signature(ColumnParallelLinear.__init__)); print('Row sig:', inspect.signature(RowParallelLinear.__init__))" 2>/dev/null
+[?2004lColumn sig: (self, in_features, out_features, bias=False, master_weight=None)
+Row sig: (self, in_features, out_features, bias=False, master_weight=None)
+[?2004hroot@7f4ec1ab08a1:/app# 

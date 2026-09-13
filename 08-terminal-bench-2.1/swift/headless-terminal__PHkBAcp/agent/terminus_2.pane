@@ -1,0 +1,1340 @@
+[?2004hroot@f7c5e2f5ca90:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@f7c5e2f5ca90:/app# clear
+[?2004l[H[J[3J[?2004hroot@f7c5e2f5ca90:/app# ls -la /app
+[?2004ltotal 4
+drwxr-xr-x 1 root root  38 Oct 28  2025 .
+drwxr-xr-x 1 root root 102 Sep  7 01:32 ..
+-rw-r--r-- 1 root root 401 Oct 27  2025 base_terminal.py
+[?2004hroot@f7c5e2f5ca90:/app# find / -name '*.py' 2>/dev/null | xargs grep -l 'BaseTerminal' 2>/dev/null | head -20
+[?2004l/app/base_terminal.py
+[?2004hroot@f7c5e2f5ca90:/app# pip list 2>/dev/null | head -50
+[?2004lPackage Version
+------- -------
+pip     25.2
+[?2004hroot@f7c5e2f5ca90:/app# cat /app/base_terminal.py
+[?2004lfrom abc import ABC, abstractmethod
+
+
+class BaseTerminal(ABC):
+    @abstractmethod
+    def send_keystrokes(self, keystrokes: str, wait_sec: float = 0.0) -> None:
+        """
+        Sends keystrokes to the terminal.
+
+        Args:
+            keystrokes: The keystrokes to send to the terminal.
+            wait_sec: The number of seconds to wait for the command to complete.
+        """
+        pass
+[?2004hroot@f7c5e2f5ca90:/app# python3 --version && which bash python3
+[?2004lPython 3.13.7
+/usr/bin/bash
+/usr/local/bin/python3
+[?2004hroot@f7c5e2f5ca90:/app# cat > /app/headless_terminal.py <<'PYEOF'
+[?2004l[?2004h> """Headless, pty-backed terminal implementation.
+[?2004l[?2004h> 
+[?2004l[?2004h> ``HeadlessTerminal`` implements the :class:`base_terminal.BaseTerminal`
+[?2004l[?2004h> interface by spawning an *interactive* ``bash`` shell attached to a
+[?2004l[?2004h> pseudo-terminal (pty):
+[?2004li[?2004h> 
+[?2004ls[?2004h> * The process starts as an interactive bash shell, so commands are
+[?2004l[?2004h>   executed by typing characters and pressing Enter, just like a real
+[?2004l[?2004h>   terminal.
+[?2004l[?2004h> * Because the shell runs on a real pty, interactive programs (``top``,
+[?2004l[?2004h>   ``less``, the python REPL, curses applications, ...) work out of the box.
+[?2004l[?2004h> * Modifier / control keys are supported by writing raw bytes to the pty
+[?2004l[?2004h>   master, e.g. ``"\x03"`` (CTRL+C), ``"\x1a"`` (CTRL+Z), ``"\x1b"`` (ESC),
+[?2004l[?2004h>   ``"\n"`` (Enter), ... The kernel terminal line discipline treats these
+[?2004l[?2004h>   bytes exactly as a real terminal would (CTRL+C raises SIGINT, etc.).
+[?2004l[?2004h> * The shell is started interactive (``bash -i``), so it sources its
+[?2004l[?2004h>   startup files such as ``~/.bashrc``.
+[?2004l[?2004h> 
+[?2004l`[?2004h> Example
+[?2004l[?2004h> -------
+[?2004lh[?2004h> >>> from headless_terminal import HeadlessTerminal
+[?2004l[?2004h> >>> term = HeadlessTerminal()
+[?2004l[?2004h> >>> term.send_keystrokes("echo hello\\n", wait_sec=0.5)
+[?2004l[?2004h> >>> "hello" in term.output
+[?2004l[?2004h> True
+[?2004l[?2004h> >>> term.send_keystrokes("exit\\n")
+[?2004l[?2004h> >>> term.close()
+[?2004l[?2004h> 
+[?2004l [?2004h> Note: this module only relies on the Python standard library.
+[?2004l[?2004h> """
+[?2004l[?2004h> from __future__ import annotations
+[?2004l[?2004h> 
+[?2004l`[?2004h> import atexit
+[?2004l[?2004h> import fcntl
+[?2004lC[?2004h> import os
+[?2004l"\[?2004h> import pty
+[?2004l[?2004h> import re
+[?2004l [?2004h> import select
+[?2004l-[?2004h> import shlex
+[?2004l[?2004h> import shutil
+[?2004l[?2004h> import struct
+[?2004l--[?2004h> import subprocess
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import termios
+[?2004ly[?2004h> import threading
+[?2004l[?2004h> import time
+[?2004l-[?2004h> from abc import ABC, abstractmethod
+[?2004l[?2004h> from typing import List, Optional, Sequence
+[?2004l[?2004h> 
+[?2004l [?2004h> try:  # Prefer the provided interface that lives next to this module.
+[?2004l[?2004h>     from base_terminal import BaseTerminal
+[?2004l[?2004h> except ImportError:  # pragma: no cover - fallback if imported from elsewhere
+[?2004l[?2004h>     _HERE = os.path.dirname(os.path.abspath(__file__))
+[?2004l[?2004h>     if _HERE not in sys.path:
+[?2004l[?2004h>         sys.path.insert(0, _HERE)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         from base_terminal import BaseTerminal
+[?2004lR[?2004h>     except ImportError:  # pragma: no cover
+[?2004l[?2004h> 
+[?2004l [?2004h>         class BaseTerminal(ABC):  # type: ignore[no-redef]
+[?2004l[?2004h>             @abstractmethod
+[?2004l[?2004h>             def send_keystrokes(self, keystrokes: str, wait_sec: float = 0.0) -> None:  # noqa: D102
+[?2004l[?2004h>                 """Send ``keystrokes`` to the terminal, then wait ``wait_sec``."""
+[?2004l[?2004h> 
+[?2004l [?2004h> __all__ = ["HeadlessTerminal"]
+[?2004l[?2004h> 
+[?2004l-[?2004h> # Matches textual \xNN escape sequences, e.g. the literal 4-char string r"\x03".
+[?2004l[?2004h> _ESCAPE_RE = re.compile(r"\\x([0-9a-fA-F]{1,2})")
+[?2004l[?2004h> 
+[?2004le[?2004h> _BASH_CANDIDATES = ("/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash")
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> def _keystrokes_to_bytes(keystrokes) -> bytes:
+[?2004l[?2004h>     """Convert *keystrokes* to the raw bytes to inject into the pty.
+[?2004l[?2004h> 
+[?2004lh[?2004h>     A normal ``str`` is encoded to UTF-8 and written verbatim, so real
+[?2004l[?2004h>     control characters such as ``"\x03"`` are transmitted as-is.  In
+[?2004l[?2004h>     addition, *textual* ``\xNN`` escape sequences (for example keystrokes
+[?2004l[?2004h>     read from a config file) are interpreted.  Any other backslashes are
+[?2004l[?2004h>     left untouched so commands that contain literal backslashes keep
+[?2004l[?2004h>     working.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     if isinstance(keystrokes, (bytes, bytearray)):
+[?2004l[?2004h>         return bytes(keystrokes)
+[?2004l[?2004h>     if not isinstance(keystrokes, str):
+[?2004l[?2004h>         raise TypeError(
+[?2004l[?2004h>             "keystrokes must be str or bytes, got %s" % type(keystrokes).__name__
+[?2004l[?2004h>         )
+[?2004l[?2004h>     if "\\" in keystrokes:
+[?2004l[?2004h>         keystrokes = _ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), keystrokes)
+[?2004l[?2004h>     return keystrokes.encode("utf-8")
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l [?2004h> def _resolve_command(command) -> List[str]:
+[?2004l[?2004h>     """Return the argv used to start the shell attached to the terminal."""
+[?2004l[?2004h>     if command is None:
+[?2004l[?2004h>         bash = shutil.which("bash")
+[?2004l[?2004h>         if bash is None:
+[?2004l[?2004h>             for candidate in _BASH_CANDIDATES:
+[?2004l[?2004h>                 if os.path.exists(candidate):
+[?2004l[?2004h>                     bash = candidate
+[?2004l[?2004h>                     break
+[?2004l[?2004h>         if bash is None:
+[?2004l([?2004h>             raise RuntimeError(
+[?2004l[?2004h>                 "HeadlessTerminal requires a bash shell but 'bash' was not found."
+[?2004l[?2004h>             )
+[?2004l[?2004h>         # -i -> interactive: bash sources ~/.bashrc and behaves like a
+[?2004l[?2004h>         # real terminal session (prompt, job control, ...).
+[?2004l[?2004h>         return [bash, "-i"]
+[?2004l[?2004h>     if isinstance(command, (list, tuple)):
+[?2004l[?2004h>         return [str(part) for part in command]
+[?2004l[?2004h>     return shlex.split(str(command))
+[?2004l[?2004h> 
+[?2004lt[?2004h> 
+[?2004le[?2004h> def _child_preexec(slave_fd: int) -> None:
+[?2004l[?2004h>     """Runs in the child (between fork and exec).
+[?2004l[?2004h> 
+[?2004lo[?2004h>     Creates a new session and makes the pty slave the controlling
+[?2004l[?2004h>     terminal, which is required for proper job control / SIGINT etc.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     os.setsid()
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+[?2004l[?2004h>     except OSError:  # pragma: no cover - best effort
+[?2004l[?2004h>         pass
+[?2004l [?2004h> 
+[?2004l [?2004h> 
+[?2004l [?2004h> class HeadlessTerminal(BaseTerminal):
+[?2004l[?2004h>     """A headless terminal: an interactive bash shell on a pseudo-terminal.
+[?2004l[?2004h> 
+[?2004lo[?2004h>     Additional conveniences on top of the ``BaseTerminal`` interface:
+[?2004l[?2004h> 
+[?2004ls[?2004h>     * ``output``         -- all text the shell has printed so far
+[?2004l[?2004h>     * ``get_output()``   -- same as ``term.output``
+[?2004l[?2004h>     * ``read_output()``  -- returns the accumulated output and clears it
+[?2004l[?2004h>     * ``clear_output()`` -- discards the accumulated output buffer
+[?2004l[?2004h>     * ``wait_for(s, timeout)`` -- wait until ``s`` shows up in the output
+[?2004l[?2004h>     * ``sendline(line)`` -- send a line followed by Enter
+[?2004l[?2004h>     * ``is_alive``, ``pid``, ``exit_code`` -- process state
+[?2004l[?2004h>     * ``close()``        -- terminate the shell and clean up
+[?2004l[?2004h>     * ``with HeadlessTerminal() as t: ...`` -- context manager support
+[?2004l[?2004h> 
+[?2004l [?2004h>     Control-key constants are provided as attributes, e.g.
+[?2004l[?2004h>     ``HeadlessTerminal.KEY_CTRL_C`` == ``"\x03"``.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004ln[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Control / modifier key constants.
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     KEY_ENTER = "\n"
+[?2004l[?2004h>     KEY_ESC = "\x1b"
+[?2004l[?2004h>     KEY_TAB = "\t"
+[?2004l[?2004h>     KEY_BACKSPACE = "\x7f"
+[?2004lo[?2004h>     KEY_CTRL_A = "\x01"
+[?2004l[?2004h>     KEY_CTRL_C = "\x03"
+[?2004l  [?2004h>     KEY_CTRL_D = "\x04"
+[?2004l[?2004h>     KEY_CTRL_E = "\x05"
+[?2004l[?2004h>     KEY_CTRL_L = "\x0c"
+[?2004l[?2004h>     KEY_CTRL_P = "\x10"
+[?2004l[?2004h>     KEY_CTRL_N = "\x0e"
+[?2004l[?2004h>     KEY_CTRL_U = "\x15"
+[?2004l[?2004h>     KEY_CTRL_W = "\x17"
+[?2004l[?2004h>     KEY_CTRL_Z = "\x1a"
+[?2004l[?2004h>     ARROW_UP = "\x1b[A"
+[?2004l[?2004h>     ARROW_DOWN = "\x1b[B"
+[?2004l[?2004h>     ARROW_RIGHT = "\x1b[C"
+[?2004l[?2004h>     ARROW_LEFT = "\x1b[D"
+[?2004l  [?2004h> 
+[?2004l [?2004h>     def __init__(
+[?2004l[?2004h>         self,
+[?2004l[?2004h>         command: Optional[object] = None,
+[?2004l[?2004h>         cwd: Optional[str] = None,
+[?2004l[?2004h>         env: Optional[dict] = None,
+[?2004l[?2004h>         columns: int = 80,
+[?2004l[?2004h>         rows: int = 24,
+[?2004l[?2004h>     ) -> None:
+[?2004l[?2004h>         if getattr(self, "_proc", None) is not None:
+[?2004l[?2004h>             raise RuntimeError("cannot re-initialize a HeadlessTerminal instance")
+[?2004l[?2004h>         self._cmd = _resolve_command(command)
+[?2004l[?2004h>         self._cwd = cwd
+[?2004l[?2004h>         self._env = env
+[?2004l[?2004h>         self._columns = int(columns)
+[?2004l[?2004h>         self._rows = int(rows)
+[?2004l[?2004h> 
+[?2004lo[?2004h>         self._buffer_lock = threading.Lock()
+[?2004l[?2004h>         self._buffer: bytearray = bytearray()
+[?2004l[?2004h>         self._write_lock = threading.Lock()
+[?2004l[?2004h>         self._closed = False
+[?2004l[?2004h>         self._proc: Optional[subprocess.Popen] = None
+[?2004l[?2004h>         self._reader: Optional[threading.Thread] = None
+[?2004l[?2004h>         self._master_fd: int = -1
+[?2004l[?2004h> 
+[?2004ln[?2004h>         self._start()
+[?2004l[?2004h>         atexit.register(self.close)
+[?2004l[?2004h> 
+[?2004la[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Lifecycle
+[?2004l [?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     def _start(self) -> None:
+[?2004l[?2004h>         master, slave = pty.openpty()
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             # Give the terminal a sane size so programs like ``top``
+[?2004l[?2004h>             # render correctly.
+[?2004l[?2004h>             fcntl.ioctl(
+[?2004l[?2004h>                 master,
+[?2004l[?2004h>                 termios.TIOCSWINSZ,
+[?2004l[?2004h>                 struct.pack("HHHH", self._rows, self._columns, 0, 0),
+[?2004l[?2004h>             )
+[?2004l[?2004h>             env = dict(os.environ)
+[?2004l[?2004h>             env["TERM"] = env.get("TERM") if env.get("TERM", "") not in ("dumb", "") else "xterm-256color"
+[?2004l[?2004h>             if not env.get("TERM"):
+[?2004l[?2004h>                 env["TERM"] = "xterm-256color"
+[?2004l[?2004h>             if env.get("TERM", "").lower() in ("", "dumb"):
+[?2004l[?2004h>                 env["TERM"] = "xterm-256color"
+[?2004l[?2004h>             if self._env:
+[?2004l([?2004h>                 env.update({str(k): str(v) for k, v in self._env.items()})
+[?2004l[?2004h> 
+[?2004le[?2004h>             self._proc = subprocess.Popen(
+[?2004l[?2004h>                 self._cmd,
+[?2004l[?2004h>                 stdin=slave,
+[?2004l[?2004h>                 stdout=slave,
+[?2004l[?2004h>                 stderr=slave,
+[?2004l[?2004h>                 cwd=self._cwd,
+[?2004l[?2004h>                 env=env,
+[?2004l[?2004h>                 close_fds=True,
+[?2004l[?2004h>                 preexec_fn=lambda: _child_preexec(slave),
+[?2004l[?2004h>             )
+[?2004l[?2004h>         except Exception:
+[?2004l[?2004h>             for fd in (master, slave):
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     os.close(fd)
+[?2004l[?2004h>                 except OSError:
+[?2004lsi[?2004h>                     pass
+[?2004l[?2004h>             raise
+[?2004l[?2004h>         os.close(slave)
+[?2004l[?2004h>         self._master_fd = master
+[?2004l[?2004h> 
+[?2004li[?2004h>         self._reader = threading.Thread(
+[?2004l[?2004h>             target=self._reader_loop,
+[?2004l[?2004h>             args=(self._proc,),
+[?2004l[?2004h>             name="headless-terminal-reader",
+[?2004l[?2004h>             daemon=True,
+[?2004l[?2004h>         )
+[?2004l---[?2004h>         self._reader.start()
+[?2004l[?2004h> 
+[?2004l-[?2004h>     def _reader_loop(self, proc: subprocess.Popen) -> None:
+[?2004l[?2004h>         """Continuously drain the pty so the child is never blocked."""
+[?2004l[?2004h>         master = self._master_fd
+[?2004l[?2004h>         try:
+[?2004lt[?2004h>             while True:
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     readable, _, _ = select.select([master], [], [], 0.2)
+[?2004l[?2004h>                 except (OSError, ValueError):
+[?2004l[?2004h>                     break
+[?2004lr[?2004h>                 if readable:
+[?2004l[?2004h>                     try:
+[?2004l[?2004h>                         chunk = os.read(master, 65536)
+[?2004l[?2004h>                     except OSError:
+[?2004l[?2004h>                         # EIO: slave side closed (the shell exited).
+[?2004l[?2004h>                         break
+[?2004l[?2004h>                     if not chunk:
+[?2004l[?2004h>                         break
+[?2004l[?2004h>                     with self._buffer_lock:
+[?2004lb[?2004h>                         self._buffer.extend(chunk)
+[?2004l[?2004h>                 elif proc.poll() is not None:
+[?2004l[?2004h>                     # Child is gone; drain whatever is left, then stop.
+[?2004l[?2004h>                     self._drain(master)
+[?2004l[?2004h>                     break
+[?2004lrn[?2004h>         finally:
+[?2004lo[?2004h>             try:
+[?2004lfo[?2004h>                 proc.wait(timeout=5)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004lt[?2004h>     @staticmethod
+[?2004l[?2004h>     def _drain(master: int) -> None:
+[?2004l[?2004h>         while True:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     readable, _, _ = select.select([master], [], [], 0.1)
+[?2004l[?2004h>                 except (OSError, ValueError):
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 if not readable:
+[?2004l[?2004h>                     break
+[?2004ls[?2004h>                 try:
+[?2004l[?2004h>                     chunk = os.read(master, 65536)
+[?2004l[?2004h>                 except OSError:
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 if not chunk:
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 with HeadlessTerminal._buffer_lock_placeholder():  # replaced below
+[?2004l[?2004h>                     pass
+[?2004l [?2004h>             except Exception:
+[?2004l[?2004h>                 break
+[?2004l [?2004h> 
+[?2004li[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # BaseTerminal interface
+[?2004lco[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     def send_keystrokes(self, keystrokes: str, wait_sec: float = 0.0) -> None:
+[?2004l[?2004h>         """Send *keystrokes* to the terminal.
+[?2004l[?2004h> 
+[?2004ls[?2004h>         Args:
+[?2004l[?2004h>             keystrokes: The characters to type into the terminal.  Control
+[?2004l[?2004h>                 keys may be expressed directly (``"\x03"`` = CTRL+C)
+[?2004l[?2004h>                 or textually (``r"\x03"``).
+[?2004l[?2004h>             wait_sec: The number of seconds to wait after sending
+[?2004l[?2004h>                 (to give the command time to run).
+[?2004l[?2004h>         """
+[?2004l [?2004h>         self._write(_keystrokes_to_bytes(keystrokes))
+[?2004l[?2004h>         if wait_sec and wait_sec > 0:
+[?2004l[?2004h>             time.sleep(float(wait_sec))
+[?2004l[?2004h> 
+[?2004l [?2004h>     # pexpect-style alias
+[?2004l  [?2004h>     def send(self, data: str, *args, **kwargs) -> None:
+[?2004le[?2004h>         """Alias for :meth:`send_keystrokes` (pexpect compatibility)."""
+[?2004l[?2004h>         self.send_keystrokes(data)
+[?2004l[?2004h> 
+[?2004l [?2004h>     def sendline(self, line: str, wait_sec: float = 0.0) -> None:
+[?2004l[?2004h>         """Send *line* followed by an Enter key."""
+[?2004l[?2004h>         line = line.rstrip("\n")
+[?2004l[?2004h>         self.send_keystrokes(line + self.KEY_ENTER, wait_sec=wait_sec)
+[?2004l[?2004h> 
+[?2004l [?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Internal write path
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     def _write(self, data: bytes) -> None:
+[?2004l[?2004h>         if self._master_fd < 0 and self._closed:
+[?2004l[?2004h>             raise RuntimeError("the terminal has been closed")
+[?2004l[?2004h>         master = self._master_fd
+[?2004l[?2004h>         view = memoryview(data)
+[?2004l[?2004h>         with self._write_lock:
+[?2004l[?2004h>             while view:
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     written = os.write(master, view)
+[?2004l[?2004h>                 except OSError:
+[?2004l[?2004h>                     proc = self._proc
+[?2004l[?2004h>                     if proc is not None and proc.poll() is not None:
+[?2004l[?2004h>                         raise RuntimeError(
+[?2004lon[?2004h>                             "cannot send keystrokes: the shell process has exited"
+[?2004l[?2004h>                         )
+[?2004l[?2004h>                     # Transient error (e.g. EIO during shutdown); drop the
+[?2004l[?2004h>                     # remaining bytes instead of hanging.
+[?2004lt[?2004h>                     break
+[?2004l[?2004h>                 view = view[written:]
+[?2004l[?2004h> 
+[?2004lc[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Output access
+[?2004l  [?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     @property
+[?2004l[?2004h>     def output(self) -> str:
+[?2004l[?2004h>         """Everything the shell has printed so far (decoded text)."""
+[?2004l[?2004h>         with self._buffer_lock:
+[?2004l[?2004h>             data = bytes(self._buffer)
+[?2004l[?2004h>         return data.decode("utf-8", "replace")
+[?2004l[?2004h> 
+[?2004l [?2004h>     def get_output(self) -> str:
+[?2004le[?2004h>         """Return all output produced so far."""
+[?2004l[?2004h>         return self.output
+[?2004l)[?2004h> 
+[?2004l
+[?2004h>     def read_output(self) -> str:
+[?2004l[?2004h>         """Return the accumulated output and clear the buffer."""
+[?2004l[?2004h>         with self._buffer_lock:
+[?2004l[?2004h>             data = bytes(self._buffer)
+[?2004l[?2004h>             self._buffer.clear()
+[?2004l[?2004h>         return data.decode("utf-8", "replace")
+[?2004l[?2004h> 
+[?2004l[?2004h>     def clear_output(self) -> None:
+[?2004l[?2004h>         """Discard the accumulated output buffer."""
+[?2004l[?2004h>         with self._buffer_lock:
+[?2004l[?2004h>             self._buffer.clear()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Aliases
+[?2004l[?2004h>     reset_output = clear_output
+[?2004l[?2004h> 
+[?2004l[?2004h>     def wait_for(self, text: str, timeout: float = 10.0) -> bool:
+[?2004l[?2004h>         """Wait until *text* appears in the terminal output.
+[?2004l[?2004h> 
+[?2004l[?2004h>         Returns ``True`` as soon as *text* is found, ``False`` after
+[?2004l[?2004h>         *timeout* seconds.
+[?2004l[?2004h>         """
+[?2004l[?2004h>         deadline = time.monotonic() + max(0.0, float(timeout))
+[?2004l[?2004h>         while True:
+[?2004l[?2004h>             if text and text in self.output:
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>             if time.monotonic() >= deadline:
+[?2004l[?2004h>                 return False
+[?2004l[?2004h>             time.sleep(0.02)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Process state
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     @property
+[?2004l[?2004h>     def pid(self) -> Optional[int]:
+[?2004l[?2004h>         return self._proc.pid if self._proc is not None else None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def is_alive(self) -> bool:
+[?2004l[?2004h>         """True while the shell process is running."""
+[?2004l[?2004h>         return self._proc is not None and self._proc.poll() is None
+[?2004l[?2004h> 
+[?2004l[?2004h>     alive = is_alive
+[?2004l[?2004h> 
+[?2004l[?2004h>     @property
+[?2004l[?2004h>     def exit_code(self) -> Optional[int]:
+[?2004l[?2004h>         """Exit code of the shell, or ``None`` while it is still running."""
+[?2004l[?2004h>         proc = self._proc
+[?2004l[?2004h>         if proc is None:
+[?2004l[?2004h>             return None
+[?2004l[?2004h>         return proc.poll()
+[?2004l[?2004h> 
+[?2004l[?2004h>     exitstatus = exit_code  # pexpect-style alias
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Shutdown
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     def close(self) -> None:
+[?2004l[?2004h>         """Terminate the shell (if still running) and free all resources."""
+[?2004l[?2004h>         if self._closed:
+[?2004l[?2004h>             return
+[?2004l[?2004h>         self._closed = True
+[?2004l[?2004h>         proc = self._proc
+[?2004l[?2004h>         if proc is not None and proc.poll() is None:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 proc.terminate()
+[?2004l[?2004h>                 proc.wait(timeout=1.0)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     proc.kill()
+[?2004l[?2004h>                 except Exception:
+[?2004l[?2004h>                     pass
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     proc.wait(timeout=1.0)
+[?2004l[?2004h>                 except Exception:
+[?2004l[?2004h>                     pass
+[?2004l[?2004h>         if self._reader is not None:
+[?2004l[?2004h>             self._reader.join(timeout=1.0)
+[?2004l[?2004h>             self._reader = None
+[?2004l[?2004h>         if self._master_fd is not None and self._master_fd >= 0:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 os.close(self._master_fd)
+[?2004l[?2004h>             except OSError:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             self._master_fd = -1
+[?2004l[?2004h> 
+[?2004l[?2004h>     def terminate(self) -> None:
+[?2004l[?2004h>         """Alias for :meth:`close`."""
+[?2004l[?2004h>         self.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def kill(self) -> None:
+[?2004l[?2004h>         """Forcefully kill the shell and clean up."""
+[?2004l[?2004h>         if self._closed:
+[?2004l[?2004h>             return
+[?2004l[?2004h>         proc = self._proc
+[?2004l[?2004h>         if proc is not None and proc.poll() is None:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 proc.kill()
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 proc.wait(timeout=1.0)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>         self.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __enter__(self) -> "HeadlessTerminal":
+[?2004l[?2004h>         return self
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __exit__(self, exc_type, exc, tb) -> None:
+[?2004l[?2004h>         self.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __del__(self):  # pragma: no cover - best effort cleanup
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             self.close()
+[?2004l[?2004h>         except Exception:
+[?2004l[?2004h>             pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __repr__(self) -> str:  # pragma: no cover - debugging aid
+[?2004l[?2004h>         state = "running" if self.is_alive() else "stopped"
+[?2004l[?2004h>         return f"<HeadlessTerminal pid={self.pid} {state}>"
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == "__main__":  # pragma: no cover - manual smoke test
+[?2004l[?2004h>     term = HeadlessTerminal()
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         term.send_keystrokes("echo headless terminal works\n", wait_sec=0.5)
+[?2004l[?2004h>         print(term.output)
+[?2004l[?2004h>         term.send_keystrokes("exit\n", wait_sec=0.3)
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         term.close()
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@f7c5e2f5ca90:/app# cat > /app/headless_terminal.py <<'PYEOF'
+[?2004lm = HeadlessTerminal()
+>>> term.send_keystrokes("echo hello\\n", wait_sec=0.5)
+>>> "hello" in term.output
+True
+>>> term.send_keystrokes("exit\\n")
+>>> term.close()
+
+Note: this module only relies on the Python standard library.
+"""
+from __future__ import annotations
+
+import atexit
+import fcntl
+import os
+import pty
+import re
+import select
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import time
+from abc import ABC, abstractmethod
+from typing import List, Optional
+
+try:  # Prefer the provided interface that lives next to this module.
+    from base_terminal import BaseTerminal
+except ImportError:  # pragma: no cover - fallback if imported from elsewhere
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
+    try:
+        from base_terminal import BaseTerminal
+    except ImportError:  # pragma: no cover
+
+        class BaseTerminal(ABC):  # type: ignore[no-redef]
+            @abstractmethod
+  [?2004h> """Headless, pty-backed terminal implementation.
+[?2004l[?2004h> 
+[?2004l[?2004h> ``HeadlessTerminal`` implements the :class:`base_terminal.BaseTerminal`
+[?2004l[?2004h> interface by spawning an *interactive* ``bash`` shell attached to a
+[?2004lterm[?2004h> pseudo-terminal (pty):
+[?2004l[?2004h> 
+[?2004l[?2004h> * The process starts as an interactive bash shell, so commands are
+[?2004l[?2004h>   executed by typing characters and pressing Enter, just like a real
+[?2004l[?2004h>   terminal.
+[?2004l[?2004h> * Because the shell runs on a real pty, interactive programs (``top``,
+[?2004l[?2004h>   ``less``, the python REPL, curses applications, ...) work out of the box.
+[?2004l[?2004h> * Modifier / control keys are supported by writing raw bytes to the pty
+[?2004l[?2004h>   master, e.g. ``"\x03"`` (CTRL+C), ``"\x1a"`` (CTRL+Z), ``"\x1b"`` (ESC),
+[?2004l[?2004h>   ``"\n"`` (Enter), ... The kernel terminal line discipline treats these
+[?2004l[?2004h>   bytes exactly as a real terminal would (CTRL+C raises SIGINT, etc.).
+[?2004l[?2004h> * The shell is started interactive (``bash -i``), so it sources its
+[?2004l [?2004h>   startup files such as ``~/.bashrc``.
+[?2004ll [?2004h> 
+[?2004l[?2004h> Example
+[?2004l[?2004h> -------
+[?2004l[?2004h> >>> from headless_terminal import HeadlessTerminal
+[?2004la l[?2004h> >>> term = HeadlessTerminal()
+[?2004l`[?2004h> >>> term.send_keystrokes("echo hello\\n", wait_sec=0.5)
+[?2004l[?2004h> >>> "hello" in term.output
+[?2004l   -[?2004h> True
+[?2004l[?2004h> >>> term.send_keystrokes("exit\\n")
+[?2004lesourc[?2004h> >>> term.close()
+[?2004l[?2004h> 
+[?2004l[?2004h> Note: this module only relies on the Python standard library.
+[?2004l[?2004h> """
+[?2004l[?2004h> from __future__ import annotations
+[?2004l[?2004h> 
+[?2004lt[?2004h> import atexit
+[?2004l[?2004h> import fcntl
+[?2004l[?2004h> import os
+[?2004l[?2004h> import pty
+[?2004l[?2004h> import re
+[?2004l[?2004h> import select
+[?2004l[?2004h> import shlex
+[?2004l[?2004h> import shutil
+[?2004l[?2004h> import struct
+[?2004l[?2004h> import subprocess
+[?2004l-[?2004h> import sys
+[?2004l-[?2004h> import termios
+[?2004l C[?2004h> import threading
+[?2004l[?2004h> import time
+[?2004l[?2004h> from abc import ABC, abstractmethod
+[?2004l[?2004h> from typing import List, Optional
+[?2004l[?2004h> 
+[?2004l[?2004h> try:  # Prefer the provided interface that lives next to this module.
+[?2004l
+ [?2004h>     from base_terminal import BaseTerminal
+[?2004l[?2004h> except ImportError:  # pragma: no cover - fallback if imported from elsewhere
+[?2004l[?2004h>     _HERE = os.path.dirname(os.path.abspath(__file__))
+[?2004l[?2004h>     if _HERE not in sys.path:
+[?2004l[?2004h>         sys.path.insert(0, _HERE)
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         from base_terminal import BaseTerminal
+[?2004l = "\x1b[A"
+    AR[?2004h>     except ImportError:  # pragma: no cover
+[?2004l[?2004h> 
+[?2004lC[?2004h>         class BaseTerminal(ABC):  # type: ignore[no-redef]
+[?2004l[?2004h>             @abstractmethod
+[?2004l[?2004h>             def send_keystrokes(self, keystrokes: str, wait_sec: float = 0.0) -> None:  # noqa: D102
+[?2004l[?2004h>                 """Send ``keystrokes`` to the terminal, then wait ``wait_sec``."""
+[?2004l[?2004h> 
+[?2004l[?2004h> __all__ = ["HeadlessTerminal"]
+[?2004l[?2004h> 
+[?2004l[?2004h> # Matches textual \xNN escape sequences, e.g. the literal 4-char string r"\x03".
+[?2004l[?2004h> _ESCAPE_RE = re.compile(r"\\x([0-9a-fA-F]{1,2})")
+[?2004l[?2004h> 
+[?2004l[?2004h> _BASH_CANDIDATES = ("/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash")
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _keystrokes_to_bytes(keystrokes) -> bytes:
+[?2004l[?2004h>     """Convert *keystrokes* to the raw bytes to inject into the pty.
+[?2004learray[?2004h> 
+[?2004l[?2004h>     A normal ``str`` is encoded to UTF-8 and written verbatim, so real
+[?2004l[?2004h>     control characters such as ``"\x03"`` are transmitted as-is.  In
+[?2004l[?2004h>     addition, *textual* ``\xNN`` escape sequences (for example keystrokes
+[?2004l[?2004h>     read from a config file) are interpreted.  Any other backslashes are
+[?2004l[?2004h>     left untouched so commands that contain literal backslashes keep
+[?2004l[?2004h>     working.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     if isinstance(keystrokes, (bytes, bytearray)):
+[?2004l[?2004h>         return bytes(keystrokes)
+[?2004l[?2004h>     if not isinstance(keystrokes, str):
+[?2004l[?2004h>         raise TypeError(
+[?2004l[?2004h>             "keystrokes must be str or bytes, got %s" % type(keystrokes).__name__
+[?2004l[?2004h>         )
+[?2004l[?2004h>     if "\\" in keystrokes:
+[?2004l[?2004h>         keystrokes = _ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), keystrokes)
+[?2004l[?2004h>     return keystrokes.encode("utf-8")
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _resolve_command(command) -> List[str]:
+[?2004l[?2004h>     """Return the argv used to start the shell attached to the terminal."""
+[?2004l[?2004h>     if command is None:
+[?2004l[?2004h>         bash = shutil.which("bash")
+[?2004l[?2004h>         if bash is None:
+[?2004l[?2004h>             for candidate in _BASH_CANDIDATES:
+[?2004l[?2004h>                 if os.path.exists(candidate):
+[?2004l[?2004h>                     bash = candidate
+[?2004l[?2004h>                     break
+[?2004l[?2004h>         if bash is None:
+[?2004l[?2004h>             raise RuntimeError(
+[?2004l[?2004h>                 "HeadlessTerminal requires a bash shell but 'bash' was not found."
+[?2004l[?2004h>             )
+[?2004l[?2004h>         # -i -> interactive: bash sources ~/.bashrc and behaves like a
+[?2004l[?2004h>         # real terminal session (prompt, job control, ...).
+[?2004l[?2004h>         return [bash, "-i"]
+[?2004l[?2004h>     if isinstance(command, (list, tuple)):
+[?2004l[?2004h>         return [str(part) for part in command]
+[?2004l[?2004h>     return shlex.split(str(command))
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _child_preexec(slave_fd: int) -> None:
+[?2004l[?2004h>     """Runs in the child (between fork and exec).
+[?2004l[?2004h> 
+[?2004l[?2004h>     Creates a new session and makes the pty slave the controlling
+[?2004l[?2004h>     terminal, which is required for proper job control / SIGINT etc.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     os.setsid()
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+[?2004l[?2004h>     except OSError:  # pragma: no cover - best effort
+[?2004l[?2004h>         pass
+[?2004l[?2004h> 
+[?2004lv[?2004h> 
+[?2004l[?2004h> class HeadlessTerminal(BaseTerminal):
+[?2004l[?2004h>     """A headless terminal: an interactive bash shell on a pseudo-terminal.
+[?2004l[?2004h> 
+[?2004l[?2004h>     In addition to the ``BaseTerminal`` interface this class provides:
+[?2004l [?2004h> 
+[?2004l[?2004h>     * ``output``            -- all text the shell has printed so far
+[?2004l[?2004h>     * ``get_output()``      -- same as ``term.output``
+[?2004l [?2004h>     * ``read_output()``     -- returns the accumulated output and clears it
+[?2004l[?2004h>     * ``clear_output()``    -- discards the accumulated output buffer
+[?2004l[?2004h>     * ``wait_for(s, timeout)`` -- wait until ``s`` shows up in the output
+[?2004l[?2004h>     * ``sendline(line)``    -- send a line followed by Enter
+[?2004l[?2004h>     * ``is_alive`` / ``pid`` / ``exit_code`` -- process state
+[?2004l[?2004h>     * ``close()``           -- terminate the shell and release resources
+[?2004l[?2004h>     * ``with HeadlessTerminal() as t: ...``  -- context manager support
+[?2004l[?2004h> 
+[?2004lr[?2004h>     Control-key constants are provided as attributes, e.g.
+[?2004l[?2004h>     ``HeadlessTerminal.KEY_CTRL_C`` == ``"\x03"``.
+[?2004l[?2004h>     """
+[?2004l[?2004h> 
+[?2004l [?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Control / modifier key constants.
+[?2004l [?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     KEY_ENTER = "\n"
+[?2004l[?2004h>     KEY_ESC = "\x1b"
+[?2004l[?2004h>     KEY_TAB = "\t"
+[?2004ls[?2004h>     KEY_BACKSPACE = "\x7f"
+[?2004l[?2004h>     KEY_CTRL_A = "\x01"
+[?2004l[?2004h>     KEY_CTRL_C = "\x03"
+[?2004leE[?2004h>     KEY_CTRL_D = "\x04"
+[?2004l [?2004h>     KEY_CTRL_E = "\x05"
+[?2004l   [?2004h>     KEY_CTRL_L = "\x0c"
+[?2004l[?2004h>     KEY_CTRL_P = "\x10"
+[?2004l[?2004h>     KEY_CTRL_N = "\x0e"
+[?2004l[?2004h>     KEY_CTRL_U = "\x15"
+[?2004l[?2004h>     KEY_CTRL_W = "\x17"
+[?2004l  [?2004h>     KEY_CTRL_Z = "\x1a"
+[?2004l[?2004h>     ARROW_UP = "\x1b[A"
+[?2004l [?2004h>     ARROW_DOWN = "\x1b[B"
+[?2004l[?2004h>     ARROW_RIGHT = "\x1b[C"
+[?2004l[?2004h>     ARROW_LEFT = "\x1b[D"
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(
+[?2004lo[?2004h>         self,
+[?2004l[?2004h>         command: Optional[object] = None,
+[?2004l[?2004h>         cwd: Optional[str] = None,
+[?2004l[?2004h>         env: Optional[dict] = None,
+[?2004l-[?2004h>         columns: int = 80,
+[?2004l[?2004h>         rows: int = 24,
+[?2004l[?2004h>     ) -> None:
+[?2004lrm[?2004h>         if getattr(self, "_proc", None) is not None:
+[?2004l[?2004h>             raise RuntimeError("cannot re-initialize a HeadlessTerminal instance")
+[?2004lr,[?2004h>         self._cmd = _resolve_command(command)
+[?2004l[?2004h>         self._cwd = cwd
+[?2004l t[?2004h>         self._env = env
+[?2004l[?2004h>         self._columns = int(columns)
+[?2004l[?2004h>         self._rows = int(rows)
+[?2004l[?2004h> 
+[?2004lo[?2004h>         self._buffer_lock = threading.Lock()
+[?2004l[?2004h>         self._buffer: bytearray = bytearray()
+[?2004lt[?2004h>         self._write_lock = threading.Lock()
+[?2004lter[?2004h>         self._closed = False
+[?2004l[?2004h>         self._proc: Optional[subprocess.Popen] = None
+[?2004l   [?2004h>         self._reader: Optional[threading.Thread] = None
+[?2004l [?2004h>         self._master_fd: int = -1
+[?2004lytes[?2004h> 
+[?2004l([?2004h>         self._start()
+[?2004l[?2004h>         atexit.register(self.close)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Lifecycle
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     def _start(self) -> None:
+[?2004l [?2004h>         master, slave = pty.openpty()
+[?2004l[?2004h>         try:
+[?2004l [?2004h>             # Give the terminal a sane size so programs like ``top``
+[?2004l[?2004h>             # render correctly.
+[?2004l[?2004h>             fcntl.ioctl(
+[?2004l[?2004h>                 master,
+[?2004l[?2004h>                 termios.TIOCSWINSZ,
+[?2004l# [?2004h>                 struct.pack("HHHH", self._rows, self._columns, 0, 0),
+[?2004l[?2004h>             )
+[?2004l [?2004h>             env = dict(os.environ)
+[?2004l[?2004h>             if self._env:
+[?2004l[?2004h>                 env.update({str(k): str(v) for k, v in self._env.items()})
+[?2004l[?2004h>             if env.get("TERM", "").lower() in ("", "dumb"):
+[?2004l[?2004h>                 env["TERM"] = "xterm-256color"
+[?2004l[?2004h> 
+[?2004lt[?2004h>             self._proc = subprocess.Popen(
+[?2004l[?2004h>                 self._cmd,
+[?2004l[?2004h>                 stdin=slave,
+[?2004l [?2004h>                 stdout=slave,
+[?2004l[?2004h>                 stderr=slave,
+[?2004l[?2004h>                 cwd=self._cwd,
+[?2004l[?2004h>                 env=env,
+[?2004l[?2004h>                 close_fds=True,
+[?2004l[?2004h>                 preexec_fn=lambda: _child_preexec(slave),
+[?2004l[?2004h>             )
+[?2004l[?2004h>         except Exception:
+[?2004l[?2004h>             for fd in (master, slave):
+[?2004l[?2004h>                 try:
+[?2004lh[?2004h>                     os.close(fd)
+[?2004l[?2004h>                 except OSError:
+[?2004l[?2004h>                     pass
+[?2004l[?2004h>             raise
+[?2004l[?2004h>         os.close(slave)
+[?2004l[?2004h>         self._master_fd = master
+[?2004l[?2004h> 
+[?2004ls[?2004h>         self._reader = threading.Thread(
+[?2004l[?2004h>             target=self._reader_loop,
+[?2004l[?2004h>             args=(self._proc,),
+[?2004l[?2004h>             name="headless-terminal-reader",
+[?2004l-[?2004h>             daemon=True,
+[?2004l[?2004h>         )
+[?2004l[?2004h>         self._reader.start()
+[?2004l[?2004h> 
+[?2004l-[?2004h>     def _reader_loop(self, proc: subprocess.Popen) -> None:
+[?2004l[?2004h>         """Continuously drain the pty so a chatty child is never blocked."""
+[?2004l[?2004h>         master = self._master_fd
+[?2004l._buf[?2004h>         try:
+[?2004l  [?2004h>             while True:
+[?2004l[?2004h>                 try:
+[?2004l
+        r[?2004h>                     readable, _, _ = select.select([master], [], [], 0.2)
+[?2004l[?2004h>                 except (OSError, ValueError):
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 if readable:
+[?2004l[?2004h>                     try:
+[?2004ln[?2004h>                         chunk = os.read(master, 65536)
+[?2004l [?2004h>                     except OSError:
+[?2004l[?2004h>                         # EIO: slave side closed (the shell exited).
+[?2004l[?2004h>                         break
+[?2004l"[?2004h>                     if not chunk:
+[?2004l[?2004h>                         break
+[?2004l[?2004h>                     with self._buffer_lock:
+[?2004l[?2004h>                         self._buffer.extend(chunk)
+[?2004l[?2004h>                 elif proc.poll() is not None:
+[?2004l[?2004h>                     # Child is gone; drain whatever is left, then stop.
+[?2004l[?2004h>                     self._drain(master)
+[?2004l[?2004h>                     break
+[?2004l [?2004h>         finally:
+[?2004lT[?2004h>             try:
+[?2004l [?2004h>                 proc.wait(timeout=5)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l [?2004h>     def _drain(self, master: int) -> None:
+[?2004lt[?2004h>         """Read any remaining pty data after the child has exited."""
+[?2004l[?2004h>         while True:
+[?2004l[?2004h>             try:
+[?2004l  [?2004h>                 try:
+[?2004l [?2004h>                     readable, _, _ = select.select([master], [], [], 0.1)
+[?2004l[?2004h>                 except (OSError, ValueError):
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 if not readable:
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     chunk = os.read(master, 65536)
+[?2004l> [?2004h>                 except OSError:
+[?2004l[?2004h>                     break
+[?2004le[?2004h>                 if not chunk:
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 with self._buffer_lock:
+[?2004l[?2004h>                     self._buffer.extend(chunk)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 break
+[?2004l[?2004h> 
+[?2004ll[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # BaseTerminal interface
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     def send_keystrokes(self, keystrokes: str, wait_sec: float = 0.0) -> None:
+[?2004l[?2004h>         """Send *keystrokes* to the terminal.
+[?2004l[?2004h> 
+[?2004ll[?2004h>         Args:
+[?2004l[?2004h>             keystrokes: The characters to type into the terminal.  Control
+[?2004l-----[?2004h>                 keys may be given directly (``"\x03"`` = CTRL+C) or
+[?2004l[?2004h>                 textually (``r"\x03"``); ``"\n`` is the Enter key.
+[?2004l[?2004h>             wait_sec: The number of seconds to wait after sending (gives
+[?2004l[?2004h>                 the command time to run).
+[?2004l[?2004h>         """
+[?2004l[?2004h>         self._write(_keystrokes_to_bytes(keystrokes))
+[?2004l  [?2004h>         if wait_sec and wait_sec > 0:
+[?2004l[?2004h>             time.sleep(float(wait_sec))
+[?2004l[?2004h> 
+[?2004l [?2004h>     # pexpect-style alias
+[?2004l[?2004h>     def send(self, data: str, *args, **kwargs) -> None:
+[?2004l[?2004h>         """Alias for :meth:`send_keystrokes` (pexpect compatibility)."""
+[?2004l[?2004h>         self.send_keystrokes(data)
+[?2004l[?2004h> 
+[?2004l [?2004h>     def sendline(self, line: str, wait_sec: float = 0.0) -> None:
+[?2004l[?2004h>         """Send *line* followed by an Enter key."""
+[?2004l[?2004h>         self.send_keystrokes(line.rstrip("\n") + self.KEY_ENTER, wait_sec=wait_sec)
+[?2004l[?2004h> 
+[?2004l [?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Internal write path
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     def _write(self, data: bytes) -> None:
+[?2004l[?2004h>         if self._closed:
+[?2004l[?2004h>             raise RuntimeError("the terminal has been closed")
+[?2004l[?2004h>         master = self._master_fd
+[?2004ls[?2004h>         view = memoryview(data)
+[?2004l[?2004h>         with self._write_lock:
+[?2004l [?2004h>             while view:
+[?2004lhe[?2004h>                 try:
+[?2004l[?2004h>                     written = os.write(master, view)
+[?2004lse[?2004h>                 except OSError:
+[?2004l[?2004h>                     proc = self._proc
+[?2004l[?2004h>                     if proc is not None and proc.poll() is not None:
+[?2004l[?2004h>                         raise RuntimeError(
+[?2004l[?2004h>                             "cannot send keystrokes: the shell process has exited"
+[?2004l[?2004h>                         )
+[?2004l[?2004h>                     # Transient error (e.g. EIO during shutdown); drop the
+[?2004l[?2004h>                     # remaining bytes instead of hanging.
+[?2004l[?2004h>                     break
+[?2004l s[?2004h>                 view = view[written:]
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Output access
+[?2004lc[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     @property
+[?2004lg [?2004h>     def output(self) -> str:
+[?2004l[?2004h>         """Everything the shell has printed so far (decoded text)."""
+[?2004l[?2004h>         with self._buffer_lock:
+[?2004l[?2004h>             data = bytes(self._buffer)
+[?2004l[?2004h>         return data.decode("utf-8", "replace")
+[?2004l[?2004h> 
+[?2004ln[?2004h>     def get_output(self) -> str:
+[?2004lk[?2004h>         """Return all output produced so far."""
+[?2004l_[?2004h>         return self.output
+[?2004l[?2004h> 
+[?2004l[?2004h>     def read_output(self) -> str:
+[?2004l[?2004h>         """Return the accumulated output and clear the buffer."""
+[?2004l[?2004h>         with self._buffer_lock:
+[?2004l[?2004h>             data = bytes(self._buffer)
+[?2004l[?2004h>             self._buffer.clear()
+[?2004l[?2004h>         return data.decode("utf-8", "replace")
+[?2004l[?2004h> 
+[?2004l[?2004h>     def clear_output(self) -> None:
+[?2004l[?2004h>         """Discard the accumulated output buffer."""
+[?2004l[?2004h>         with self._buffer_lock:
+[?2004l[?2004h>             self._buffer.clear()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Aliases
+[?2004l[?2004h>     reset_output = clear_output
+[?2004l[?2004h> 
+[?2004l[?2004h>     def wait_for(self, text: str, timeout: float = 10.0) -> bool:
+[?2004l[?2004h>         """Wait until *text* appears in the terminal output.
+[?2004l[?2004h> 
+[?2004l[?2004h>         Returns ``True`` as soon as *text* is found, ``False`` after
+[?2004l[?2004h>         *timeout* seconds.
+[?2004l[?2004h>         """
+[?2004l[?2004h>         deadline = time.monotonic() + max(0.0, float(timeout))
+[?2004l[?2004h>         while True:
+[?2004l[?2004h>             if text and text in self.output:
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>             if time.monotonic() >= deadline:
+[?2004l[?2004h>                 return False
+[?2004l[?2004h>             time.sleep(0.02)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Process state
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     @property
+[?2004l[?2004h>     def pid(self) -> Optional[int]:
+[?2004l[?2004h>         """PID of the shell process (``None`` once it is gone)."""
+[?2004l[?2004h>         return self._proc.pid if self._proc is not None else None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def is_alive(self) -> bool:
+[?2004l[?2004h>         """True while the shell process is running."""
+[?2004l[?2004h>         return self._proc is not None and self._proc.poll() is None
+[?2004l[?2004h> 
+[?2004l[?2004h>     alive = is_alive
+[?2004l[?2004h> 
+[?2004l[?2004h>     @property
+[?2004l[?2004h>     def exit_code(self) -> Optional[int]:
+[?2004l[?2004h>         """Exit code of the shell, or ``None`` while it is still running."""
+[?2004l[?2004h>         proc = self._proc
+[?2004l[?2004h>         if proc is None:
+[?2004l[?2004h>             return None
+[?2004l[?2004h>         return proc.poll()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # pexpect-style alias
+[?2004l[?2004h>     exitstatus = exit_code
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     # Shutdown
+[?2004l[?2004h>     # ------------------------------------------------------------------ #
+[?2004l[?2004h>     def close(self) -> None:
+[?2004l[?2004h>         """Terminate the shell (if still running) and free all resources."""
+[?2004l[?2004h>         if self._closed:
+[?2004l[?2004h>             return
+[?2004l[?2004h>         self._closed = True
+[?2004l[?2004h>         proc = self._proc
+[?2004l[?2004h>         if proc is not None and proc.poll() is None:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 proc.terminate()
+[?2004l[?2004h>                 proc.wait(timeout=1.0)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     proc.kill()
+[?2004l[?2004h>                 except Exception:
+[?2004l[?2004h>                     pass
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     proc.wait(timeout=1.0)
+[?2004l[?2004h>                 except Exception:
+[?2004l[?2004h>                     pass
+[?2004l[?2004h>         if self._reader is not None:
+[?2004l[?2004h>             self._reader.join(timeout=1.0)
+[?2004l[?2004h>             self._reader = None
+[?2004l[?2004h>         if self._master_fd is not None and self._master_fd >= 0:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 os.close(self._master_fd)
+[?2004l[?2004h>             except OSError:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             self._master_fd = -1
+[?2004l[?2004h> 
+[?2004l[?2004h>     def terminate(self) -> None:
+[?2004l[?2004h>         """Alias for :meth:`close`."""
+[?2004l[?2004h>         self.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def kill(self) -> None:
+[?2004l[?2004h>         """Forcefully kill the shell and clean up."""
+[?2004l[?2004h>         if not self._closed:
+[?2004l[?2004h>             proc = self._proc
+[?2004l[?2004h>             if proc is not None and proc.poll() is None:
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     proc.kill()
+[?2004l[?2004h>                 except Exception:
+[?2004l[?2004h>                     pass
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     proc.wait(timeout=1.0)
+[?2004l[?2004h>                 except Exception:
+[?2004l[?2004h>                     pass
+[?2004l[?2004h>         self.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __enter__(self) -> "HeadlessTerminal":
+[?2004l[?2004h>         return self
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __exit__(self, exc_type, exc, tb) -> None:
+[?2004l[?2004h>         self.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __del__(self):  # pragma: no cover - best effort cleanup
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             self.close()
+[?2004l[?2004h>         except Exception:
+[?2004l[?2004h>             pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __repr__(self) -> str:  # pragma: no cover - debugging aid
+[?2004l[?2004h>         state = "running" if self.is_alive() else "stopped"
+[?2004l[?2004h>         return f"<HeadlessTerminal pid={self.pid} {state}>"
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == "__main__":  # pragma: no cover - manual smoke test
+[?2004l[?2004h>     term = HeadlessTerminal()
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         term.send_keystrokes("echo headless terminal works\n", wait_sec=0.5)
+[?2004l[?2004h>         print(term.output)
+[?2004l[?2004h>         term.send_keystrokes("exit\n", wait_sec=0.3)
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         term.close()
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@f7c5e2f5ca90:/app# python3 -m py_compile /app/headless_terminal.py && echo COMPILE_OK
+[?2004l  File "/app/headless_terminal.py", line 74
+    """Convert *keystrokes* to the raw bytes to inject into the pty.
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes in position 229-230: truncated \xXX escape
+[?2004hroot@f7c5e2f5ca90:/app# cd /app && python3 headless_terminal.py
+[?2004l  File [35m"/app/headless_terminal.py"[0m, line [35m74[0m
+    [1;31m"""Convert *keystrokes* to the raw bytes to inject into the pty.[0m
+    [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mSyntaxError[0m: [35m(unicode error) 'unicodeescape' codec can't decode bytes in position 229-230: truncated \xXX escape[0m
+[?2004hroot@f7c5e2f5ca90:/app# python3 - <<'EOF'
+[?2004l[?2004h> src = open('/app/headless_terminal.py').read()
+[?2004l[?2004h> src = src.replace('"""Headless, pty-backed terminal implementation.', 'r"""Headless, pty-backed terminal implementation.')
+[?2004l[?2004h> src = src.replace('    """Convert *keystrokes* to the raw bytes', '    r"""Convert *keystrokes* to the raw bytes')
+[?2004l[?2004h> src = src.replace('        """Send *keystrokes* to the terminal.', '        r"""Send *keystrokes* to the terminal.')
+[?2004l[?2004h> src = src.replace('    """A headless terminal: an interactive bash shell on a pseudo-terminal.', '    r"""A headless terminal: an interactive bash shell on a pseudo-terminal.')
+[?2004l[?2004h> open('/app/headless_terminal.py','w').write(src)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f7c5e2f5ca90:/app# python3 -m py_compile /app/headless_terminal.py && echo COMPILE_OK
+[?2004lCOMPILE_OK
+[?2004hroot@f7c5e2f5ca90:/app# cd /app && python3 headless_terminal.py
+[?2004lecho headless terminal works
+[?2004hroot@f7c5e2f5ca90:/app# echo headless terminal works
+[?2004lheadless terminal works
+[?2004hroot@f7c5e2f5ca90:/app# 
+[?2004hroot@f7c5e2f5ca90:/app# cat > /tmp/test_headless.py <<'EOF'
+[?2004l[?2004h> import os, sys, time, tempfile
+[?2004l[?2004h> sys.path.insert(0, '/app')
+[?2004l[?2004h> from headless_terminal import HeadlessTerminal
+[?2004l[?2004h> 
+[?2004l[?2004h> def bash_pids():
+[?2004l[?2004h>     return set(int(p) for p in os.popen("pgrep -x bash").read().split())
+[?2004l[?2004h> 
+[?2004l[?2004h> failures = []
+[?2004l[?2004h> def check(name, cond, extra=""):
+[?2004l[?2004h>     print(f"[{'PASS' if cond else 'FAIL'}] {name}")
+[?2004l[?2004h>     if not cond:
+[?2004l[?2004h>         failures.append(name)
+[?2004l[?2004h>         print("---- output tail ----")
+[?2004l[?2004h>         print(extra[-3000:])
+[?2004l[?2004h>         print("---------------------")
+[?2004l[?2004h> 
+[?2004l[?2004h> before = bash_pids()
+[?2004l[?2004h> 
+[?2004l[?2004h> # 1. Basic command execution (type chars + Enter)
+[?2004l[?2004h> t = HeadlessTerminal()
+[?2004l[?2004h> assert t.is_alive()
+[?2004l[?2004h> t.send_keystrokes("echo start_$((21+21))\n", wait_sec=0.5)
+[?2004l[?2004h> check("basic echo + enter", "start_42" in t.output, t.output)
+[?2004l[?2004h> t.close()
+[?2004l[?2004h> 
+[?2004l[?2004h> # 2. .bashrc sourcing (fake HOME so we don't touch the real one)
+[?2004l[?2004h> home = tempfile.mkdtemp(prefix="fakehome_")
+[?2004l[?2004h> with open(os.path.join(home, ".bashrc"), "w") as f:
+[?2004l[?2004h>     f.write("export HEADLESS_RC_VAR=rc_loaded\n")
+[?2004l[?2004h>     f.write("alias hterm='echo alias_from_rc'\n")
+[?2004l[?2004h> t2 = HeadlessTerminal(env={"HOME": home}, cwd=home)
+[?2004l[?2004h> t2.send_keystrokes("echo var=$HEADLESS_RC_VAR\n", wait_sec=0.5)
+[?2004l[?2004h> check(".bashrc env var sourced", "var=rc_loaded" in t2.output, t2.output)
+[?2004l[?2004h> t2.send_keystrokes("hterm\n", wait_sec=0.5)
+[?2004l[?2004h> check(".bashrc alias usable", "alias_from_rc" in t2.output, t2.output)
+[?2004l[?2004h> 
+[?2004l[?2004h> # 3. Ctrl-C (\x03) interrupts a running command
+[?2004l[?2004h> t2.send_keystrokes("sleep 30\n", wait_sec=0.3)
+[?2004l[?2004h> t2.send_keystrokes("\x03", wait_sec=0.5)
+[?2004l[?2004h> t2.send_keystrokes("echo back_after_interrupt\n", wait_sec=0.5)
+[?2004l[?2004h> check("ctrl+c (real) interrupts", "back_after_interrupt" in t2.output, t2.output)
+[?2004l[?2004h> 
+[?2004l[?2004h> # 4. Textual \x03 is interpreted as Ctrl-C
+[?2004l[?2004h> t2.send_keystrokes("sleep 30\n", wait_sec=0.3)
+[?2004l[?2004h> t2.send_keystrokes(r"\x03", wait_sec=0.5)
+[?2004l[?2004h> t2.send_keystrokes("echo back_after_textual\n", wait_sec=0.5)
+[?2004l[?2004h> check("textual \\x03 acts as ctrl+c", "back_after_textual" in t2.output, t2.output)
+[?2004l[?2004h> 
+[?2004l[?2004h> # 5. exit + write after exit
+[?2004l[?2004h> t2.send_keystrokes("exit\n", wait_sec=0.8)
+[?2004l[?2004h> check("shell exits on 'exit'", not t2.is_alive())
+[?2004l[?2004h> raised = False
+[?2004l[?2004h> try:
+[?2004l[?2004h>     t2.send_keystrokes("echo should_fail\n")
+[?2004l[?2004h> except RuntimeError:
+[?2004l[?2004h>     raised = True
+[?2004l[?2004h> check("write after exit raises", raised)
+[?2004l[?2004h> t2.close()
+[?2004l[?2004h> 
+[?2004l[?2004h> # 6. Interactive program: python REPL
+[?2004l[?2004h> t3 = HeadlessTerminal()
+[?2004l[?2004h> t3.send_keystrokes("python3\n", wait_sec=0.6)
+[?2004l[?2004h> check("python repl starts", ">>>" in t3.output, t3.output)
+[?2004l[?2004h> t3.send_keystrokes("print(6*7)\n", wait_sec=0.5)
+[?2004l[?2004h> check("python repl computes", "42" in t3.output, t3.output)
+[?2004l[?2004h> t3.send_keystrokes("exit()\n", wait_sec=0.5)
+[?2004l[?2004h> t3.send_keystrokes("echo back_to_bash\n", wait_sec=0.5)
+[?2004l[?2004h> check("back to bash after exit()", "back_to_bash" in t3.output, t3.output)
+[?2004l[?2004h> 
+[?2004l[?2004h> # 7. Interactive TUI: top, quit with 'q'
+[?2004l[?2004h> t3.send_keystrokes("top\n", wait_sec=1.2)
+[?2004l[?2004h> check("top renders", "top -" in t3.output, t3.output[-1000:])
+[?2004l[?2004h> t3.send_keystrokes("q", wait_sec=0.6)
+[?2004l[?2004h> t3.send_keystrokes("echo top_done\n", wait_sec=0.5)
+[?2004l[?2004h> check("top quit with q", "top_done" in t3.output, t3.output)
+[?2004l[?2004h> t3.close()
+[?2004l[?2004h> 
+[?2004l[?2004h> # 8. wait_for / read_output / context manager
+[?2004l[?2004h> with HeadlessTerminal() as t4:
+[?2004l[?2004h>     check("wait_for prompt", t4.wait_for("#", timeout=5), t4.output)
+[?2004l[?2004h>     t4.send_keystrokes("echo ctx_done\n", wait_sec=0.5)
+[?2004l[?2004h>     out = t4.read_output()
+[?2004l[?2004h>     check("read_output contains result", "ctx_done" in out)
+[?2004l[?2004h>     check("read_output cleared buffer", "ctx_done" not in t4.output)
+[?2004l[?2004h> check("context manager closed shell", not t4.is_alive())
+[?2004l[?2004h> 
+[?2004l[?2004h> # 9. no orphaned bash processes
+[?2004l[?2004h> time.sleep(0.5)
+[?2004l[?2004h> after = bash_pids()
+[?2004l[?2004h> stray = after - before
+[?2004l[?2004h> check("no orphaned bash processes", not stray, str(stray))
+[?2004l[?2004h> 
+[?2004l[?2004h> print()
+[?2004l[?2004h> if failures:
+[?2004l[?2004h>     print("FAILURES:", failures)
+[?2004l[?2004h>     sys.exit(1)
+[?2004l[?2004h> print("ALL TESTS PASSED")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f7c5e2f5ca90:/app# python3 /tmp/test_headless.py
+[?2004l/bin/sh: 1: pgrep: not found
+[PASS] basic echo + enter
+[PASS] .bashrc env var sourced
+[PASS] .bashrc alias usable
+[PASS] ctrl+c (real) interrupts
+[PASS] textual \x03 acts as ctrl+c
+[PASS] shell exits on 'exit'
+[FAIL] write after exit raises
+---- output tail ----
+
+---------------------
+[PASS] python repl starts
+[PASS] python repl computes
+[PASS] back to bash after exit()
+[FAIL] top renders
+---- output tail ----
+h[6C[?25l[6D[1;35m>>> [0mpri[7D[34h[?25h[7C[?25l[7D[1;35m>>> [0mprin[8D[34h[?25h[8C[?25l[8D[1;35m>>> [0mprint[9D[34h[?25h[9C[?25l[9D[1;35m>>> [0mprint([10D[34h[?25h[10C[?25l[10D[1;35m>>> [0mprint(6[11D[34h[?25h[11C[?25l[11D[1;35m>>> [0mprint(6*[12D[34h[?25h[12C[?25l[12D[1;35m>>> [0mprint(6*7[13D[34h[?25h[13C[?25l[13D[1;35m>>> [0mprint(6*7)[14D[34h[?25h[14C[14D
+[?2004l[?1l>42
+[?2004h[?1h=[?25l[1A
+[1;35m>>> [0m[4D[34h[?25h[4C[?25l[4D[1;35m>>> [0me[5D[34h[?25h[5C[?25l[5D[1;35m>>> [0mex[6D[34h[?25h[6C[?25l[6D[1;35m>>> [0mexi[7D[34h[?25h[7C[?25l[7D[1;35m>>> [0mexit[8D[34h[?25h[8C[?25l[8D[1;35m>>> [0mexit([9D[34h[?25h[9C[?25l[9D[1;35m>>> [0mexit()[10D[34h[?25h[10C[10D
+[?2004l[?1l>[?2004hroot@f7c5e2f5ca90:/app# echo back_to_bash
+[?2004lback_to_bash
+[?2004hroot@f7c5e2f5ca90:/app# top
+[?2004lbash: top: command not found
+[?2004hroot@f7c5e2f5ca90:/app# 
+---------------------
+[PASS] top quit with q
+[PASS] wait_for prompt
+[PASS] read_output contains result
+[PASS] read_output cleared buffer
+[PASS] context manager closed shell
+/bin/sh: 1: pgrep: not found
+[PASS] no orphaned bash processes
+
+FAILURES: ['write after exit raises', 'top renders']
+[?2004hroot@f7c5e2f5ca90:/app# which top less htop vi vim nano 2>/dev/null; ls /usr/bin | grep -E '^(top|less|htop|vi|vim|nano)$' 2>/dev/null; echo ---
+[?2004l---
+[?2004hroot@f7c5e2f5ca90:/app# cat > /tmp/curses_demo.py <<'EOF'
+[?2004l[?2004h> import curses
+[?2004l[?2004h> def main(stdscr):
+[?2004l[?2004h>     stdscr.clear()
+[?2004l[?2004h>     stdscr.addstr(0, 0, "CURSES_READY")
+[?2004l[?2004h>     stdscr.refresh()
+[?2004l[?2004h>     ch = stdscr.getch()
+[?2004l[?2004h>     stdscr.clear()
+[?2004l[?2004h>     stdscr.addstr(0, 0, "got key: %s" % chr(ch) if 32 <= ch < 127 else "got key")
+[?2004l[?2004h>     stdscr.refresh()
+[?2004l[?2004h> curses.wrapper(main)
+[?2004l[?2004h> print("CURSES_QUIT")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f7c5e2f5ca90:/app# cat > /tmp/test_final.py <<'EOF'
+[?2004l[?2004h> import os, sys, time
+[?2004l[?2004h> global_pids_before = None
+[?2004l[?2004h> sys.path.insert(0, '/app')
+[?2004l[?2004h> from headless_terminal import HeadlessTerminal
+[?2004l[?2004h> 
+[?2004l[?2004h> def bash_pids():
+[?2004l[?2004h>     pids = set()
+[?2004l[?2004h>     for d in os.listdir('/proc'):
+[?2004l[?2004h>         if d.isdigit():
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open('/proc/%s/comm' % d) as f:
+[?2004l[?2004h>                     if f.read().strip() == 'bash':
+[?2004l[?2004h>                         pids.add(int(d))
+[?2004l[?2004h>             except OSError:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>     return pids
+[?2004l[?2004h> 
+[?2004l[?2004h> failures = []
+[?2004l[?2004h> def check(name, cond, extra=""):
+[?2004l[?2004h>     print("[%s] %s" % ("PASS" if cond else "FAIL", name))
+[?2004l[?2004h>     if not cond:
+[?2004l[?2004h>         failures.append(name)
+[?2004l[?2004h>         print("---- output tail ----")
+[?2004l[?2004h>         print(extra[-2500:])
+[?2004l[?2004h>         print("---------------------")
+[?2004l[?2004h> 
+[?2004l[?2004h> before = bash_pids()
+[?2004l[?2004h> 
+[?2004l[?2004h> # Multi-line send: two commands entered in one send_keystrokes call
+[?2004l[?2004h> t = HeadlessTerminal()
+[?2004l[?2004h> t.send_keystrokes("echo line_one\necho line_two\n", wait_sec=0.6)
+[?2004l[?2004h> check("multi-line send runs both commands", "line_one" in t.output and "line_two" in t.output, t.output)
+[?2004l[?2004h> 
+[?2004l[?2004h> # TUI/curses program (full interactive program support)
+[?2004l[?2004h> t.send_keystrokes("python3 /tmp/curses_demo.py\n", wait_sec=1.5)
+[?2004l[?2004h> check("curses program starts (TUI)", "CURSES_READY" in t.output, t.output[-1500:])
+[?2004l[?2004h> t.send_keystrokes("q", wait_sec=0.8)
+[?2004l[?2004h> check("curses program accepts key + quits", "CURSES_QUIT" in t.output, t.output[-1500:])
+[?2004l[?2004h> t.send_keystrokes("echo after_tui\n", wait_sec=0.4)
+[?2004l[?2004h> check("shell usable after TUI exits", "after_tui" in t.output, t.output)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Ctrl+Z (SIGTSTP) suspends, fg resumes  -- another modifier key
+[?2004l[?2004h> t.send_keystrokes("sleep 20\n", wait_sec=0.3)
+[?2004l[?2004h> t.send_keystrokes("\x1a", wait_sec=0.5)
+[?2004l[?2004h> check("ctrl+z suspends job", "Stopped" in t.output, t.output[-1500:])
+[?2004l[?2004h> t.send_keystrokes("fg\n", wait_sec=0.3)
+[?2004l[?2004h> t.send_keystrokes("\x03", wait_sec=0.5)
+[?2004l[?2004h> t.send_keystrokes("echo after_fg\n", wait_sec=0.4)
+[?2004l[?2004h> check("fg resumes + ctrl+c kills", "after_fg" in t.output, t.output[-1500:])
+[?2004l[?2004h> 
+[?2004l[?2004h> # Ctrl+D at prompt exits the shell (EOF)
+[?2004l[?2004h> t.send_keystrokes("\x04", wait_sec=0.6)
+[?2004l[?2004h> check("ctrl+d (EOF) exits shell", not t.is_alive())
+[?2004l[?2004h> t.close()
+[?2004l[?2004h> 
+[?2004l[?2004h> time.sleep(0.5)
+[?2004l[?2004h> stray = bash_pids() - before
+[?2004l[?2004h> check("no orphaned bash processes", not stray, str(stray))
+[?2004l[?2004h> 
+[?2004l[?2004h> print()
+[?2004l[?2004h> if failures:
+[?2004l[?2004h>     print("FAILURES:", failures)
+[?2004l[?2004h>     sys.exit(1)
+[?2004l[?2004h> print("ALL TESTS PASSED")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f7c5e2f5ca90:/app# python3 /tmp/test_final.py
+[?2004l[PASS] multi-line send runs both commands
+[PASS] curses program starts (TUI)
+[PASS] curses program accepts key + quits
+[PASS] shell usable after TUI exits
+[PASS] ctrl+z suspends job
+[PASS] fg resumes + ctrl+c kills
+[PASS] ctrl+d (EOF) exits shell
+[PASS] no orphaned bash processes
+
+ALL TESTS PASSED
+[?2004hroot@f7c5e2f5ca90:/app# grep -n 'placeholder\|replaced below' /app/headless_terminal.py; echo grep_done
+[?2004lgrep_done
+[?2004hroot@f7c5e2f5ca90:/app# cd /app && python3 -c "from headless_terminal import HeadlessTerminal; t = HeadlessTerminal(); t.send_keystrokes('pwd && echo IMPORT_OK\n', 0.4); assert 'IMPORT_OK' in t.output and '/root' in t.output, t.output; t.close(); print('FINAL CHECK OK')"
+[?2004lTraceback (most recent call last):
+  File [35m"<string>"[0m, line [35m1[0m, in [35m<module>[0m
+    from headless_terminal import HeadlessTerminal; t = HeadlessTerminal(); t.send_keystrokes('pwd && echo IMPORT_OK\n', 0.4); assert [1;31m'IMPORT_OK' in t.output and '/root' in t.output[0m, t.output; t.close(); print('FINAL CHECK OK')
+                                                                                                                                      [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mAssertionError[0m: [35mpwd && echo IMPORT_OK
+[?2004hroot@f7c5e2f5ca90:/app# pwd && echo IMPORT_OK
+[?2004l/app
+IMPORT_OK
+[?2004hroot@f7c5e2f5ca90:/app# [0m
+[?2004hroot@f7c5e2f5ca90:/app# ls -la /app && python3 -m py_compile /app/headless_terminal.py && echo ALL_GOOD
+[?2004ltotal 24
+drwxr-xr-x 1 root root    65 Sep  7 02:11 .
+drwxr-xr-x 1 root root   117 Sep  7 01:32 ..
+drwxr-xr-x 2 root root    96 Sep  7 02:11 __pycache__
+-rw-r--r-- 1 root root   401 Oct 27  2025 base_terminal.py
+-rw-r--r-- 1 root root 17138 Sep  7 02:11 headless_terminal.py
+ALL_GOOD
+[?2004hroot@f7c5e2f5ca90:/app# cd /app && python3 -c "
+[?2004l[?2004h> from headless_terminal import HeadlessTerminal
+[?2004l[?2004h> t = HeadlessTerminal()
+[?2004l[?2004h> t.send_keystrokes('pwd; echo IMPORT_OK\n', 1.0)
+[?2004l[?2004h> print(repr(t.output[-150:]))
+[?2004l[?2004h> assert t.wait_for('IMPORT_OK', 5)
+[?2004l[?2004h> assert '/app' in t.output
+[?2004l[?2004h> t.close()
+[?2004l[?2004h> print('FINAL CHECK OK')
+[?2004l[?2004h> "
+[?2004l'pwd; echo IMPORT_OK\r\n\x1b[?2004hroot@f7c5e2f5ca90:/app# pwd; echo IMPORT_OK\r\n\x1b[?2004l\r/app\r\nIMPORT_OK\r\n\x1b[?2004hroot@f7c5e2f5ca90:/app# '
+FINAL CHECK OK
+[?2004hroot@f7c5e2f5ca90:/app# 

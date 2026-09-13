@@ -1,0 +1,3400 @@
+[?2004hroot@072bedd94a5f:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@072bedd94a5f:/app# clear
+[?2004l[H[J[3J[?2004hroot@072bedd94a5f:/app# ls -la /app
+[?2004ltotal 4
+drwxr-xr-x 1 root root  32 Sep 13  2025 .
+drwxr-xr-x 1 root root 102 Sep  6 13:35 ..
+-rw-r--r-- 1 root root 922 Sep 13  2025 forward.py
+[?2004hroot@072bedd94a5f:/app# python3 -c "import numpy; print('numpy', numpy.__version__)"
+[?2004lnumpy 2.2.5
+[?2004hroot@072bedd94a5f:/app# python3 -c "
+[?2004l[?2004h> import numpy as np, forward
+[?2004l[?2004h> for name, x in [('flat', np.zeros(10)), ('row', np.zeros((1,10))), ('col', np.zeros((10,1))), ('list', [0.0]*10)]:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         y = forward(x)
+[?2004l[?2004h>         print(name, 'OK ->', type(y), np.asarray(y).shape, float(np.asarray(y).reshape(-1)[0]))
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print(name, 'FAIL', type(e).__name__, str(e)[:80])
+[?2004l[?2004h> "
+[?2004lflat FAIL TypeError 'module' object is not callable. Did you mean: 'forward.forward(...)'?
+row FAIL TypeError 'module' object is not callable. Did you mean: 'forward.forward(...)'?
+col FAIL TypeError 'module' object is not callable. Did you mean: 'forward.forward(...)'?
+list FAIL TypeError 'module' object is not callable. Did you mean: 'forward.forward(...)'?
+[?2004hroot@072bedd94a5f:/app# python3 -c "
+[?2004l[?2004h> import numpy as np
+[?2004l[?2004h> from forward import forward
+[?2004l[?2004h> for name, x in [('flat', np.zeros(10)), ('row', np.zeros((1,10))), ('col', np.zeros((10,1))), ('list', [0.0]*10)]:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         y = forward(x)
+[?2004l[?2004h>         print(name, 'OK ->', type(y), np.asarray(y).shape, float(np.asarray(y).reshape(-1)[0]))
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print(name, 'FAIL', type(e).__name__, str(e)[:80])
+[?2004l[?2004h> 
+[?2004l[?2004h> x = np.random.randn(10)
+[?2004l[?2004h> print('random flat:', forward(x))
+[?2004l[?2004h> print('random flat repeat:', forward(x))
+[?2004l[?2004h> "
+[?2004lflat OK -> <class 'float'> () -0.09423482539555281
+row OK -> <class 'float'> () -0.09423482539555281
+col OK -> <class 'float'> () -0.09423482539555281
+list OK -> <class 'float'> () -0.09423482539555281
+random flat: -0.15303773771933105
+random flat repeat: -0.15303773771933105
+[?2004hroot@072bedd94a5f:/app# cat > /app/steal.py << 'EOF'
+[?2004l------------------------------------------------------------ queries --
+calls = 0
+_cache = {}
+
+def F(x):
+    """Cached black-box query."""
+    global calls
+    x = np.ascontiguousarray(x, dtype=np.float64).reshape(10)
+    key = x.tobytes()
+    v = _cache.get(key)
+    if v is None:
+        calls += 1
+        v = float(_fwd(x))
+        if not np.isfinite(v):
+            raise RuntimeError("forward() returned a non-finite value")
+        _cache[key] = v
+    return v
+
+def log(*a):
+    print(*a, file=sys.stderr)
+
+rng = np.random.default_rng(20240613)
+
+def rand_unit():
+    while True:
+        z = rng.standard_normal(10)
+        n = np.linalg.norm(z)
+        if n > 1e-8:
+            return z / n
+
+log("forward(0) =", F(np.zeros(10)))
+
+# ------------------------------------------------------- 1-D kink finder ---
+def scan_line(f1d, T, N=1600):
+    ts = np.linspace(-T, T, N)
+    fs = np.array([f1d(t) for t in ts])
+    dt = ts[1] - ts[0]
+    s = np.diff(fs) / dt                      # slope of interval j
+    nI = N - 1
+    Fmax = max(1.0, float(np.abs(fs).max()))
+    Smax = max(1.0, float(np.abs(s).max()))
+    tol = 1e-7 * Smax + 1e-9 * Fmax + 1e-12
+    C = np.zeros(nI, dtype=bool)
+    for j in range(nI):
+        if j > 0 and abs(s[j] - s[j-1]) > tol:
+            C[j] = True
+        if j < nI - 1 and abs(s[j+1] - s[j]) > tol:
+            C[j] = True
+    zones, j = [], 0
+    while j < nI:
+        if C[j]:
+            j0 = j
+            while j + 1 < nI and C[j+1]:
+                j += 1
+            zones.append((j0, j))
+        j += 1
+    boundary = bool(zones) and (zones[0][0] == 0 or zones[-1][1] == nI - 1)
+    return ts, s, tol, boundary, zones
+
+def _refine(f1d, a, b, sL, sR, fa, fb, tol, depth):
+    """Isolate kink(s) inside (a, b); invariant: no kink in (a,b] region
+    outside, sL/sR = slopes of the clean regions left of a / right of b."""
+    if abs(sR - sL) <= 0.5 * tol:             # net zero: phantom / cancelling
+        return []
+    m = 0.5 * (a + b)
+    if depth > 64 or (b - a) <= 8e-9 * (1.0 + abs(m)):
+        return [(m, sL, sR)]
+    fm = f1d(m)
+    sAm = (fm - fa) / (m - a)
+    sMb = (fb - fm) / (b - m)
+    L = abs(sAm - sL) > tol
+    R = abs(sMb - sR) > tol
+    if L and R:                               # kink in each half (or both sides)
+        return (_refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1) +
+                _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1))
+    if L:
+        return _refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1)
+    if R:
+        return _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1)
+    d = 2.0 * fm - fa - fb                    # kink extremely near the middle
+    if d == 0.0:
+        return [(m, sL, sR)]
+    k = sR - sL
+    left = (d > 0.0) == (k > 0.0)
+    if (b - a) <= 1e-6 * (1.0 + abs(m)):
+        return [(m, sL, sR)]
+    if left:
+        return _refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1)
+    return _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1)
+
+# ----------------------------------------------------- gradient extraction --
+def grad_at(q, s_target, v):
+    """Gradient of f at q (a[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> """Steal A1 (up to permutation and per-row scaling) of a one-layer ReLU net
+[?2004l[?2004h> 
+[?2004l[?2004h>     f(x) = A2 @ ReLU(A1 @ x + b1) + b2 ,  input dim = 10
+[?2004l[?2004h> 
+[?2004l [?2004h> using only black-box queries to forward.forward.
+[?2004l[?2004h> 
+[?2004lq[?2004h> Method
+[?2004l[?2004h> ------
+[?2004l[?2004h> * Along any line x(t) = x0 + t*v, f is a 1-D piecewise-linear function with
+[?2004l[?2004h>   one breakpoint per neuron (for a generic direction v); kinks are found by
+[?2004l[?2004h>   slope-change detection on a grid followed by bisection refinement.
+[?2004l_[?2004h> * Crossing neuron i's kink hyperplane, the 10-D gradient of f jumps by exactly
+[?2004l[?2004h>   +/- A2_i * a_i (all other terms are continuous there).  Hence the direction
+[?2004l[?2004h>   of the gradient jump recovers row a_i up to sign and scale -- precisely the
+[?2004l[?2004h>   indeterminacy the task allows.
+[?2004l[?2004h> * Two independent lines (a third if counts disagree) are used for
+[?2004l[?2004h>   cross-checking, deduplication and to separate neurons whose breakpoints
+[?2004l[?2004h>   coincide on one line (e.g. when some biases b1_i are exactly 0).
+[?2004l[?2004h> """
+[?2004l(x0,[?2004h> import sys
+[?2004l[?2004h> import numpy as np
+[?2004l[?2004h> from forward import forward as _fwd
+[?2004l[?2004h> 
+[?2004lp[?2004h> # ---------------------------------------------------------------- queries --
+[?2004l[?2004h> calls = 0
+[?2004ldow [?2004h> _cache = {}
+[?2004le[?2004h> 
+[?2004l
+[?2004h> def F(x):
+[?2004l[?2004h>     """Cached black-box query."""
+[?2004l[?2004h>     global calls
+[?2004l[?2004h>     x = np.ascontiguousarray(x, dtype=np.float64).reshape(10)
+[?2004l[?2004h>     key = x.tobytes()
+[?2004l[?2004h>     v = _cache.get(key)
+[?2004l[?2004h>     if v is None:
+[?2004l  [?2004h>         calls += 1
+[?2004l+[?2004h>         v = float(_fwd(x))
+[?2004l[?2004h>         if not np.isfinite(v):
+[?2004l[?2004h>             raise RuntimeError("forward() returned a non-finite value")
+[?2004l[?2004h>         _cache[key] = v
+[?2004l[?2004h>     return v
+[?2004l[?2004h> 
+[?2004l[?2004h> def log(*a):
+[?2004l[?2004h>     print(*a, file=sys.stderr)
+[?2004l[?2004h> 
+[?2004lt[?2004h> rng = np.random.default_rng(20240613)
+[?2004l[?2004h> 
+[?2004lt[?2004h> def rand_unit():
+[?2004l [?2004h>     while True:
+[?2004lt[?2004h>         z = rng.standard_normal(10)
+[?2004l[?2004h>         n = np.linalg.norm(z)
+[?2004l[?2004h>         if n > 1e-8:
+[?2004l[?2004h>             return z / n
+[?2004l[?2004h> 
+[?2004l [?2004h> log("forward(0) =", F(np.zeros(10)))
+[?2004lp[?2004h> 
+[?2004lp[?2004h> # ------------------------------------------------------- 1-D kink finder ---
+[?2004l[?2004h> def scan_line(f1d, T, N=1600):
+[?2004l[?2004h>     ts = np.linspace(-T, T, N)
+[?2004l[?2004h>     fs = np.array([f1d(t) for t in ts])
+[?2004l[?2004h>     dt = ts[1] - ts[0]
+[?2004l[?2004h>     s = np.diff(fs) / dt                      # slope of interval j
+[?2004l[?2004h>     nI = N - 1
+[?2004l[?2004h>     Fmax = max(1.0, float(np.abs(fs).max()))
+[?2004l[?2004h>     Smax = max(1.0, float(np.abs(s).max()))
+[?2004l[?2004h>     tol = 1e-7 * Smax + 1e-9 * Fmax + 1e-12
+[?2004l[?2004h>     C = np.zeros(nI, dtype=bool)
+[?2004l[?2004h>     for j in range(nI):
+[?2004ll,[?2004h>         if j > 0 and abs(s[j] - s[j-1]) > tol:
+[?2004l[?2004h>             C[j] = True
+[?2004l[?2004h>         if j < nI - 1 and abs(s[j+1] - s[j]) > tol:
+[?2004le[?2004h>             C[j] = True
+[?2004l[?2004h>     zones, j = [], 0
+[?2004l[?2004h>     while j < nI:
+[?2004l[?2004h>         if C[j]:
+[?2004l[?2004h>             j0 = j
+[?2004l[?2004h>             while j + 1 < nI and C[j+1]:
+[?2004l[?2004h>                 j += 1
+[?2004l[?2004h>             zones.append((j0, j))
+[?2004l[?2004h>         j += 1
+[?2004l[?2004h>     boundary = bool(zones) and (zones[0][0] == 0 or zones[-1][1] == nI - 1)
+[?2004l[?2004h>     return ts, s, tol, boundary, zones
+[?2004l[?2004h> 
+[?2004l [?2004h> def _refine(f1d, a, b, sL, sR, fa, fb, tol, depth):
+[?2004l[?2004h>     """Isolate kink(s) inside (a, b); invariant: no kink in (a,b] region
+[?2004l[?2004h>     outside, sL/sR = slopes of the clean regions left of a / right of b."""
+[?2004l[?2004h>     if abs(sR - sL) <= 0.5 * tol:             # net zero: phantom / cancelling
+[?2004l[?2004h>         return []
+[?2004l [?2004h>     m = 0.5 * (a + b)
+[?2004li[?2004h>     if depth > 64 or (b - a) <= 8e-9 * (1.0 + abs(m)):
+[?2004l[?2004h>         return [(m, sL, sR)]
+[?2004l[?2004h>     fm = f1d(m)
+[?2004l[?2004h>     sAm = (fm - fa) / (m - a)
+[?2004l[?2004h>     sMb = (fb - fm) / (b - m)
+[?2004l[?2004h>     L = abs(sAm - sL) > tol
+[?2004l[?2004h>     R = abs(sMb - sR) > tol
+[?2004l [?2004h>     if L and R:                               # kink in each half (or both sides)
+[?2004l-[?2004h>         return (_refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1) +
+[?2004l[?2004h>                 _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1))
+[?2004l[?2004h>     if L:
+[?2004lu[?2004h>         return _refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1)
+[?2004l[?2004h>     if R:
+[?2004l[?2004h>         return _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1)
+[?2004l[?2004h>     d = 2.0 * fm - fa - fb                    # kink extremely near the middle
+[?2004l[?2004h>     if d == 0.0:
+[?2004l[?2004h>         return [(m, sL, sR)]
+[?2004l[?2004h>     k = sR - sL
+[?2004l.[?2004h>     left = (d > 0.0) == (k > 0.0)
+[?2004l[?2004h>     if (b - a) <= 1e-6 * (1.0 + abs(m)):
+[?2004l[?2004h>         return [(m, sL, sR)]
+[?2004l[?2004h>     if left:
+[?2004l[?2004h>         return _refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1)
+[?2004l[?2004h>     return _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1)
+[?2004l[?2004h> 
+[?2004li[?2004h> # ----------------------------------------------------- gradient extraction --
+[?2004l[?2004h> def grad_at(q, s_target, v):
+[?2004ln[?2004h>     """Gradient of f at q (assumed interior of a region); the component along
+[?2004l[?2004h>     the unit vector v is forced to the known exact one-sided slope s_target."""
+[?2004l[?2004h>     g = np.zeros(10)
+[?2004l[?2004h>     f0 = F(q)
+[?2004l[?2004h>     scale = max(1.0, float(np.linalg.norm(q)))
+[?2004l  [?2004h>     for j in range(10):
+[?2004l[?2004h>         D = 1e-5 * scale
+[?2004l(g[?2004h>         ok = False
+[?2004l[?2004h>         for _ in range(14):
+[?2004l[?2004h>             e = np.zeros(10); e[j] = D
+[?2004le[?2004h>             fm_ = F(q - e); fp_ = F(q + e)
+[?2004l [?2004h>             s1 = (f0 - fm_) / D
+[?2004l [?2004h>             s2 = (fp_ - f0) / D
+[?2004lz[?2004h>             if abs(s1 - s2) <= 1e-8 * max(1.0, abs(s1), abs(s2)) + 1e-12:
+[?2004l[?2004h>                 g[j] = (fp_ - fm_) / (2.0 * D)
+[?2004l[?2004h>                 ok = True
+[?2004lon[?2004h>                 break
+[?2004l[?2004h>             D *= 0.1
+[?2004l[[?2004h>         if not ok:
+[?2004l[?2004h>             g[j] = (fp_ - fm_) / (2.0 * D)
+[?2004l[?2004h>             log(f"    [warn] grad comp {j} at q={q.round(4).tolist()}: "
+[?2004l[?2004h>                 f"linearity check failed even at D={D:.1e}")
+[?2004l[?2004h>     g = g + (s_target - float(g @ v)) * v
+[?2004l[?2004h>     return g
+[?2004l[?2004h> 
+[?2004le[?2004h> def find_kinks_on_line(x0, v):
+[?2004l  [?2004h>     def f1d(t):
+[?2004l[?2004h>         return F(x0 + t * v)
+[?2004l[?2004h>     T = 1.0
+[?2004l':[?2004h>     prev_n = -1
+[?2004l[?2004h>     kinks = []
+[?2004lg[?2004h>     for _it in range(9):                      # expand window until stable
+[?2004l[?2004h>         ts, s, tol, boundary, zones = scan_line(f1d, T)
+[?2004l[?2004h>         cands = []
+[?2004l[?2004h>         for (j0, j1) in zones:
+[?2004l[?2004h>             a, b = ts[j0], ts[j1 + 1]
+[?2004l[?2004h>             sL = s[max(j0 - 1, 0)]
+[?2004l[?2004h>             sR = s[min(j1 + 1, len(s) - 1)]
+[?2004l[?2004h>             cands += _refine(f1d, a, b, sL, sR, f1d(a), f1d(b), tol, 0)
+[?2004l[?2004h>         cands.sort(key=lambda z: z[0])
+[?2004ld[?2004h>         merged = []
+[?2004l[?2004h>         for (t, sl, sr) in cands:
+[?2004l[?2004h>             if merged and abs(t - merged[-1]['t']) < 1e-6 * (1 + abs(t)):
+[?2004l[?2004h>                 merged[-1]['t'] = 0.5 * (merged[-1]['t'] + t)
+[?2004l[?2004h>                 merged[-1]['co'] = True       # two hyperplanes meet here
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 merged.append({'t': t, 'co': False})
+[?2004l[?2004h>         kinks = []
+[?2004l[?2004h>         for i, rec in enumerate(merged):
+[?2004l[?2004h>             t = rec['t']
+[?2004l [?2004h>             gaps = [abs(t - r['t']) for j, r in enumerate(merged) if j != i]
+[?2004l[?2004h>             gap = min(gaps) if gaps else 1e9
+[?2004l[?2004h>             gap = min(gap, 0.05 * T)
+[?2004lm[?2004h>             dv = max(1e-7 * (1 + abs(t)), 0.1 * gap)
+[?2004l[?2004h>             sl = (f1d(t - dv) - f1d(t - 2 * dv)) / dv
+[?2004lai[?2004h>             sr = (f1d(t + 2 * dv) - f1d(t + dv)) / dv
+[?2004l[?2004h>             if abs(sr - sl) <= max(10 * tol, 1e-9 * (1 + abs(sr) + abs(sl))):
+[?2004l[?2004h>                 log(f"    (dropped spurious kink at t={t:.6g})")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             kinks.append({'t': t, 'sl': sl, 'sr': sr, 'gap': gap,
+[?2004l[?2004h>                           'co': rec['co'], 'v': v, 'x0': x0})
+[?2004l[?2004h>         near_edge = any(abs(k['t']) > 0.9 * T for k in kinks)
+[?2004l[?2004h>         if (not boundary) and (not near_edge) and len(kinks) == prev_n:
+[?2004l[?2004h>             break
+[?2004lp[?2004h>         prev_n = len(kinks)
+[?2004l  [?2004h>         T *= 4.0
+[?2004l[?2004h>     for k in kinks:
+[?2004l[?2004h>         t, gap = k['t'], k['gap']
+[?2004l[?2004h>         d_ = max(1e-9 * (1 + abs(t)), 0.02 * gap)
+[?2004l[?2004h>         gL = grad_at(x0 + (t - d_) * v, k['sl'], v)
+[?2004l +[?2004h>         gR = grad_at(x0 + (t + d_) * v, k['sr'], v)
+[?2004l[?2004h>         J = gR - gL                           # = +/- A2_i * a_i
+[?2004l[?2004h>         k['J'] = J
+[?2004l[?2004h>         k['mag'] = float(np.linalg.norm(J))
+[?2004l  [?2004h>         k['p'] = x0 + t * v
+[?2004l[?2004h>         if abs(float(J @ v) - (k['sr'] - k['sl'])) > \
+[?2004l[?2004h>                 1e-6 * (1 + abs(float(J @ v))):
+[?2004l[?2004h>             log(f"    [warn] t={t:.6g}: J.v={float(J @ v):.6g} vs "
+[?2004l[?2004h>                 f"slope diff {k['sr'] - k['sl']:.6g}")
+[?2004l[?2004h>     return kinks
+[?2004li[?2004h> 
+[?2004l,[?2004h> # ------------------------------------------------------------------- main ---
+[?2004l[?2004h> def canon(u):
+[?2004lst[?2004h>     u = np.asarray(u, dtype=np.float64)
+[?2004l[?2004h>     u = u / np.linalg.norm(u)
+[?2004l[?2004h>     i = int(np.argmax(np.abs(u)))
+[?2004l[?2004h>     if u[i] < 0:
+[?2004l[?2004h>         u = -u
+[?2004l)[?2004h>     return u
+[?2004l[?2004h> 
+[?2004l=[?2004h> def main():
+[?2004l[?2004h>     v1, v2, v3 = rand_unit(), rand_unit(), rand_unit()
+[?2004l[?2004h>     uz = rand_unit()
+[?2004l[?2004h> 
+[?2004l[?2004h>     log("scanning line 1: x0=0")
+[?2004l[?2004h>     kinks1 = find_kinks_on_line(np.zeros(10), v1)
+[?2004l[?2004h>     log("scanning line 2: x0=0.5*u")
+[?2004l[?2004h>     kinks2 = find_kinks_on_line(0.5 * uz, v2)
+[?2004l[?2004h>     lines = [("L1", kinks1), ("L2", kinks2)]
+[?2004l[?2004h>     log(f"line1: {len(kinks1)} kinks, line2: {len(kinks2)} kinks")
+[?2004ll[?2004h> 
+[?2004l[?2004h>     any_merged = any(k['co'] for k in kinks1 + kinks2)
+[?2004l[?2004h>     if len(kinks1) != len(kinks2) and not any_merged:
+[?2004l[?2004h>         log("counts disagree -> scanning line 3: x0=0, new direction")
+[?2004l[?2004h>         kinks3 = find_kinks_on_line(np.zeros(10), v3)
+[?2004l{c[?2004h>         lines.append(("L3", kinks3))
+[?2004l:
+[?2004h>         log(f"line3: {len(kinks3)} kinks")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ---- group kinks across lines by direction of the gradient jump ----
+[?2004l[?2004h>     groups = []
+[?2004l[?2004h>     def find_group(u):
+[?2004l[?2004h>         for g in groups:
+[?2004l[?2004h>             if abs(float(g['dir'] @ u)) > 1 - 1e-5:
+[?2004l[?2004h>                 return g
+[?2004l[?2004h>         return None
+[?2004l[?2004h> 
+[?2004l[?2004h>     for (lname, ks) in lines:
+[?2004l[?2004h>         for k in ks:
+[?2004l[?2004h>             if k['mag'] < 1e-8:
+[?2004l[?2004h>                 log("    [warn] near-zero gradient jump at a kink; skipped")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             u = canon(k['J'])
+[?2004l[?2004h>             g = find_group(u)
+[?2004l[?2004h>             if g is None:
+[?2004l[?2004h>                 g = {'dir': u, 'mag': k['mag'], 'merged': False,
+[?2004l[?2004h>                      'counts': {}, 'infos': {}}
+[?2004l[?2004h>                 groups.append(g)
+[?2004l[?2004h>             g['counts'][lname] = g['counts'].get(lname, 0) + 1
+[?2004l[?2004h>             g['merged'] = g['merged'] or bool(k['co'])
+[?2004l[?2004h>             g['infos'].setdefault(lname, []).append(
+[?2004l[?2004h>                 {'t': k['t'], 'x0': k['x0'], 'v': k['v'], 'co': k['co'],
+[?2004l[?2004h>                  'mag': k['mag'], 'J': k['J'], 'p': k['p']})
+[?2004l[?2004h> 
+[?2004l[?2004h>     # resolve kinks where two hyperplanes coincided on one line: the jump
+[?2004l[?2004h>     # there equals the sum of the jumps of the two real neurons.
+[?2004l[?2004h>     def explained_by_sum(gm):
+[?2004l[?2004h>         target = gm['mag'] * gm['dir']
+[?2004l[?2004h>         r = target.copy()
+[?2004l[?2004h>         used = set()
+[?2004l[?2004h>         for _ in range(40):
+[?2004l[?2004h>             best = None
+[?2004l[?2004h>             for h in groups:
+[?2004l[?2004h>                 if h is gm or id(h) in used:
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 vec = h['mag'] * h['dir']
+[?2004l[?2004h>                 for sgn in (1.0, -1.0):
+[?2004l[?2004h>                     nr = np.linalg.norm(r - sgn * vec)
+[?2004l[?2004h>                     if best is None or nr < best[0]:
+[?2004l[?2004h>                         best = (nr, h, sgn, vec)
+[?2004l[?2004h>             nr, h, sgn, vec = best
+[?2004l[?2004h>             if np.linalg.norm(r) > 0 and abs(float(r @ vec)) < 0.2 * np.linalg.norm(r):
+[?2004l[?2004h>                 return np.linalg.norm(r) <= 5e-3 * gm['mag'] + 1e-12
+[?2004l[?2004h>             r = r - sgn * vec
+[?2004l[?2004h>             used.add(id(h))
+[?2004l[?2004h>         return np.linalg.norm(r) <= 5e-3 * gm['mag'] + 1e-12
+[?2004l[?2004h> 
+[?2004l[?2004h>     for g in list(groups):
+[?2004l[?2004h>         if not g['merged']:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if explained_by_sum(g):
+[?2004l[?2004h>             log("  removed kink caused by two coincident hyperplanes "
+[?2004l[?2004h>                 "(decomposed into rows found on the second line)")
+[?2004l[?2004h>             groups.remove(g)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             log("  [warn] coincident-hyperplane kink could not be decomposed")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ---- assemble output matrix ----
+[?2004l[?2004h>     rows = []
+[?2004l[?2004h>     for g in groups:
+[?2004l[?2004h>         mult = max(g['counts'].values())
+[?2004l[?2004h>         for _ in range(mult):
+[?2004l[?2004h>             rows.append(g['dir'])
+[?2004l[?2004h>     M = np.array(rows, dtype=np.float64).reshape((-1, 10)) if rows \
+[?2004l[?2004h>         else np.zeros((0, 10))
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ---------------- self-verification (stderr only) -------------------
+[?2004l[?2004h>     if M.shape[0] > 0:
+[?2004l[?2004h>         log(f"
+[?2004l[?2004h> verification: refitting f(x) = c + sum_i a_i*ReLU(u_i.x + b_i) "
+[?2004l[?2004h>             f"with the {M.shape[0]} stolen directions")
+[?2004l[?2004h>         m = M.shape[0]
+[?2004l[?2004h>         Xs = [rng.normal(size=10) for _ in range(2 * m + 10)]
+[?2004l[?2004h>         A = np.column_stack([np.maximum(x @ M[i] - M[i] @ p, 0.0) for i, p in \
+[?2004l[?2004h>                              zip([M[i] for i in range(m)], [g['beta'] for g in groups])])
+[?2004l[?2004h>         A = np.column_stack([np.maximum(x @ M[i] + groups[i]['beta'], 0.0)
+[?2004l[?2004h>                              for i, x in ([ (M[i], x) for i in range(m)] for x in Xs)]) \
+[?2004l[?2004h>             if False else np.column_stack(
+[?2004l[?2004h>                 [np.array([max(float(x @ M[i]) + groups[i]['beta'], 0.0)
+[?2004l[?2004h>                            for x in Xs]) for i in range(m)])
+[?2004l[?2004h>         y = np.array([F(x) for x in Xs])
+[?2004l[?2004h>         sol = np.linalg.lstsq(np.column_stack([A, np.ones(len(Xs))]), y,
+[?2004l[?2004h>                               rcond=None)[0]
+[?2004l[?2004h>         rec = np.column_stack([A, np.ones(len(Xs))]) @ sol
+[?2004l[?2004h>         rel = float(np.linalg.norm(rec - y) / max(1e-30, np.linalg.norm(y)))
+[?2004l[?2004h>         log(f"  fit residual (relative) = {rel:.3e}   "
+[?2004l[?2004h>             f"({'OK' if rel < 1e-6 else 'INCONSISTENT'})")
+[?2004l[?2004h> 
+[?2004l[?2004h>     np.set_printoptions(precision=9, linewidth=250)
+[?2004l[?2004h>     print(M)
+[?2004l[?2004h>     np.save('/app/stolen_A1.npy', M)
+[?2004l[?2004h>     log(f"saved matrix of shape {M.shape} to /app/stolen_A1.npy "
+[?2004l[?2004h>         f"(total forward calls: {calls})")
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@072bedd94a5f:/app# python3 -c "import ast; ast.parse(open('/app/steal.py').read()); print('syntax OK')"
+[?2004lTraceback (most recent call last):
+  File [35m"<string>"[0m, line [35m1[0m, in [35m<module>[0m
+    import ast; [31mast.parse[0m[1;31m(open('/app/steal.py').read())[0m; print('syntax OK')
+                [31m~~~~~~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+  File [35m"/usr/local/lib/python3.13/ast.py"[0m, line [35m50[0m, in [35mparse[0m
+    return compile(source, filename, mode, flags,
+                   _feature_version=feature_version, optimize=optimize)
+  File [35m"<unknown>"[0m, line [35m294[0m
+    log([1;31mf[0m"
+        [1;31m^[0m
+[1;35mSyntaxError[0m: [35munterminated f-string literal (detected at line 294)[0m
+[?2004hroot@072bedd94a5f:/app# cat > /app/steal.py << 'EOF1'
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> """Steal A1 (up to permutation and per-row scaling) of a one-layer ReLU net
+[?2004l[?2004h> 
+[?2004l[?2004h>     f(x) = A2 @ ReLU(A1 @ x + b1) + b2 ,  input dim = 10
+[?2004l[?2004h> 
+[?2004l[?2004h> using only black-box queries to forward.forward.
+[?2004l[?2004h> 
+[?2004l[?2004h> Method:
+[?2004l[?2004h> * Along any line x(t) = x0 + t*v, f is piecewise linear with one breakpoint
+[?2004l[?2004h>   per neuron (generic direction); kinks are found by slope-change detection
+[?2004l[?2004h>   on a grid followed by bisection refinement.
+[?2004l[?2004h> * Crossing neuron i's kink hyperplane, the 10-D gradient of f jumps by
+[?2004l[?2004h>   +/- A2_i * a_i (all other terms stay continuous), so the jump direction
+[?2004l[?2004h>   recovers row a_i up to sign and scale -- exactly the allowed freedom.
+[?2004l[?2004h> * Two independent lines (a third if counts disagree) are used for
+[?2004l[?2004h>   cross-checking, deduplication and separating neurons whose breakpoints
+[?2004l[?2004h>   coincide on one line (e.g. some biases b1_i exactly 0).
+[?2004l[?2004h> """
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import numpy as np
+[?2004l[?2004h> from forward import forward as _fwd
+[?2004l[?2004h> 
+[?2004l[?2004h> calls = 0
+[?2004l[?2004h> _cache = {}
+[?2004l[?2004h> 
+[?2004l[?2004h> def F(x):
+[?2004l[?2004h>     global calls
+[?2004l[?2004h>     x = np.ascontiguousarray(x, dtype=np.float64).reshape(10)
+[?2004l[?2004h>     key = x.tobytes()
+[?2004l[?2004h>     v = _cache.get(key)
+[?2004l[?2004h>     if v is None:
+[?2004l[?2004h>         calls += 1
+[?2004l[?2004h>         v = float(_fwd(x))
+[?2004l[?2004h>         if not np.isfinite(v):
+[?2004l[?2004h>             raise RuntimeError("forward() returned a non-finite value")
+[?2004l[?2004h>         _cache[key] = v
+[?2004l[?2004h>     return v
+[?2004l[?2004h> 
+[?2004l[?2004h> def log(*a):
+[?2004l[?2004h>     print(*a, file=sys.stderr)
+[?2004l[?2004h> 
+[?2004l[?2004h> rng = np.random.default_rng(20240613)
+[?2004l[?2004h> 
+[?2004l[?2004h> def rand_unit():
+[?2004l[?2004h>     while True:
+[?2004l[?2004h>         z = rng.standard_normal(10)
+[?2004l[?2004h>         n = np.linalg.norm(z)
+[?2004l[?2004h>         if n > 1e-8:
+[?2004l[?2004h>             return z / n
+[?2004l[?2004h> 
+[?2004l[?2004h> log("forward(0) =", F(np.zeros(10)))
+[?2004l[?2004h> EOF1
+[?2004l[?2004hroot@072bedd94a5f:/app# grep -c '' /app/steal.py
+[?2004l51
+[?2004hroot@072bedd94a5f:/app# cat >> /app/steal.py << 'EOF2'
+[?2004l[?2004h> 
+[?2004l[?2004h> def scan_line(f1d, T, N=1600):
+[?2004l[?2004h>     ts = np.linspace(-T, T, N)
+[?2004l[?2004h>     fs = np.array([f1d(t) for t in ts])
+[?2004l[?2004h>     dt = ts[1] - ts[0]
+[?2004l[?2004h>     s = np.diff(fs) / dt
+[?2004l[?2004h>     nI = N - 1
+[?2004l[?2004h>     Fmax = max(1.0, float(np.abs(fs).max()))
+[?2004l[?2004h>     Smax = max(1.0, float(np.abs(s).max()))
+[?2004l[?2004h>     tol = 1e-7 * Smax + 1e-9 * Fmax + 1e-12
+[?2004l[?2004h>     C = np.zeros(nI, dtype=bool)
+[?2004l[?2004h>     for j in range(nI):
+[?2004l[?2004h>         if j > 0 and abs(s[j] - s[j-1]) > tol:
+[?2004l[?2004h>             C[j] = True
+[?2004l[?2004h>         if j < nI - 1 and abs(s[j+1] - s[j]) > tol:
+[?2004l[?2004h>             C[j] = True
+[?2004l[?2004h>     zones, j = [], 0
+[?2004l[?2004h>     while j < nI:
+[?2004l[?2004h>         if C[j]:
+[?2004l[?2004h>             j0 = j
+[?2004l[?2004h>             while j + 1 < nI and C[j+1]:
+[?2004l[?2004h>                 j += 1
+[?2004l[?2004h>             zones.append((j0, j))
+[?2004l[?2004h>         j += 1
+[?2004l[?2004h>     boundary = bool(zones) and (zones[0][0] == 0 or zones[-1][1] == nI - 1)
+[?2004l[?2004h>     return ts, s, tol, boundary, zones
+[?2004l[?2004h> 
+[?2004l[?2004h> def _refine(f1d, a, b, sL, sR, fa, fb, tol, depth):
+[?2004l[?2004h>     # isolate kink(s) inside (a, b); sL/sR = clean slopes left/right of it
+[?2004l[?2004h>     if abs(sR - sL) <= 0.5 * tol:
+[?2004l[?2004h>         return []
+[?2004l[?2004h>     m = 0.5 * (a + b)
+[?2004l[?2004h>     if depth > 64 or (b - a) <= 8e-9 * (1.0 + abs(m)):
+[?2004l[?2004h>         return [(m, sL, sR)]
+[?2004l[?2004h>     fm = f1d(m)
+[?2004l[?2004h>     sAm = (fm - fa) / (m - a)
+[?2004l[?2004h>     sMb = (fb - fm) / (b - m)
+[?2004l[?2004h>     L = abs(sAm - sL) > tol
+[?2004l[?2004h>     R = abs(sMb - sR) > tol
+[?2004l[?2004h>     if L and R:
+[?2004l[?2004h>         return (_refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1) +
+[?2004l[?2004h>                 _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1))
+[?2004l[?2004h>     if L:
+[?2004l[?2004h>         return _refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1)
+[?2004l[?2004h>     if R:
+[?2004l[?2004h>         return _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1)
+[?2004l[?2004h>     d = 2.0 * fm - fa - fb
+[?2004l[?2004h>     if d == 0.0:
+[?2004l[?2004h>         return [(m, sL, sR)]
+[?2004l[?2004h>     k = sR - sL
+[?2004l[?2004h>     left = (d > 0.0) == (k > 0.0)
+[?2004l[?2004h>     if (b - a) <= 1e-6 * (1.0 + abs(m)):
+[?2004l[?2004h>         return [(m, sL, sR)]
+[?2004l[?2004h>     if left:
+[?2004l[?2004h>         return _refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1)
+[?2004l[?2004h>     return _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1)
+[?2004l[?2004h> EOF2
+[?2004l[?2004hroot@072bedd94a5f:/app# grep -c '' /app/steal.py && tail -n 2 /app/steal.py
+[?2004l107
+        return _refine(f1d, a, m, sL, sAm, fa, fm, tol, depth + 1)
+    return _refine(f1d, m, b, sAm, sR, fm, fb, tol, depth + 1)
+[?2004hroot@072bedd94a5f:/app# cat >> /app/steal.py << 'EOF3'
+[?2004l[?2004h> 
+[?2004l[?2004h> def grad_at(q, s_target, v):
+[?2004l[?2004h>     # gradient of f at q (interior of a region); the component along the
+[?2004l[?2004h>     # unit vector v is forced to the exact one-sided slope s_target
+[?2004l[?2004h>     g = np.zeros(10)
+[?2004l[?2004h>     f0 = F(q)
+[?2004l[?2004h>     scale = max(1.0, float(np.linalg.norm(q)))
+[?2004l[?2004h>     for j in range(10):
+[?2004l[?2004h>         D = 1e-5 * scale
+[?2004l[?2004h>         ok = False
+[?2004l[?2004h>         for _ in range(14):
+[?2004l[?2004h>             e = np.zeros(10)
+[?2004l[?2004h>             e[j] = D
+[?2004l[?2004h>             fm_ = F(q - e)
+[?2004l[?2004h>             fp_ = F(q + e)
+[?2004l[?2004h>             s1 = (f0 - fm_) / D
+[?2004l[?2004h>             s2 = (fp_ - f0) / D
+[?2004l[?2004h>             if abs(s1 - s2) <= 1e-8 * max(1.0, abs(s1), abs(s2)) + 1e-12:
+[?2004l[?2004h>                 g[j] = (fp_ - fm_) / (2.0 * D)
+[?2004l[?2004h>                 ok = True
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             D *= 0.1
+[?2004l[?2004h>         if not ok:
+[?2004l[?2004h>             g[j] = (fp_ - fm_) / (2.0 * D)
+[?2004l[?2004h>             log(f"    [warn] grad comp {j}: linearity check failed at "
+[?2004l[?2004h>                 f"D={D:.1e}")
+[?2004l[?2004h>     g = g + (s_target - float(g @ v)) * v
+[?2004l[?2004h>     return g
+[?2004l[?2004h> 
+[?2004l[?2004h> def find_kinks_on_line(x0, v):
+[?2004l[?2004h>     def f1d(t):
+[?2004l[?2004h>         return F(x0 + t * v)
+[?2004l[?2004h>     T = 1.0
+[?2004l[?2004h>     prev_n = -1
+[?2004l[?2004h>     kinks = []
+[?2004l[?2004h>     for _it in range(9):
+[?2004l[?2004h>         ts, s, tol, boundary, zones = scan_line(f1d, T)
+[?2004l[?2004h>         cands = []
+[?2004l[?2004h>         for (j0, j1) in zones:
+[?2004l[?2004h>             a, b = ts[j0], ts[j1 + 1]
+[?2004l[?2004h>             sL = s[max(j0 - 1, 0)]
+[?2004l[?2004h>             sR = s[min(j1 + 1, len(s) - 1)]
+[?2004l[?2004h>             cands += _refine(f1d, a, b, sL, sR, f1d(a), f1d(b), tol, 0)
+[?2004l[?2004h>         cands.sort(key=lambda z: z[0])
+[?2004l[?2004h>         merged = []
+[?2004l[?2004h>         for (t, sl, sr) in cands:
+[?2004l[?2004h>             if merged and abs(t - merged[-1]['t']) < 1e-6 * (1 + abs(t)):
+[?2004l[?2004h>                 merged[-1]['t'] = 0.5 * (merged[-1]['t'] + t)
+[?2004l[?2004h>                 merged[-1]['co'] = True
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 merged.append({'t': t, 'co': False})
+[?2004l[?2004h>         kinks = []
+[?2004l[?2004h>         for i, rec in enumerate(merged):
+[?2004l[?2004h>             t = rec['t']
+[?2004l[?2004h>             gaps = [abs(t - r['t']) for j, r in enumerate(merged)
+[?2004l[?2004h>                     if j != i]
+[?2004l[?2004h>             gap = min(gaps) if gaps else 1e9
+[?2004l[?2004h>             gap = min(gap, 0.05 * T)
+[?2004l[?2004h>             dv = max(1e-7 * (1 + abs(t)), 0.1 * gap)
+[?2004l[?2004h>             sl = (f1d(t - dv) - f1d(t - 2 * dv)) / dv
+[?2004l[?2004h>             sr = (f1d(t + 2 * dv) - f1d(t + dv)) / dv
+[?2004l[?2004h>             if abs(sr - sl) <= max(10 * tol,
+[?2004l[?2004h>                                     1e-9 * (1 + abs(sr) + abs(sl))):
+[?2004l[?2004h>                 log(f"    (dropped spurious kink at t={t:.6g})")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             kinks.append({'t': t, 'sl': sl, 'sr': sr, 'gap': gap,
+[?2004l[?2004h>                           'co': rec['co'], 'v': v, 'x0': x0})
+[?2004l[?2004h>         near_edge = any(abs(k['t']) > 0.9 * T for k in kinks)
+[?2004l[?2004h>         if (not boundary) and (not near_edge) and len(kinks) == prev_n:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         prev_n = len(kinks)
+[?2004l[?2004h>         T *= 4.0
+[?2004l[?2004h>     for k in kinks:
+[?2004l[?2004h>         t, gap = k['t'], k['gap']
+[?2004l[?2004h>         d_ = max(1e-9 * (1 + abs(t)), 0.02 * gap)
+[?2004l[?2004h>         gL = grad_at(x0 + (t - d_) * v, k['sl'], v)
+[?2004l[?2004h>         gR = grad_at(x0 + (t + d_) * v, k['sr'], v)
+[?2004l[?2004h>         J = gR - gL
+[?2004l[?2004h>         k['J'] = J
+[?2004l[?2004h>         k['mag'] = float(np.linalg.norm(J))
+[?2004l[?2004h>         k['p'] = x0 + t * v
+[?2004l[?2004h>         if abs(float(J @ v) - (k['sr'] - k['sl'])) > \
+[?2004l[?2004h>                 1e-6 * (1 + abs(float(J @ v))):
+[?2004l[?2004h>             log(f"    [warn] t={t:.6g}: J.v={float(J @ v):.6g} vs slope "
+[?2004l[?2004h>                 f"diff {k['sr'] - k['sl']:.6g}")
+[?2004l[?2004h>     return kinks
+[?2004l[?2004h> EOF3
+[?2004l[?2004hroot@072bedd94a5f:/app# grep -c '' /app/steal.py && tail -n 2 /app/steal.py
+[?2004l193
+                f"diff {k['sr'] - k['sl']:.6g}")
+    return kinks
+[?2004hroot@072bedd94a5f:/app# cat >> /app/steal.py << 'EOF4'
+[?2004l[?2004h> 
+[?2004l[?2004h> def canon(u):
+[?2004l[?2004h>     u = np.asarray(u, dtype=np.float64)
+[?2004l[?2004h>     u = u / np.linalg.norm(u)
+[?2004l[?2004h>     i = int(np.argmax(np.abs(u)))
+[?2004l[?2004h>     if u[i] < 0:
+[?2004l[?2004h>         u = -u
+[?2004l[?2004h>     return u
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     v1, v2, v3 = rand_unit(), rand_unit(), rand_unit()
+[?2004l[?2004h>     uz = rand_unit()
+[?2004l[?2004h> 
+[?2004l[?2004h>     log("scanning line 1: x0 = 0")
+[?2004l[?2004h>     kinks1 = find_kinks_on_line(np.zeros(10), v1)
+[?2004l[?2004h>     log("scanning line 2: x0 = 0.5*u")
+[?2004l[?2004h>     kinks2 = find_kinks_on_line(0.5 * uz, v2)
+[?2004l[?2004h>     lines = [("L1", kinks1), ("L2", kinks2)]
+[?2004l[?2004h>     log(f"line1: {len(kinks1)} kinks, line2: {len(kinks2)} kinks")
+[?2004l[?2004h> 
+[?2004l[?2004h>     any_merged = any(k['co'] for k in kinks1 + kinks2)
+[?2004l[?2004h>     if len(kinks1) != len(kinks2) and not any_merged:
+[?2004l[?2004h>         log("counts disagree -> scanning line 3: x0 = 0, fresh direction")
+[?2004l[?2004h>         kinks3 = find_kinks_on_line(np.zeros(10), v3)
+[?2004l[?2004h>         lines.append(("L3", kinks3))
+[?2004l[?2004h>         log(f"line3: {len(kinks3)} kinks")
+[?2004l[?2004h> 
+[?2004l[?2004h>     groups = []
+[?2004l[?2004h>     def find_group(u):
+[?2004l[?2004h>         for g in groups:
+[?2004l[?2004h>             if abs(float(g['dir'] @ u)) > 1 - 1e-5:
+[?2004l[?2004h>                 return g
+[?2004l[?2004h>         return None
+[?2004l[?2004h> 
+[?2004l[?2004h>     for (lname, ks) in lines:
+[?2004l[?2004h>         for k in ks:
+[?2004l[?2004h>             if k['mag'] < 1e-8:
+[?2004l[?2004h>                 log("    [warn] near-zero gradient jump at a kink; skipped")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             u = canon(k['J'])
+[?2004l[?2004h>             g = find_group(u)
+[?2004l[?2004h>             if g is None:
+[?2004l[?2004h>                 g = {'dir': u, 'mag': k['mag'], 'merged': False,
+[?2004l[?2004h>                      'counts': {}, 'infos': {}}
+[?2004l[?2004h>                 groups.append(g)
+[?2004l[?2004h>             g['counts'][lname] = g['counts'].get(lname, 0) + 1
+[?2004l[?2004h>             g['merged'] = g['merged'] or bool(k['co'])
+[?2004l[?2004h>             g['infos'].setdefault(lname, []).append(
+[?2004l[?2004h>                 {'t': k['t'], 'x0': k['x0'], 'v': k['v'], 'co': k['co'],
+[?2004l[?2004h>                  'mag': k['mag'], 'J': k['J'], 'p': k['p']})
+[?2004l[?2004h> 
+[?2004l[?2004h>     def explained_by_sum(gm):
+[?2004l[?2004h>         target = gm['mag'] * gm['dir']
+[?2004l[?2004h>         r = target.copy()
+[?2004l[?2004h>         used = set()
+[?2004l[?2004h>         for _ in range(40):
+[?2004l[?2004h>             best = None
+[?2004l[?2004h>             for h in groups:
+[?2004l[?2004h>                 if h is gm or id(h) in used:
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 vec = h['mag'] * h['dir']
+[?2004l[?2004h>                 for sgn in (1.0, -1.0):
+[?2004l[?2004h>                     nr = np.linalg.norm(r - sgn * vec)
+[?2004l[?2004h>                     if best is None or nr < best[0]:
+[?2004l[?2004h>                         best = (nr, h, sgn, vec)
+[?2004l[?2004h>             nr, h, sgn, vec = best
+[?2004l[?2004h>             rn = np.linalg.norm(r)
+[?2004l[?2004h>             if rn > 0 and abs(float(r @ vec)) < 0.2 * rn:
+[?2004l[?2004h>                 return rn <= 5e-3 * gm['mag'] + 1e-12
+[?2004l[?2004h>             r = r - sgn * vec
+[?2004l[?2004h>             used.add(id(h))
+[?2004l[?2004h>         return np.linalg.norm(r) <= 5e-3 * gm['mag'] + 1e-12
+[?2004l[?2004h> 
+[?2004l[?2004h>     for g in list(groups):
+[?2004l[?2004h>         if not g['merged']:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if explained_by_sum(g):
+[?2004l[?2004h>             log("  decomposed a coincident-hyperplane kink into the rows "
+[?2004l[?2004h>                 "found on the other line")
+[?2004l[?2004h>             groups.remove(g)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             log("  [warn] coincident-hyperplane kink could not be "
+[?2004l[?2004h>                 "decomposed; keeping its summed row")
+[?2004l[?2004h> EOF4
+[?2004l[?2004hroot@072bedd94a5f:/app# grep -c '' /app/steal.py && tail -n 2 /app/steal.py
+[?2004l276
+            log("  [warn] coincident-hyperplane kink could not be "
+                "decomposed; keeping its summed row")
+[?2004hroot@072bedd94a5f:/app# cat >> /app/steal.py << 'EOF5'
+[?2004l[?2004h> 
+[?2004l[?2004h>     # beta_i: signed offset of the kink hyperplane in the canonical row
+[?2004l[?2004h>     # frame: with u_i = row direction and p_i a point on the hyperplane,
+[?2004l[?2004h>     # the hyperplane is {u_i . x + beta_i = 0} with beta_i = -u_i . p_i.
+[?2004l[?2004h>     for g in groups:
+[?2004l[?2004h>         betas = []
+[?2004l[?2004h>         for infos in g['infos'].values():
+[?2004l[?2004h>             for info in infos:
+[?2004l[?2004h>                 if not info['co']:
+[?2004l[?2004h>                     betas.append(-float(g['dir'] @ info['p']))
+[?2004l[?2004h>         if not betas:
+[?2004l[?2004h>             info = next(iter(g['infos'].values()))[0]
+[?2004l[?2004h>             betas = [-float(g['dir'] @ info['p'])]
+[?2004l[?2004h>         g['beta'] = float(np.mean(betas))
+[?2004l[?2004h>         if max(betas) - min(betas) > 2e-4:
+[?2004l[?2004h>             log(f"  [warn] inconsistent kink offsets for one row: {betas}")
+[?2004l[?2004h>         if not g['merged']:
+[?2004l[?2004h>             per = [next(iter(infos))['mag'] for infos in g['infos'].values()]
+[?2004l[?2004h>             mx, mn = max(per), min(per)
+[?2004l[?2004h>             if mx > 0 and (mx - mn) / mx > 1e-3:
+[?2004l[?2004h>                 log(f"  [warn] inconsistent jump magnitudes: {per}")
+[?2004l[?2004h> 
+[?2004l[?2004h>     rows = []
+[?2004l[?2004h>     for g in groups:
+[?2004l[?2004h>         mult = max(g['counts'].values())
+[?2004l[?2004h>         for _ in range(mult):
+[?2004l[?2004h>             rows.append(g)
+[?2004l[?2004h>     M = np.array([g['dir'] for g in rows], dtype=np.float64) if rows \
+[?2004l[?2004h>         else np.zeros((0, 10))
+[?2004l[?2004h>     log(f"recovered {len(groups)} distinct directions, "
+[?2004l[?2004h>         f"{M.shape[0]} rows in total")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # ------------- end-to-end self-verification -------------------------
+[?2004l[?2004h>     # For a genuine 1-layer ReLU net, with z_i = u_i.x + beta_i:
+[?2004l[?2004h>     #   f = c0 + sum_i u_i*|z_i| + w_i*z_i   with |w_i| == |u_i|  (coeffs:
+[?2004l[?2004h>     # A2*ReLU(q z) = (A2/2)(|z| + z) for q>0 and (A2/2)(|z| - z) for q<0)
+[?2004l[?2004h>     # This is LINEAR in the unknowns (alpha_i, w_i, c0), so a single
+[?2004l[?2004h>     # least-squares fit must be exact and must satisfy |w_i| == |alpha_i|.
+[?2004l[?2004h>     m = M.shape[0]
+[?2004l[?2004h>     if m > 0:
+[?2004l[?2004h>         betas = np.array([g['beta'] for g in rows])
+[?2004l[?2004h>         Xs = rng.normal(size=(2 * (2 * m + 3), 10))
+[?2004l[?2004h>         Z = Xs @ M.T + betas
+[?2004l[?2004h>         Ab = np.column_stack([np.abs(Z), Z, np.ones((Xs.shape[0], 1))])
+[?2004l[?2004h>         y = np.array([F(xvec) for xvec in Xs])
+[?2004l[?2004h>         sol = np.linalg.lstsq(Ab, y, rcond=None)[0]
+[?2004l[?2004h>         rec = Ab @ sol
+[?2004l[?2004h>         rel = float(np.linalg.norm(rec - y) /
+[?2004l[?2004h>                     max(1e-30, float(np.linalg.norm(y))))
+[?2004l[?2004h>         coef_a = sol[:m]
+[?2004l[?2004h>         coef_w = sol[m:2 * m]
+[?2004l[?2004h>         scale = np.maximum(np.abs(coef_a), 1e-30)
+[?2004l[?2004h>         bad = int(np.sum(np.abs(np.abs(coef_w) - np.abs(coef_a))
+[?2004l[?2004h>                           > 1e-4 * scale))
+[?2004l[?2004h>         if rel > 1e-6 or bad > 0:
+[?2004l[?2004h>             log(f"  [warn] self-check: residual={rel:.3e}, "
+[?2004l[?2004h>                 f"relu-structure violations={bad}/{m}"
+[?2004l[?2004h>                 f" -> stolen rows may contain errors")
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             log(f"  self-check passed: residual={rel:.3e}, the stolen "
+[?2004l[?2004h>                 f"directions reproduce f exactly as a 1-layer ReLU net")
+[?2004l[?2004h> 
+[?2004l[?2004h>     np.set_printoptions(precision=9, linewidth=250)
+[?2004l[?2004h>     print(M)
+[?2004l[?2004h>     np.save('/app/stolen_A1.npy', M)
+[?2004l[?2004h>     log(f"saved matrix of shape {M.shape} to /app/stolen_A1.npy "
+[?2004l[?2004h>         f"(total forward calls: {calls})")
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> EOF5
+[?2004l[?2004hroot@072bedd94a5f:/app# grep -c '' /app/steal.py && python3 -m py_compile /app/steal.py && echo "COMPILE OK"
+[?2004l346
+COMPILE OK
+[?2004hroot@072bedd94a5f:/app# cd /app && time timeout 600 python3 steal.py > /tmp/steal_stdout.txt 2> /tmp/steal_stderr.txt; echo "EXIT=$?"
+[?2004l
+real	0m1.576s
+user	0m1.496s
+sys	0m0.067s
+EXIT=0
+[?2004hroot@072bedd94a5f:/app# cat /tmp/steal_stderr.txt
+[?2004lforward(0) = -0.09423482539555281
+scanning line 1: x0 = 0
+    (dropped spurious kink at t=-0.740096)
+    (dropped spurious kink at t=-0.740082)
+    (dropped spurious kink at t=-0.740052)
+    (dropped spurious kink at t=-0.739994)
+    (dropped spurious kink at t=-0.739525)
+    (dropped spurious kink at t=-0.495867)
+    (dropped spurious kink at t=-0.495837)
+    (dropped spurious kink at t=-0.495779)
+    (dropped spurious kink at t=-0.49531)
+    (dropped spurious kink at t=-0.212274)
+    (dropped spurious kink at t=-0.212266)
+    (dropped spurious kink at t=-0.212252)
+    (dropped spurious kink at t=-0.212222)
+    (dropped spurious kink at t=-0.212164)
+    (dropped spurious kink at t=-0.211695)
+    (dropped spurious kink at t=-0.121132)
+    (dropped spurious kink at t=-0.121128)
+    (dropped spurious kink at t=-0.121121)
+    (dropped spurious kink at t=-0.121091)
+    (dropped spurious kink at t=-0.120857)
+    (dropped spurious kink at t=-0.120388)
+    (dropped spurious kink at t=-0.021747)
+    (dropped spurious kink at t=-0.0217323)
+    (dropped spurious kink at t=-0.0212633)
+    (dropped spurious kink at t=0.03099)
+    (dropped spurious kink at t=0.030991)
+    (dropped spurious kink at t=0.0310057)
+    (dropped spurious kink at t=0.031035)
+    (dropped spurious kink at t=0.0312695)
+    (dropped spurious kink at t=0.119015)
+    (dropped spurious kink at t=0.119029)
+    (dropped spurious kink at t=0.119059)
+    (dropped spurious kink at t=0.119293)
+    (dropped spurious kink at t=0.119762)
+    (dropped spurious kink at t=0.173961)
+    (dropped spurious kink at t=0.173976)
+    (dropped spurious kink at t=0.174093)
+    (dropped spurious kink at t=0.174328)
+    (dropped spurious kink at t=0.174797)
+    (dropped spurious kink at t=0.484281)
+    (dropped spurious kink at t=0.484283)
+    (dropped spurious kink at t=0.484287)
+    (dropped spurious kink at t=0.484522)
+    (dropped spurious kink at t=0.484991)
+    (dropped spurious kink at t=0.507165)
+    (dropped spurious kink at t=0.507168)
+    (dropped spurious kink at t=0.507182)
+    (dropped spurious kink at t=0.507212)
+    (dropped spurious kink at t=0.50727)
+    (dropped spurious kink at t=0.507505)
+    (dropped spurious kink at t=0.514672)
+    (dropped spurious kink at t=0.514687)
+    (dropped spurious kink at t=0.514716)
+    (dropped spurious kink at t=0.514775)
+    (dropped spurious kink at t=0.515009)
+    (dropped spurious kink at t=0.551695)
+    (dropped spurious kink at t=0.551697)
+    (dropped spurious kink at t=0.551712)
+    (dropped spurious kink at t=0.551829)
+    (dropped spurious kink at t=0.552064)
+    (dropped spurious kink at t=0.552533)
+    (dropped spurious kink at t=0.692652)
+    (dropped spurious kink at t=0.692655)
+    (dropped spurious kink at t=0.692669)
+    (dropped spurious kink at t=0.692699)
+    (dropped spurious kink at t=0.692933)
+    (dropped spurious kink at t=0.728517)
+    (dropped spurious kink at t=0.728519)
+    (dropped spurious kink at t=0.728527)
+    (dropped spurious kink at t=0.728541)
+    (dropped spurious kink at t=0.728659)
+    (dropped spurious kink at t=0.728893)
+    (dropped spurious kink at t=-1.88527)
+    (dropped spurious kink at t=-1.88524)
+    (dropped spurious kink at t=-1.8843)
+    (dropped spurious kink at t=-1.88243)
+    (dropped spurious kink at t=-0.740096)
+    (dropped spurious kink at t=-0.740082)
+    (dropped spurious kink at t=-0.740052)
+    (dropped spurious kink at t=-0.739994)
+    (dropped spurious kink at t=-0.739525)
+    (dropped spurious kink at t=-0.738587)
+    (dropped spurious kink at t=-0.73671)
+    (dropped spurious kink at t=-0.495867)
+    (dropped spurious kink at t=-0.495837)
+    (dropped spurious kink at t=-0.495779)
+    (dropped spurious kink at t=-0.49531)
+    (dropped spurious kink at t=-0.212277)
+    (dropped spurious kink at t=-0.212275)
+    (dropped spurious kink at t=-0.212271)
+    (dropped spurious kink at t=-0.212242)
+    (dropped spurious kink at t=-0.212008)
+    (dropped spurious kink at t=-0.210131)
+    (dropped spurious kink at t=-0.121132)
+    (dropped spurious kink at t=-0.12113)
+    (dropped spurious kink at t=-0.121013)
+    (dropped spurious kink at t=-0.120075)
+    (dropped spurious kink at t=-0.0217494)
+    (dropped spurious kink at t=-0.0217421)
+    (dropped spurious kink at t=-0.0217128)
+    (dropped spurious kink at t=-0.0216542)
+    (dropped spurious kink at t=-0.0214196)
+    (dropped spurious kink at t=-0.0209506)
+    (dropped spurious kink at t=-0.0200125)
+    (dropped spurious kink at t=0.0309935)
+    (dropped spurious kink at t=0.0310008)
+    (dropped spurious kink at t=0.0310155)
+    (dropped spurious kink at t=0.0310741)
+    (dropped spurious kink at t=0.0311914)
+    (dropped spurious kink at t=0.0314259)
+    (dropped spurious kink at t=0.0318949)
+    (dropped spurious kink at t=0.0337711)
+    (dropped spurious kink at t=0.119007)
+    (dropped spurious kink at t=0.119009)
+    (dropped spurious kink at t=0.119012)
+    (dropped spurious kink at t=0.11902)
+    (dropped spurious kink at t=0.119137)
+    (dropped spurious kink at t=0.120075)
+    (dropped spurious kink at t=0.173966)
+    (dropped spurious kink at t=0.173995)
+    (dropped spurious kink at t=0.174054)
+    (dropped spurious kink at t=0.174171)
+    (dropped spurious kink at t=0.175109)
+    (dropped spurious kink at t=0.484285)
+    (dropped spurious kink at t=0.484292)
+    (dropped spurious kink at t=0.484307)
+    (dropped spurious kink at t=0.484365)
+    (dropped spurious kink at t=0.485303)
+    (dropped spurious kink at t=0.507168)
+    (dropped spurious kink at t=0.507192)
+    (dropped spurious kink at t=0.510319)
+    (dropped spurious kink at t=0.514669)
+    (dropped spurious kink at t=0.51467)
+    (dropped spurious kink at t=0.514673)
+    (dropped spurious kink at t=0.51468)
+    (dropped spurious kink at t=0.514692)
+    (dropped spurious kink at t=0.514716)
+    (dropped spurious kink at t=0.514814)
+    (dropped spurious kink at t=0.515009)
+    (dropped spurious kink at t=0.516573)
+    (dropped spurious kink at t=0.551696)
+    (dropped spurious kink at t=0.5517)
+    (dropped spurious kink at t=0.551707)
+    (dropped spurious kink at t=0.551722)
+    (dropped spurious kink at t=0.551751)
+    (dropped spurious kink at t=0.55222)
+    (dropped spurious kink at t=0.554096)
+    (dropped spurious kink at t=0.692659)
+    (dropped spurious kink at t=0.692777)
+    (dropped spurious kink at t=0.693246)
+    (dropped spurious kink at t=0.694184)
+    (dropped spurious kink at t=0.728518)
+    (dropped spurious kink at t=0.728522)
+    (dropped spurious kink at t=0.72858)
+    (dropped spurious kink at t=0.730457)
+    (dropped spurious kink at t=1.08901)
+    (dropped spurious kink at t=1.08904)
+    (dropped spurious kink at t=1.08927)
+    (dropped spurious kink at t=1.08974)
+    (dropped spurious kink at t=1.09068)
+    (dropped spurious kink at t=1.26743)
+    (dropped spurious kink at t=1.26767)
+    (dropped spurious kink at t=1.26954)
+    (dropped spurious kink at t=1.67269)
+    (dropped spurious kink at t=1.67292)
+    (dropped spurious kink at t=1.6748)
+    (dropped spurious kink at t=-1.88528)
+    (dropped spurious kink at t=-1.88527)
+    (dropped spurious kink at t=-1.88527)
+    (dropped spurious kink at t=-1.88525)
+    (dropped spurious kink at t=-1.88522)
+    (dropped spurious kink at t=-1.88516)
+    (dropped spurious kink at t=-1.88493)
+    (dropped spurious kink at t=-1.88118)
+    (dropped spurious kink at t=-0.740096)
+    (dropped spurious kink at t=-0.740082)
+    (dropped spurious kink at t=-0.740052)
+    (dropped spurious kink at t=-0.739994)
+    (dropped spurious kink at t=-0.739525)
+    (dropped spurious kink at t=-0.738587)
+    (dropped spurious kink at t=-0.73671)
+    (dropped spurious kink at t=-0.732958)
+    (dropped spurious kink at t=-0.725453)
+    (dropped spurious kink at t=-0.495868)
+    (dropped spurious kink at t=-0.495864)
+    (dropped spurious kink at t=-0.495857)
+    (dropped spurious kink at t=-0.495622)
+    (dropped spurious kink at t=-0.494684)
+    (dropped spurious kink at t=-0.492808)
+    (dropped spurious kink at t=-0.485303)
+    (dropped spurious kink at t=-0.212274)
+    (dropped spurious kink at t=-0.212266)
+    (dropped spurious kink at t=-0.212252)
+    (dropped spurious kink at t=-0.212222)
+    (dropped spurious kink at t=-0.212164)
+    (dropped spurious kink at t=-0.211695)
+    (dropped spurious kink at t=-0.210757)
+    (dropped spurious kink at t=-0.208881)
+    (dropped spurious kink at t=-0.205128)
+    (dropped spurious kink at t=-0.121132)
+    (dropped spurious kink at t=-0.12113)
+    (dropped spurious kink at t=-0.121013)
+    (dropped spurious kink at t=-0.120075)
+    (dropped spurious kink at t=-0.0217494)
+    (dropped spurious kink at t=-0.0217421)
+    (dropped spurious kink at t=-0.0217128)
+    (dropped spurious kink at t=-0.0216542)
+    (dropped spurious kink at t=-0.0214196)
+    (dropped spurious kink at t=-0.0209506)
+    (dropped spurious kink at t=-0.0200125)
+    (dropped spurious kink at t=0.0100063)
+    (dropped spurious kink at t=0.0309902)
+    (dropped spurious kink at t=0.0309923)
+    (dropped spurious kink at t=0.0309959)
+    (dropped spurious kink at t=0.0311132)
+    (dropped spurious kink at t=0.0315822)
+    (dropped spurious kink at t=0.0325203)
+    (dropped spurious kink at t=0.040025)
+    (dropped spurious kink at t=0.119007)
+    (dropped spurious kink at t=0.119009)
+    (dropped spurious kink at t=0.119012)
+    (dropped spurious kink at t=0.11902)
+    (dropped spurious kink at t=0.119137)
+    (dropped spurious kink at t=0.120075)
+    (dropped spurious kink at t=0.150094)
+    (dropped spurious kink at t=0.173958)
+    (dropped spurious kink at t=0.17396)
+    (dropped spurious kink at t=0.173964)
+    (dropped spurious kink at t=0.173971)
+    (dropped spurious kink at t=0.173986)
+    (dropped spurious kink at t=0.174015)
+    (dropped spurious kink at t=0.174484)
+    (dropped spurious kink at t=0.17636)
+    (dropped spurious kink at t=0.180113)
+    (dropped spurious kink at t=0.484286)
+    (dropped spurious kink at t=0.484294)
+    (dropped spurious kink at t=0.484311)
+    (dropped spurious kink at t=0.484346)
+    (dropped spurious kink at t=0.484482)
+    (dropped spurious kink at t=0.484756)
+    (dropped spurious kink at t=0.485303)
+    (dropped spurious kink at t=0.507166)
+    (dropped spurious kink at t=0.507175)
+    (dropped spurious kink at t=0.507192)
+    (dropped spurious kink at t=0.51157)
+    (dropped spurious kink at t=0.514669)
+    (dropped spurious kink at t=0.514673)
+    (dropped spurious kink at t=0.514682)
+    (dropped spurious kink at t=0.514716)
+    (dropped spurious kink at t=0.514853)
+    (dropped spurious kink at t=0.515947)
+    (dropped spurious kink at t=0.520325)
+    (dropped spurious kink at t=0.551705)
+    (dropped spurious kink at t=0.551722)
+    (dropped spurious kink at t=0.55179)
+    (dropped spurious kink at t=0.552064)
+    (dropped spurious kink at t=0.553158)
+    (dropped spurious kink at t=0.555347)
+    (dropped spurious kink at t=0.692652)
+    (dropped spurious kink at t=0.692655)
+    (dropped spurious kink at t=0.692659)
+    (dropped spurious kink at t=0.692699)
+    (dropped spurious kink at t=0.692777)
+    (dropped spurious kink at t=0.692933)
+    (dropped spurious kink at t=0.695435)
+    (dropped spurious kink at t=0.700438)
+    (dropped spurious kink at t=0.710444)
+    (dropped spurious kink at t=0.728522)
+    (dropped spurious kink at t=0.728541)
+    (dropped spurious kink at t=0.72858)
+    (dropped spurious kink at t=0.729206)
+    (dropped spurious kink at t=0.730457)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.08912)
+    (dropped spurious kink at t=1.09006)
+    (dropped spurious kink at t=1.09193)
+    (dropped spurious kink at t=1.09568)
+    (dropped spurious kink at t=1.2674)
+    (dropped spurious kink at t=1.26741)
+    (dropped spurious kink at t=1.26741)
+    (dropped spurious kink at t=1.26747)
+    (dropped spurious kink at t=1.26759)
+    (dropped spurious kink at t=1.26782)
+    (dropped spurious kink at t=1.26829)
+    (dropped spurious kink at t=1.2758)
+    (dropped spurious kink at t=1.67263)
+    (dropped spurious kink at t=1.67264)
+    (dropped spurious kink at t=1.67267)
+    (dropped spurious kink at t=1.67273)
+    (dropped spurious kink at t=1.67284)
+    (dropped spurious kink at t=1.67308)
+    (dropped spurious kink at t=1.67355)
+    (dropped spurious kink at t=1.68105)
+    (dropped spurious kink at t=4.0595)
+    (dropped spurious kink at t=4.05952)
+    (dropped spurious kink at t=4.05955)
+    (dropped spurious kink at t=4.05961)
+    (dropped spurious kink at t=4.05972)
+    (dropped spurious kink at t=4.06066)
+    (dropped spurious kink at t=4.06254)
+    (dropped spurious kink at t=7.56133)
+    (dropped spurious kink at t=7.56144)
+    (dropped spurious kink at t=7.56191)
+    (dropped spurious kink at t=7.56285)
+    (dropped spurious kink at t=7.56473)
+    (dropped spurious kink at t=-1.88526)
+    (dropped spurious kink at t=-1.8852)
+    (dropped spurious kink at t=-1.88508)
+    (dropped spurious kink at t=-1.88462)
+    (dropped spurious kink at t=-1.88368)
+    (dropped spurious kink at t=-1.87617)
+    (dropped spurious kink at t=-1.86116)
+    (dropped spurious kink at t=-0.740098)
+    (dropped spurious kink at t=-0.740094)
+    (dropped spurious kink at t=-0.740077)
+    (dropped spurious kink at t=-0.740043)
+    (dropped spurious kink at t=-0.739974)
+    (dropped spurious kink at t=-0.739837)
+    (dropped spurious kink at t=-0.73546)
+    (dropped spurious kink at t=-0.700438)
+    (dropped spurious kink at t=-0.56035)
+    (dropped spurious kink at t=-0.495864)
+    (dropped spurious kink at t=-0.495847)
+    (dropped spurious kink at t=-0.495779)
+    (dropped spurious kink at t=-0.494684)
+    (dropped spurious kink at t=-0.490306)
+    (dropped spurious kink at t=-0.420263)
+    (dropped spurious kink at t=-0.280175)
+    (dropped spurious kink at t=-0.212269)
+    (dropped spurious kink at t=-0.212252)
+    (dropped spurious kink at t=-0.212183)
+    (dropped spurious kink at t=-0.212047)
+    (dropped spurious kink at t=-0.211773)
+    (dropped spurious kink at t=-0.211226)
+    (dropped spurious kink at t=-0.210131)
+    (dropped spurious kink at t=-0.140088)
+    (dropped spurious kink at t=-0.121123)
+    (dropped spurious kink at t=-0.121106)
+    (dropped spurious kink at t=-0.121072)
+    (dropped spurious kink at t=-0.120935)
+    (dropped spurious kink at t=-0.120388)
+    (dropped spurious kink at t=-0.118199)
+    (dropped spurious kink at t=-0.113821)
+    (dropped spurious kink at t=-0.105066)
+    (dropped spurious kink at t=-0.0700438)
+    (dropped spurious kink at t=-0.0217509)
+    (dropped spurious kink at t=-0.0217497)
+    (dropped spurious kink at t=-0.0217476)
+    (dropped spurious kink at t=-0.0217433)
+    (dropped spurious kink at t=-0.0217348)
+    (dropped spurious kink at t=-0.0217177)
+    (dropped spurious kink at t=-0.0216835)
+    (dropped spurious kink at t=-0.0216151)
+    (dropped spurious kink at t=-0.0213415)
+    (dropped spurious kink at t=-0.0207942)
+    (dropped spurious kink at t=-0.0196998)
+    (dropped spurious kink at t=-0.0175109)
+    (dropped spurious kink at t=1.77636e-15)
+    (dropped spurious kink at t=0.0309947)
+    (dropped spurious kink at t=0.0310033)
+    (dropped spurious kink at t=0.0310204)
+    (dropped spurious kink at t=0.0310546)
+    (dropped spurious kink at t=0.0311914)
+    (dropped spurious kink at t=0.0317386)
+    (dropped spurious kink at t=0.032833)
+    (dropped spurious kink at t=0.0350219)
+    (dropped spurious kink at t=0.0700438)
+    (dropped spurious kink at t=0.119011)
+    (dropped spurious kink at t=0.11902)
+    (dropped spurious kink at t=0.119293)
+    (dropped spurious kink at t=0.120388)
+    (dropped spurious kink at t=0.122577)
+    (dropped spurious kink at t=0.140088)
+    (dropped spurious kink at t=0.173958)
+    (dropped spurious kink at t=0.173959)
+    (dropped spurious kink at t=0.173964)
+    (dropped spurious kink at t=0.173981)
+    (dropped spurious kink at t=0.174015)
+    (dropped spurious kink at t=0.175109)
+    (dropped spurious kink at t=0.210131)
+    (dropped spurious kink at t=0.484281)
+    (dropped spurious kink at t=0.484283)
+    (dropped spurious kink at t=0.484287)
+    (dropped spurious kink at t=0.484522)
+    (dropped spurious kink at t=0.484991)
+    (dropped spurious kink at t=0.485929)
+    (dropped spurious kink at t=0.487805)
+    (dropped spurious kink at t=0.49531)
+    (dropped spurious kink at t=0.507165)
+    (dropped spurious kink at t=0.507168)
+    (dropped spurious kink at t=0.507182)
+    (dropped spurious kink at t=0.507212)
+    (dropped spurious kink at t=0.50727)
+    (dropped spurious kink at t=0.507505)
+    (dropped spurious kink at t=0.508443)
+    (dropped spurious kink at t=0.510319)
+    (dropped spurious kink at t=0.514672)
+    (dropped spurious kink at t=0.514687)
+    (dropped spurious kink at t=0.514716)
+    (dropped spurious kink at t=0.514775)
+    (dropped spurious kink at t=0.515009)
+    (dropped spurious kink at t=0.515947)
+    (dropped spurious kink at t=0.517824)
+    (dropped spurious kink at t=0.525328)
+    (dropped spurious kink at t=0.540338)
+    (dropped spurious kink at t=0.551695)
+    (dropped spurious kink at t=0.551697)
+    (dropped spurious kink at t=0.551712)
+    (dropped spurious kink at t=0.551829)
+    (dropped spurious kink at t=0.552064)
+    (dropped spurious kink at t=0.552533)
+    (dropped spurious kink at t=0.553471)
+    (dropped spurious kink at t=0.555347)
+    (dropped spurious kink at t=0.570356)
+    (dropped spurious kink at t=0.600375)
+    (dropped spurious kink at t=0.692659)
+    (dropped spurious kink at t=0.692777)
+    (dropped spurious kink at t=0.693246)
+    (dropped spurious kink at t=0.694184)
+    (dropped spurious kink at t=0.697936)
+    (dropped spurious kink at t=0.705441)
+    (dropped spurious kink at t=0.72045)
+    (dropped spurious kink at t=0.728517)
+    (dropped spurious kink at t=0.728519)
+    (dropped spurious kink at t=0.728527)
+    (dropped spurious kink at t=0.728541)
+    (dropped spurious kink at t=0.728659)
+    (dropped spurious kink at t=0.728893)
+    (dropped spurious kink at t=0.729831)
+    (dropped spurious kink at t=0.731707)
+    (dropped spurious kink at t=0.73546)
+    (dropped spurious kink at t=0.750469)
+    (dropped spurious kink at t=0.780488)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.08901)
+    (dropped spurious kink at t=1.08906)
+    (dropped spurious kink at t=1.08916)
+    (dropped spurious kink at t=1.08935)
+    (dropped spurious kink at t=1.08974)
+    (dropped spurious kink at t=1.09131)
+    (dropped spurious kink at t=1.09443)
+    (dropped spurious kink at t=1.10069)
+    (dropped spurious kink at t=1.20075)
+    (dropped spurious kink at t=1.2674)
+    (dropped spurious kink at t=1.26741)
+    (dropped spurious kink at t=1.26742)
+    (dropped spurious kink at t=1.26744)
+    (dropped spurious kink at t=1.26749)
+    (dropped spurious kink at t=1.26759)
+    (dropped spurious kink at t=1.26798)
+    (dropped spurious kink at t=1.26954)
+    (dropped spurious kink at t=1.2758)
+    (dropped spurious kink at t=1.30081)
+    (dropped spurious kink at t=1.67263)
+    (dropped spurious kink at t=1.67264)
+    (dropped spurious kink at t=1.67267)
+    (dropped spurious kink at t=1.67273)
+    (dropped spurious kink at t=1.67284)
+    (dropped spurious kink at t=1.67308)
+    (dropped spurious kink at t=1.67355)
+    (dropped spurious kink at t=1.68105)
+    (dropped spurious kink at t=4.0595)
+    (dropped spurious kink at t=4.05951)
+    (dropped spurious kink at t=4.05957)
+    (dropped spurious kink at t=4.06004)
+    (dropped spurious kink at t=4.06754)
+    (dropped spurious kink at t=4.08255)
+    (dropped spurious kink at t=7.5613)
+    (dropped spurious kink at t=7.56132)
+    (dropped spurious kink at t=7.56135)
+    (dropped spurious kink at t=7.56141)
+    (dropped spurious kink at t=7.56152)
+    (dropped spurious kink at t=7.56176)
+    (dropped spurious kink at t=7.56223)
+    (dropped spurious kink at t=7.56973)
+    (dropped spurious kink at t=7.58474)
+    (dropped spurious kink at t=-1.88526)
+    (dropped spurious kink at t=-1.8852)
+    (dropped spurious kink at t=-1.88508)
+    (dropped spurious kink at t=-1.88462)
+    (dropped spurious kink at t=-1.88368)
+    (dropped spurious kink at t=-1.87617)
+    (dropped spurious kink at t=-1.86116)
+    (dropped spurious kink at t=-1.80113)
+    (dropped spurious kink at t=-1.68105)
+    (dropped spurious kink at t=-0.740098)
+    (dropped spurious kink at t=-0.740091)
+    (dropped spurious kink at t=-0.739994)
+    (dropped spurious kink at t=-0.739212)
+    (dropped spurious kink at t=-0.732958)
+    (dropped spurious kink at t=-0.72045)
+    (dropped spurious kink at t=-0.495865)
+    (dropped spurious kink at t=-0.495859)
+    (dropped spurious kink at t=-0.495847)
+    (dropped spurious kink at t=-0.495798)
+    (dropped spurious kink at t=-0.4957)
+    (dropped spurious kink at t=-0.49531)
+    (dropped spurious kink at t=-0.470294)
+    (dropped spurious kink at t=-0.420263)
+    (dropped spurious kink at t=-0.3202)
+    (dropped spurious kink at t=-0.212271)
+    (dropped spurious kink at t=-0.212222)
+    (dropped spurious kink at t=-0.212125)
+    (dropped spurious kink at t=-0.211929)
+    (dropped spurious kink at t=-0.211538)
+    (dropped spurious kink at t=-0.210757)
+    (dropped spurious kink at t=-0.20763)
+    (dropped spurious kink at t=-0.195122)
+    (dropped spurious kink at t=-0.170106)
+    (dropped spurious kink at t=-0.121126)
+    (dropped spurious kink at t=-0.121101)
+    (dropped spurious kink at t=-0.121052)
+    (dropped spurious kink at t=-0.120857)
+    (dropped spurious kink at t=-0.120075)
+    (dropped spurious kink at t=-0.0217503)
+    (dropped spurious kink at t=-0.021747)
+    (dropped spurious kink at t=-0.0217226)
+    (dropped spurious kink at t=-0.0216737)
+    (dropped spurious kink at t=-0.021576)
+    (dropped spurious kink at t=-0.0200125)
+    (dropped spurious kink at t=0.0309959)
+    (dropped spurious kink at t=0.0311914)
+    (dropped spurious kink at t=0.0315822)
+    (dropped spurious kink at t=0.0331457)
+    (dropped spurious kink at t=0.0362727)
+    (dropped spurious kink at t=0.0425266)
+    (dropped spurious kink at t=0.0550344)
+    (dropped spurious kink at t=0.08005)
+    (dropped spurious kink at t=0.119007)
+    (dropped spurious kink at t=0.119009)
+    (dropped spurious kink at t=0.119015)
+    (dropped spurious kink at t=0.119039)
+    (dropped spurious kink at t=0.119137)
+    (dropped spurious kink at t=0.1207)
+    (dropped spurious kink at t=0.123827)
+    (dropped spurious kink at t=0.130081)
+    (dropped spurious kink at t=0.173959)
+    (dropped spurious kink at t=0.173962)
+    (dropped spurious kink at t=0.173969)
+    (dropped spurious kink at t=0.173981)
+    (dropped spurious kink at t=0.174005)
+    (dropped spurious kink at t=0.174054)
+    (dropped spurious kink at t=0.17425)
+    (dropped spurious kink at t=0.17464)
+    (dropped spurious kink at t=0.175422)
+    (dropped spurious kink at t=0.176986)
+    (dropped spurious kink at t=0.180113)
+    (dropped spurious kink at t=0.280175)
+    (dropped spurious kink at t=0.4803)
+    (dropped spurious kink at t=0.484307)
+    (dropped spurious kink at t=0.484404)
+    (dropped spurious kink at t=0.4846)
+    (dropped spurious kink at t=0.484991)
+    (dropped spurious kink at t=0.486554)
+    (dropped spurious kink at t=0.492808)
+    (dropped spurious kink at t=0.505316)
+    (dropped spurious kink at t=0.507165)
+    (dropped spurious kink at t=0.507166)
+    (dropped spurious kink at t=0.507172)
+    (dropped spurious kink at t=0.50727)
+    (dropped spurious kink at t=0.507661)
+    (dropped spurious kink at t=0.508443)
+    (dropped spurious kink at t=0.51157)
+    (dropped spurious kink at t=0.514669)
+    (dropped spurious kink at t=0.514672)
+    (dropped spurious kink at t=0.514697)
+    (dropped spurious kink at t=0.517824)
+    (dropped spurious kink at t=0.530331)
+    (dropped spurious kink at t=0.551696)
+    (dropped spurious kink at t=0.551698)
+    (dropped spurious kink at t=0.551701)
+    (dropped spurious kink at t=0.551707)
+    (dropped spurious kink at t=0.551732)
+    (dropped spurious kink at t=0.551829)
+    (dropped spurious kink at t=0.55222)
+    (dropped spurious kink at t=0.555347)
+    (dropped spurious kink at t=0.580363)
+    (dropped spurious kink at t=0.680425)
+    (dropped spurious kink at t=0.692664)
+    (dropped spurious kink at t=0.692689)
+    (dropped spurious kink at t=0.692738)
+    (dropped spurious kink at t=0.692933)
+    (dropped spurious kink at t=0.705441)
+    (dropped spurious kink at t=0.728517)
+    (dropped spurious kink at t=0.728521)
+    (dropped spurious kink at t=0.728527)
+    (dropped spurious kink at t=0.728551)
+    (dropped spurious kink at t=0.7286)
+    (dropped spurious kink at t=0.728698)
+    (dropped spurious kink at t=0.728893)
+    (dropped spurious kink at t=0.730457)
+    (dropped spurious kink at t=0.780488)
+    (dropped spurious kink at t=0.88055)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.08901)
+    (dropped spurious kink at t=1.08903)
+    (dropped spurious kink at t=1.08908)
+    (dropped spurious kink at t=1.08927)
+    (dropped spurious kink at t=1.09006)
+    (dropped spurious kink at t=1.09318)
+    (dropped spurious kink at t=1.10569)
+    (dropped spurious kink at t=1.13071)
+    (dropped spurious kink at t=1.18074)
+    (dropped spurious kink at t=1.26741)
+    (dropped spurious kink at t=1.26751)
+    (dropped spurious kink at t=1.26829)
+    (dropped spurious kink at t=1.2808)
+    (dropped spurious kink at t=1.67263)
+    (dropped spurious kink at t=1.67263)
+    (dropped spurious kink at t=1.67265)
+    (dropped spurious kink at t=1.67284)
+    (dropped spurious kink at t=1.67323)
+    (dropped spurious kink at t=1.6748)
+    (dropped spurious kink at t=1.68105)
+    (dropped spurious kink at t=4.05953)
+    (dropped spurious kink at t=4.05965)
+    (dropped spurious kink at t=4.05988)
+    (dropped spurious kink at t=4.06035)
+    (dropped spurious kink at t=4.06129)
+    (dropped spurious kink at t=4.06504)
+    (dropped spurious kink at t=4.07255)
+    (dropped spurious kink at t=4.10256)
+    (dropped spurious kink at t=4.1626)
+    (dropped spurious kink at t=7.56133)
+    (dropped spurious kink at t=7.56144)
+    (dropped spurious kink at t=7.56191)
+    (dropped spurious kink at t=7.56285)
+    (dropped spurious kink at t=7.56473)
+    (dropped spurious kink at t=7.6848)
+    (dropped spurious kink at t=-1.88528)
+    (dropped spurious kink at t=-1.88527)
+    (dropped spurious kink at t=-1.88526)
+    (dropped spurious kink at t=-1.88516)
+    (dropped spurious kink at t=-1.88477)
+    (dropped spurious kink at t=-1.88399)
+    (dropped spurious kink at t=-1.88243)
+    (dropped spurious kink at t=-1.87617)
+    (dropped spurious kink at t=-1.85116)
+    (dropped spurious kink at t=-1.80113)
+    (dropped spurious kink at t=-1.601)
+    (dropped spurious kink at t=-0.740087)
+    (dropped spurious kink at t=-0.740062)
+    (dropped spurious kink at t=-0.740013)
+    (dropped spurious kink at t=-0.739916)
+    (dropped spurious kink at t=-0.739525)
+    (dropped spurious kink at t=-0.737961)
+    (dropped spurious kink at t=-0.725453)
+    (dropped spurious kink at t=-0.700438)
+    (dropped spurious kink at t=-0.600375)
+    (dropped spurious kink at t=-0.495868)
+    (dropped spurious kink at t=-0.495867)
+    (dropped spurious kink at t=-0.495818)
+    (dropped spurious kink at t=-0.495622)
+    (dropped spurious kink at t=-0.494059)
+    (dropped spurious kink at t=-0.487805)
+    (dropped spurious kink at t=-0.475297)
+    (dropped spurious kink at t=-0.450281)
+    (dropped spurious kink at t=-0.40025)
+    (dropped spurious kink at t=-0.212277)
+    (dropped spurious kink at t=-0.212276)
+    (dropped spurious kink at t=-0.212273)
+    (dropped spurious kink at t=-0.212266)
+    (dropped spurious kink at t=-0.212242)
+    (dropped spurious kink at t=-0.211851)
+    (dropped spurious kink at t=-0.211069)
+    (dropped spurious kink at t=-0.209506)
+    (dropped spurious kink at t=-0.206379)
+    (dropped spurious kink at t=-0.200125)
+    (dropped spurious kink at t=-0.121132)
+    (dropped spurious kink at t=-0.12113)
+    (dropped spurious kink at t=-0.121127)
+    (dropped spurious kink at t=-0.121121)
+    (dropped spurious kink at t=-0.121072)
+    (dropped spurious kink at t=-0.120974)
+    (dropped spurious kink at t=-0.120779)
+    (dropped spurious kink at t=-0.120388)
+    (dropped spurious kink at t=-0.118824)
+    (dropped spurious kink at t=-0.11257)
+    (dropped spurious kink at t=-0.100063)
+    (dropped spurious kink at t=-0.0217482)
+    (dropped spurious kink at t=-0.0217421)
+    (dropped spurious kink at t=-0.0216932)
+    (dropped spurious kink at t=-0.0214978)
+    (dropped spurious kink at t=-0.0211069)
+    (dropped spurious kink at t=-0.0203252)
+    (dropped spurious kink at t=-0.0187617)
+    (dropped spurious kink at t=-0.0125078)
+    (dropped spurious kink at t=-2.84217e-14)
+    (dropped spurious kink at t=0.03099)
+    (dropped spurious kink at t=0.0309917)
+    (dropped spurious kink at t=0.0309947)
+    (dropped spurious kink at t=0.0310008)
+    (dropped spurious kink at t=0.0310253)
+    (dropped spurious kink at t=0.0310741)
+    (dropped spurious kink at t=0.0312695)
+    (dropped spurious kink at t=0.0375235)
+    (dropped spurious kink at t=0.0500313)
+    (dropped spurious kink at t=0.100063)
+    (dropped spurious kink at t=0.119007)
+    (dropped spurious kink at t=0.11902)
+    (dropped spurious kink at t=0.119215)
+    (dropped spurious kink at t=0.119606)
+    (dropped spurious kink at t=0.120388)
+    (dropped spurious kink at t=0.121951)
+    (dropped spurious kink at t=0.125078)
+    (dropped spurious kink at t=0.150094)
+    (dropped spurious kink at t=0.173961)
+    (dropped spurious kink at t=0.173986)
+    (dropped spurious kink at t=0.174035)
+    (dropped spurious kink at t=0.174132)
+    (dropped spurious kink at t=0.174328)
+    (dropped spurious kink at t=0.175109)
+    (dropped spurious kink at t=0.200125)
+    (dropped spurious kink at t=0.40025)
+    (dropped spurious kink at t=0.484287)
+    (dropped spurious kink at t=0.484678)
+    (dropped spurious kink at t=0.487805)
+    (dropped spurious kink at t=0.500313)
+    (dropped spurious kink at t=0.507177)
+    (dropped spurious kink at t=0.507202)
+    (dropped spurious kink at t=0.507251)
+    (dropped spurious kink at t=0.507348)
+    (dropped spurious kink at t=0.50813)
+    (dropped spurious kink at t=0.509694)
+    (dropped spurious kink at t=0.512821)
+    (dropped spurious kink at t=0.514671)
+    (dropped spurious kink at t=0.514677)
+    (dropped spurious kink at t=0.514775)
+    (dropped spurious kink at t=0.515166)
+    (dropped spurious kink at t=0.515947)
+    (dropped spurious kink at t=0.519074)
+    (dropped spurious kink at t=0.525328)
+    (dropped spurious kink at t=0.550344)
+    (dropped spurious kink at t=0.551697)
+    (dropped spurious kink at t=0.5517)
+    (dropped spurious kink at t=0.551712)
+    (dropped spurious kink at t=0.551907)
+    (dropped spurious kink at t=0.553471)
+    (dropped spurious kink at t=0.556598)
+    (dropped spurious kink at t=0.562852)
+    (dropped spurious kink at t=0.57536)
+    (dropped spurious kink at t=0.600375)
+    (dropped spurious kink at t=0.692652)
+    (dropped spurious kink at t=0.692654)
+    (dropped spurious kink at t=0.692657)
+    (dropped spurious kink at t=0.692669)
+    (dropped spurious kink at t=0.692718)
+    (dropped spurious kink at t=0.692816)
+    (dropped spurious kink at t=0.693011)
+    (dropped spurious kink at t=0.693402)
+    (dropped spurious kink at t=0.694184)
+    (dropped spurious kink at t=0.700438)
+    (dropped spurious kink at t=0.728518)
+    (dropped spurious kink at t=0.728519)
+    (dropped spurious kink at t=0.728532)
+    (dropped spurious kink at t=0.72858)
+    (dropped spurious kink at t=0.731707)
+    (dropped spurious kink at t=0.737961)
+    (dropped spurious kink at t=0.750469)
+    (dropped spurious kink at t=0.8005)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.08901)
+    (dropped spurious kink at t=1.08906)
+    (dropped spurious kink at t=1.08916)
+    (dropped spurious kink at t=1.08935)
+    (dropped spurious kink at t=1.08974)
+    (dropped spurious kink at t=1.09131)
+    (dropped spurious kink at t=1.09443)
+    (dropped spurious kink at t=1.10069)
+    (dropped spurious kink at t=1.20075)
+    (dropped spurious kink at t=1.2674)
+    (dropped spurious kink at t=1.26741)
+    (dropped spurious kink at t=1.26742)
+    (dropped spurious kink at t=1.26744)
+    (dropped spurious kink at t=1.26749)
+    (dropped spurious kink at t=1.26759)
+    (dropped spurious kink at t=1.26798)
+    (dropped spurious kink at t=1.26954)
+    (dropped spurious kink at t=1.2758)
+    (dropped spurious kink at t=1.30081)
+    (dropped spurious kink at t=1.40088)
+    (dropped spurious kink at t=1.601)
+    (dropped spurious kink at t=1.67273)
+    (dropped spurious kink at t=1.67292)
+    (dropped spurious kink at t=1.67605)
+    (dropped spurious kink at t=1.70106)
+    (dropped spurious kink at t=1.80113)
+    (dropped spurious kink at t=2.00125)
+    (dropped spurious kink at t=2.4015)
+    (dropped spurious kink at t=3.202)
+    (dropped spurious kink at t=4.0595)
+    (dropped spurious kink at t=4.05951)
+    (dropped spurious kink at t=4.05952)
+    (dropped spurious kink at t=4.05957)
+    (dropped spurious kink at t=4.06035)
+    (dropped spurious kink at t=4.06191)
+    (dropped spurious kink at t=4.06504)
+    (dropped spurious kink at t=4.07755)
+    (dropped spurious kink at t=4.10256)
+    (dropped spurious kink at t=4.20263)
+    (dropped spurious kink at t=4.40275)
+    (dropped spurious kink at t=4.803)
+    (dropped spurious kink at t=6.404)
+    (dropped spurious kink at t=7.56132)
+    (dropped spurious kink at t=7.56137)
+    (dropped spurious kink at t=7.56176)
+    (dropped spurious kink at t=7.56254)
+    (dropped spurious kink at t=7.5641)
+    (dropped spurious kink at t=7.56723)
+    (dropped spurious kink at t=7.57974)
+    (dropped spurious kink at t=7.60475)
+    (dropped spurious kink at t=8.005)
+    (dropped spurious kink at t=-1.88528)
+    (dropped spurious kink at t=-1.88527)
+    (dropped spurious kink at t=-1.88526)
+    (dropped spurious kink at t=-1.88524)
+    (dropped spurious kink at t=-1.88493)
+    (dropped spurious kink at t=-1.88368)
+    (dropped spurious kink at t=-1.88118)
+    (dropped spurious kink at t=-1.84115)
+    (dropped spurious kink at t=-1.7611)
+    (dropped spurious kink at t=-1.601)
+    (dropped spurious kink at t=-1.2808)
+    (dropped spurious kink at t=-0.740099)
+    (dropped spurious kink at t=-0.740096)
+    (dropped spurious kink at t=-0.740091)
+    (dropped spurious kink at t=-0.740072)
+    (dropped spurious kink at t=-0.739994)
+    (dropped spurious kink at t=-0.739837)
+    (dropped spurious kink at t=-0.739212)
+    (dropped spurious kink at t=-0.737961)
+    (dropped spurious kink at t=-0.73546)
+    (dropped spurious kink at t=-0.730457)
+    (dropped spurious kink at t=-0.72045)
+    (dropped spurious kink at t=-0.6404)
+    (dropped spurious kink at t=-0.495857)
+    (dropped spurious kink at t=-0.495779)
+    (dropped spurious kink at t=-0.495622)
+    (dropped spurious kink at t=-0.49531)
+    (dropped spurious kink at t=-0.490306)
+    (dropped spurious kink at t=-0.4803)
+    (dropped spurious kink at t=-0.3202)
+    (dropped spurious kink at t=-0.212276)
+    (dropped spurious kink at t=-0.212271)
+    (dropped spurious kink at t=-0.212262)
+    (dropped spurious kink at t=-0.212242)
+    (dropped spurious kink at t=-0.212164)
+    (dropped spurious kink at t=-0.212008)
+    (dropped spurious kink at t=-0.211382)
+    (dropped spurious kink at t=-0.210131)
+    (dropped spurious kink at t=-0.200125)
+    (dropped spurious kink at t=-0.1601)
+    (dropped spurious kink at t=-0.121132)
+    (dropped spurious kink at t=-0.12113)
+    (dropped spurious kink at t=-0.121091)
+    (dropped spurious kink at t=-0.121013)
+    (dropped spurious kink at t=-0.1207)
+    (dropped spurious kink at t=-0.120075)
+    (dropped spurious kink at t=-0.08005)
+    (dropped spurious kink at t=-0.0217508)
+    (dropped spurious kink at t=-0.0217494)
+    (dropped spurious kink at t=-0.021747)
+    (dropped spurious kink at t=-0.0217421)
+    (dropped spurious kink at t=-0.0217323)
+    (dropped spurious kink at t=-0.021576)
+    (dropped spurious kink at t=-0.0212633)
+    (dropped spurious kink at t=-0.0200125)
+    (dropped spurious kink at t=-2.27374e-13)
+    (dropped spurious kink at t=0.0309898)
+    (dropped spurious kink at t=0.030991)
+    (dropped spurious kink at t=0.0309959)
+    (dropped spurious kink at t=0.031035)
+    (dropped spurious kink at t=0.0311132)
+    (dropped spurious kink at t=0.0312695)
+    (dropped spurious kink at t=0.0325203)
+    (dropped spurious kink at t=0.0350219)
+    (dropped spurious kink at t=0.040025)
+    (dropped spurious kink at t=0.08005)
+    (dropped spurious kink at t=0.119006)
+    (dropped spurious kink at t=0.119007)
+    (dropped spurious kink at t=0.11901)
+    (dropped spurious kink at t=0.11902)
+    (dropped spurious kink at t=0.119059)
+    (dropped spurious kink at t=0.119137)
+    (dropped spurious kink at t=0.11945)
+    (dropped spurious kink at t=0.120075)
+    (dropped spurious kink at t=0.1601)
+    (dropped spurious kink at t=0.173959)
+    (dropped spurious kink at t=0.173961)
+    (dropped spurious kink at t=0.173966)
+    (dropped spurious kink at t=0.173976)
+    (dropped spurious kink at t=0.174015)
+    (dropped spurious kink at t=0.174171)
+    (dropped spurious kink at t=0.174484)
+    (dropped spurious kink at t=0.175109)
+    (dropped spurious kink at t=0.180113)
+    (dropped spurious kink at t=0.200125)
+    (dropped spurious kink at t=0.24015)
+    (dropped spurious kink at t=0.3202)
+    (dropped spurious kink at t=0.484287)
+    (dropped spurious kink at t=0.484365)
+    (dropped spurious kink at t=0.484678)
+    (dropped spurious kink at t=0.485303)
+    (dropped spurious kink at t=0.490306)
+    (dropped spurious kink at t=0.500313)
+    (dropped spurious kink at t=0.507165)
+    (dropped spurious kink at t=0.507168)
+    (dropped spurious kink at t=0.507172)
+    (dropped spurious kink at t=0.507192)
+    (dropped spurious kink at t=0.507817)
+    (dropped spurious kink at t=0.510319)
+    (dropped spurious kink at t=0.514669)
+    (dropped spurious kink at t=0.514672)
+    (dropped spurious kink at t=0.514677)
+    (dropped spurious kink at t=0.514697)
+    (dropped spurious kink at t=0.515322)
+    (dropped spurious kink at t=0.520325)
+    (dropped spurious kink at t=0.551697)
+    (dropped spurious kink at t=0.551702)
+    (dropped spurious kink at t=0.551712)
+    (dropped spurious kink at t=0.551751)
+    (dropped spurious kink at t=0.551907)
+    (dropped spurious kink at t=0.55222)
+    (dropped spurious kink at t=0.552846)
+    (dropped spurious kink at t=0.555347)
+    (dropped spurious kink at t=0.56035)
+    (dropped spurious kink at t=0.6404)
+    (dropped spurious kink at t=0.692652)
+    (dropped spurious kink at t=0.692655)
+    (dropped spurious kink at t=0.692659)
+    (dropped spurious kink at t=0.692699)
+    (dropped spurious kink at t=0.692777)
+    (dropped spurious kink at t=0.692933)
+    (dropped spurious kink at t=0.695435)
+    (dropped spurious kink at t=0.700438)
+    (dropped spurious kink at t=0.72045)
+    (dropped spurious kink at t=0.728522)
+    (dropped spurious kink at t=0.728541)
+    (dropped spurious kink at t=0.72858)
+    (dropped spurious kink at t=0.729206)
+    (dropped spurious kink at t=0.730457)
+    (dropped spurious kink at t=0.740463)
+    (dropped spurious kink at t=0.760475)
+    (dropped spurious kink at t=0.8005)
+    (dropped spurious kink at t=0.9606)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.08904)
+    (dropped spurious kink at t=1.08912)
+    (dropped spurious kink at t=1.08943)
+    (dropped spurious kink at t=1.09068)
+    (dropped spurious kink at t=1.10069)
+    (dropped spurious kink at t=1.1207)
+    (dropped spurious kink at t=1.2674)
+    (dropped spurious kink at t=1.2674)
+    (dropped spurious kink at t=1.26741)
+    (dropped spurious kink at t=1.26743)
+    (dropped spurious kink at t=1.26751)
+    (dropped spurious kink at t=1.26767)
+    (dropped spurious kink at t=1.26829)
+    (dropped spurious kink at t=1.27079)
+    (dropped spurious kink at t=1.2808)
+    (dropped spurious kink at t=1.67265)
+    (dropped spurious kink at t=1.67269)
+    (dropped spurious kink at t=1.67276)
+    (dropped spurious kink at t=1.67292)
+    (dropped spurious kink at t=1.67355)
+    (dropped spurious kink at t=1.67605)
+    (dropped spurious kink at t=1.68105)
+    (dropped spurious kink at t=1.7611)
+    (dropped spurious kink at t=1.9212)
+    (dropped spurious kink at t=2.5616)
+    (dropped spurious kink at t=4.05951)
+    (dropped spurious kink at t=4.05953)
+    (dropped spurious kink at t=4.05957)
+    (dropped spurious kink at t=4.05972)
+    (dropped spurious kink at t=4.06004)
+    (dropped spurious kink at t=4.06254)
+    (dropped spurious kink at t=4.08255)
+    (dropped spurious kink at t=4.1626)
+    (dropped spurious kink at t=4.4828)
+    (dropped spurious kink at t=5.1232)
+    (dropped spurious kink at t=7.5613)
+    (dropped spurious kink at t=7.56131)
+    (dropped spurious kink at t=7.56133)
+    (dropped spurious kink at t=7.56137)
+    (dropped spurious kink at t=7.56144)
+    (dropped spurious kink at t=7.5616)
+    (dropped spurious kink at t=7.56223)
+    (dropped spurious kink at t=7.56473)
+    (dropped spurious kink at t=7.60475)
+    (dropped spurious kink at t=7.6848)
+    (dropped spurious kink at t=-1.88526)
+    (dropped spurious kink at t=-1.8852)
+    (dropped spurious kink at t=-1.88508)
+    (dropped spurious kink at t=-1.88462)
+    (dropped spurious kink at t=-1.88368)
+    (dropped spurious kink at t=-1.87617)
+    (dropped spurious kink at t=-1.86116)
+    (dropped spurious kink at t=-1.80113)
+    (dropped spurious kink at t=-1.68105)
+    (dropped spurious kink at t=-1.4409)
+    (dropped spurious kink at t=-0.9606)
+    (dropped spurious kink at t=-0.740099)
+    (dropped spurious kink at t=-0.740091)
+    (dropped spurious kink at t=-0.740033)
+    (dropped spurious kink at t=-0.739916)
+    (dropped spurious kink at t=-0.739681)
+    (dropped spurious kink at t=-0.739212)
+    (dropped spurious kink at t=-0.73546)
+    (dropped spurious kink at t=-0.72045)
+    (dropped spurious kink at t=-0.495867)
+    (dropped spurious kink at t=-0.495837)
+    (dropped spurious kink at t=-0.495779)
+    (dropped spurious kink at t=-0.49531)
+    (dropped spurious kink at t=-0.4803)
+    (dropped spurious kink at t=-0.212277)
+    (dropped spurious kink at t=-0.212275)
+    (dropped spurious kink at t=-0.212271)
+    (dropped spurious kink at t=-0.212242)
+    (dropped spurious kink at t=-0.212008)
+    (dropped spurious kink at t=-0.210131)
+    (dropped spurious kink at t=-0.180113)
+    (dropped spurious kink at t=-0.121132)
+    (dropped spurious kink at t=-0.12113)
+    (dropped spurious kink at t=-0.121013)
+    (dropped spurious kink at t=-0.120075)
+    (dropped spurious kink at t=-0.0217511)
+    (dropped spurious kink at t=-0.02175)
+    (dropped spurious kink at t=-0.0217482)
+    (dropped spurious kink at t=-0.0217445)
+    (dropped spurious kink at t=-0.0217372)
+    (dropped spurious kink at t=-0.0217226)
+    (dropped spurious kink at t=-0.0216932)
+    (dropped spurious kink at t=-0.021576)
+    (dropped spurious kink at t=-0.0206379)
+    (dropped spurious kink at t=-0.0187617)
+    (dropped spurious kink at t=-0.0150094)
+    (dropped spurious kink at t=0)
+    (dropped spurious kink at t=0.0309935)
+    (dropped spurious kink at t=0.0310008)
+    (dropped spurious kink at t=0.0310155)
+    (dropped spurious kink at t=0.0310741)
+    (dropped spurious kink at t=0.0311914)
+    (dropped spurious kink at t=0.0314259)
+    (dropped spurious kink at t=0.0318949)
+    (dropped spurious kink at t=0.0337711)
+    (dropped spurious kink at t=0.0375235)
+    (dropped spurious kink at t=0.0450281)
+    (dropped spurious kink at t=0.0600375)
+    (dropped spurious kink at t=0.119007)
+    (dropped spurious kink at t=0.119009)
+    (dropped spurious kink at t=0.119012)
+    (dropped spurious kink at t=0.11902)
+    (dropped spurious kink at t=0.119137)
+    (dropped spurious kink at t=0.120075)
+    (dropped spurious kink at t=0.173958)
+    (dropped spurious kink at t=0.17396)
+    (dropped spurious kink at t=0.173964)
+    (dropped spurious kink at t=0.173971)
+    (dropped spurious kink at t=0.173986)
+    (dropped spurious kink at t=0.174015)
+    (dropped spurious kink at t=0.174484)
+    (dropped spurious kink at t=0.17636)
+    (dropped spurious kink at t=0.180113)
+    (dropped spurious kink at t=0.24015)
+    (dropped spurious kink at t=0.4803)
+    (dropped spurious kink at t=0.484281)
+    (dropped spurious kink at t=0.484283)
+    (dropped spurious kink at t=0.484287)
+    (dropped spurious kink at t=0.484522)
+    (dropped spurious kink at t=0.484991)
+    (dropped spurious kink at t=0.485929)
+    (dropped spurious kink at t=0.487805)
+    (dropped spurious kink at t=0.49531)
+    (dropped spurious kink at t=0.507165)
+    (dropped spurious kink at t=0.507168)
+    (dropped spurious kink at t=0.507182)
+    (dropped spurious kink at t=0.507212)
+    (dropped spurious kink at t=0.50727)
+    (dropped spurious kink at t=0.507505)
+    (dropped spurious kink at t=0.508443)
+    (dropped spurious kink at t=0.510319)
+    (dropped spurious kink at t=0.514672)
+    (dropped spurious kink at t=0.514687)
+    (dropped spurious kink at t=0.514716)
+    (dropped spurious kink at t=0.514775)
+    (dropped spurious kink at t=0.515009)
+    (dropped spurious kink at t=0.515947)
+    (dropped spurious kink at t=0.517824)
+    (dropped spurious kink at t=0.525328)
+    (dropped spurious kink at t=0.540338)
+    (dropped spurious kink at t=0.551695)
+    (dropped spurious kink at t=0.551697)
+    (dropped spurious kink at t=0.551712)
+    (dropped spurious kink at t=0.551829)
+    (dropped spurious kink at t=0.552064)
+    (dropped spurious kink at t=0.552533)
+    (dropped spurious kink at t=0.553471)
+    (dropped spurious kink at t=0.555347)
+    (dropped spurious kink at t=0.570356)
+    (dropped spurious kink at t=0.600375)
+    (dropped spurious kink at t=0.692659)
+    (dropped spurious kink at t=0.692777)
+    (dropped spurious kink at t=0.693246)
+    (dropped spurious kink at t=0.694184)
+    (dropped spurious kink at t=0.697936)
+    (dropped spurious kink at t=0.705441)
+    (dropped spurious kink at t=0.72045)
+    (dropped spurious kink at t=0.728517)
+    (dropped spurious kink at t=0.728519)
+    (dropped spurious kink at t=0.728527)
+    (dropped spurious kink at t=0.728541)
+    (dropped spurious kink at t=0.728659)
+    (dropped spurious kink at t=0.728893)
+    (dropped spurious kink at t=0.729831)
+    (dropped spurious kink at t=0.731707)
+    (dropped spurious kink at t=0.73546)
+    (dropped spurious kink at t=0.750469)
+    (dropped spurious kink at t=0.780488)
+    (dropped spurious kink at t=0.840525)
+    (dropped spurious kink at t=0.9606)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.089)
+    (dropped spurious kink at t=1.08912)
+    (dropped spurious kink at t=1.09006)
+    (dropped spurious kink at t=1.09193)
+    (dropped spurious kink at t=1.09568)
+    (dropped spurious kink at t=1.11069)
+    (dropped spurious kink at t=1.14071)
+    (dropped spurious kink at t=1.20075)
+    (dropped spurious kink at t=1.2674)
+    (dropped spurious kink at t=1.26741)
+    (dropped spurious kink at t=1.26741)
+    (dropped spurious kink at t=1.26747)
+    (dropped spurious kink at t=1.26759)
+    (dropped spurious kink at t=1.26782)
+    (dropped spurious kink at t=1.26829)
+    (dropped spurious kink at t=1.2758)
+    (dropped spurious kink at t=1.29081)
+    (dropped spurious kink at t=1.32083)
+    (dropped spurious kink at t=1.4409)
+    (dropped spurious kink at t=1.67263)
+    (dropped spurious kink at t=1.67264)
+    (dropped spurious kink at t=1.67267)
+    (dropped spurious kink at t=1.67273)
+    (dropped spurious kink at t=1.67284)
+    (dropped spurious kink at t=1.67308)
+    (dropped spurious kink at t=1.67355)
+    (dropped spurious kink at t=1.68105)
+    (dropped spurious kink at t=1.9212)
+    (dropped spurious kink at t=3.8424)
+    (dropped spurious kink at t=4.0595)
+    (dropped spurious kink at t=4.05951)
+    (dropped spurious kink at t=4.05957)
+    (dropped spurious kink at t=4.06004)
+    (dropped spurious kink at t=4.06754)
+    (dropped spurious kink at t=4.08255)
+    (dropped spurious kink at t=4.3227)
+    (dropped spurious kink at t=4.803)
+    (dropped spurious kink at t=5.7636)
+    (dropped spurious kink at t=7.56133)
+    (dropped spurious kink at t=7.56144)
+    (dropped spurious kink at t=7.56191)
+    (dropped spurious kink at t=7.56285)
+    (dropped spurious kink at t=7.56473)
+    (dropped spurious kink at t=7.6848)
+    (dropped spurious kink at t=15.3696)
+scanning line 2: x0 = 0.5*u
+    (dropped spurious kink at t=-0.912276)
+    (dropped spurious kink at t=-0.912274)
+    (dropped spurious kink at t=-0.91226)
+    (dropped spurious kink at t=-0.91223)
+    (dropped spurious kink at t=-0.912172)
+    (dropped spurious kink at t=-0.912054)
+    (dropped spurious kink at t=-0.91182)
+    (dropped spurious kink at t=-0.493707)
+    (dropped spurious kink at t=-0.49359)
+    (dropped spurious kink at t=-0.493121)
+    (dropped spurious kink at t=-0.319263)
+    (dropped spurious kink at t=-0.319261)
+    (dropped spurious kink at t=-0.319257)
+    (dropped spurious kink at t=-0.319242)
+    (dropped spurious kink at t=-0.319184)
+    (dropped spurious kink at t=-0.318949)
+    (dropped spurious kink at t=-0.108494)
+    (dropped spurious kink at t=-0.108492)
+    (dropped spurious kink at t=-0.108488)
+    (dropped spurious kink at t=-0.108481)
+    (dropped spurious kink at t=-0.108466)
+    (dropped spurious kink at t=-0.108349)
+    (dropped spurious kink at t=-0.10788)
+    (dropped spurious kink at t=-0.0582098)
+    (dropped spurious kink at t=-0.0582078)
+    (dropped spurious kink at t=-0.0582004)
+    (dropped spurious kink at t=-0.0580832)
+    (dropped spurious kink at t=-0.0578487)
+    (dropped spurious kink at t=0.205267)
+    (dropped spurious kink at t=0.205275)
+    (dropped spurious kink at t=0.205304)
+    (dropped spurious kink at t=0.205363)
+    (dropped spurious kink at t=0.205597)
+    (dropped spurious kink at t=0.206066)
+    (dropped spurious kink at t=0.557315)
+    (dropped spurious kink at t=0.557317)
+    (dropped spurious kink at t=0.557321)
+    (dropped spurious kink at t=0.55738)
+    (dropped spurious kink at t=0.557849)
+    (dropped spurious kink at t=0.617765)
+    (dropped spurious kink at t=0.617769)
+    (dropped spurious kink at t=0.617886)
+    (dropped spurious kink at t=0.63354)
+    (dropped spurious kink at t=0.633599)
+    (dropped spurious kink at t=0.633834)
+    (dropped spurious kink at t=0.891088)
+    (dropped spurious kink at t=0.891092)
+    (dropped spurious kink at t=0.891099)
+    (dropped spurious kink at t=0.891114)
+    (dropped spurious kink at t=0.891143)
+    (dropped spurious kink at t=0.89126)
+    (dropped spurious kink at t=0.891495)
+    (dropped spurious kink at t=-2.22156)
+    (dropped spurious kink at t=-2.22156)
+    (dropped spurious kink at t=-2.22155)
+    (dropped spurious kink at t=-2.22154)
+    (dropped spurious kink at t=-2.22152)
+    (dropped spurious kink at t=-2.22147)
+    (dropped spurious kink at t=-2.22108)
+    (dropped spurious kink at t=-2.21951)
+    (dropped spurious kink at t=-2.21639)
+    (dropped spurious kink at t=-2.21053)
+    (dropped spurious kink at t=-2.21052)
+    (dropped spurious kink at t=-2.21013)
+    (dropped spurious kink at t=-1.82974)
+    (dropped spurious kink at t=-1.82927)
+    (dropped spurious kink at t=-1.82739)
+    (dropped spurious kink at t=-0.912269)
+    (dropped spurious kink at t=-0.912211)
+    (dropped spurious kink at t=-0.911976)
+    (dropped spurious kink at t=-0.911507)
+    (dropped spurious kink at t=-0.910569)
+    (dropped spurious kink at t=-0.493736)
+    (dropped spurious kink at t=-0.493734)
+    (dropped spurious kink at t=-0.493727)
+    (dropped spurious kink at t=-0.493668)
+    (dropped spurious kink at t=-0.493433)
+    (dropped spurious kink at t=-0.491557)
+    (dropped spurious kink at t=-0.318324)
+    (dropped spurious kink at t=-0.316448)
+    (dropped spurious kink at t=-0.108486)
+    (dropped spurious kink at t=-0.108427)
+    (dropped spurious kink at t=-0.108193)
+    (dropped spurious kink at t=-0.106316)
+    (dropped spurious kink at t=-0.058209)
+    (dropped spurious kink at t=-0.0582053)
+    (dropped spurious kink at t=-0.0581907)
+    (dropped spurious kink at t=-0.0581614)
+    (dropped spurious kink at t=-0.0562852)
+    (dropped spurious kink at t=0.205267)
+    (dropped spurious kink at t=0.205275)
+    (dropped spurious kink at t=0.205304)
+    (dropped spurious kink at t=0.205363)
+    (dropped spurious kink at t=0.205597)
+    (dropped spurious kink at t=0.206066)
+    (dropped spurious kink at t=0.207004)
+    (dropped spurious kink at t=0.208881)
+    (dropped spurious kink at t=0.557319)
+    (dropped spurious kink at t=0.557326)
+    (dropped spurious kink at t=0.557341)
+    (dropped spurious kink at t=0.557458)
+    (dropped spurious kink at t=0.557692)
+    (dropped spurious kink at t=0.558161)
+    (dropped spurious kink at t=0.559099)
+    (dropped spurious kink at t=0.617765)
+    (dropped spurious kink at t=0.617766)
+    (dropped spurious kink at t=0.617774)
+    (dropped spurious kink at t=0.617788)
+    (dropped spurious kink at t=0.617847)
+    (dropped spurious kink at t=0.617964)
+    (dropped spurious kink at t=0.618199)
+    (dropped spurious kink at t=0.619137)
+    (dropped spurious kink at t=0.633514)
+    (dropped spurious kink at t=0.633521)
+    (dropped spurious kink at t=0.635397)
+    (dropped spurious kink at t=0.891088)
+    (dropped spurious kink at t=0.891092)
+    (dropped spurious kink at t=0.891099)
+    (dropped spurious kink at t=0.891114)
+    (dropped spurious kink at t=0.891143)
+    (dropped spurious kink at t=0.89126)
+    (dropped spurious kink at t=0.891495)
+    (dropped spurious kink at t=0.892433)
+    (dropped spurious kink at t=0.894309)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35048)
+    (dropped spurious kink at t=1.35049)
+    (dropped spurious kink at t=1.35061)
+    (dropped spurious kink at t=1.35084)
+    (dropped spurious kink at t=1.93919)
+    (dropped spurious kink at t=1.93922)
+    (dropped spurious kink at t=1.93934)
+    (dropped spurious kink at t=1.94121)
+    (dropped spurious kink at t=2.22118)
+    (dropped spurious kink at t=2.22121)
+    (dropped spurious kink at t=2.22127)
+    (dropped spurious kink at t=2.22139)
+    (dropped spurious kink at t=2.54895)
+    (dropped spurious kink at t=2.54897)
+    (dropped spurious kink at t=2.549)
+    (dropped spurious kink at t=2.54905)
+    (dropped spurious kink at t=2.54917)
+    (dropped spurious kink at t=2.54941)
+    (dropped spurious kink at t=2.55034)
+    (dropped spurious kink at t=3.46076)
+    (dropped spurious kink at t=3.46123)
+    (dropped spurious kink at t=3.46216)
+    (dropped spurious kink at t=-5.53997)
+    (dropped spurious kink at t=-5.53996)
+    (dropped spurious kink at t=-5.53995)
+    (dropped spurious kink at t=-5.53971)
+    (dropped spurious kink at t=-5.53596)
+    (dropped spurious kink at t=-5.52846)
+    (dropped spurious kink at t=-2.22156)
+    (dropped spurious kink at t=-2.22155)
+    (dropped spurious kink at t=-2.22154)
+    (dropped spurious kink at t=-2.22139)
+    (dropped spurious kink at t=-2.21138)
+    (dropped spurious kink at t=-2.21052)
+    (dropped spurious kink at t=-2.21044)
+    (dropped spurious kink at t=-2.21013)
+    (dropped spurious kink at t=-2.20888)
+    (dropped spurious kink at t=-2.20638)
+    (dropped spurious kink at t=-2.20138)
+    (dropped spurious kink at t=-2.19137)
+    (dropped spurious kink at t=-1.82997)
+    (dropped spurious kink at t=-1.82996)
+    (dropped spurious kink at t=-1.82993)
+    (dropped spurious kink at t=-1.82982)
+    (dropped spurious kink at t=-1.82958)
+    (dropped spurious kink at t=-1.82864)
+    (dropped spurious kink at t=-1.82114)
+    (dropped spurious kink at t=-0.912276)
+    (dropped spurious kink at t=-0.912272)
+    (dropped spurious kink at t=-0.912265)
+    (dropped spurious kink at t=-0.91225)
+    (dropped spurious kink at t=-0.912133)
+    (dropped spurious kink at t=-0.911194)
+    (dropped spurious kink at t=-0.909318)
+    (dropped spurious kink at t=-0.905566)
+    (dropped spurious kink at t=-0.493735)
+    (dropped spurious kink at t=-0.493731)
+    (dropped spurious kink at t=-0.493717)
+    (dropped spurious kink at t=-0.493687)
+    (dropped spurious kink at t=-0.493629)
+    (dropped spurious kink at t=-0.493512)
+    (dropped spurious kink at t=-0.493277)
+    (dropped spurious kink at t=-0.492808)
+    (dropped spurious kink at t=-0.485303)
+    (dropped spurious kink at t=-0.318324)
+    (dropped spurious kink at t=-0.316448)
+    (dropped spurious kink at t=-0.312695)
+    (dropped spurious kink at t=-0.305191)
+    (dropped spurious kink at t=-0.108494)
+    (dropped spurious kink at t=-0.108492)
+    (dropped spurious kink at t=-0.108486)
+    (dropped spurious kink at t=-0.108388)
+    (dropped spurious kink at t=-0.108193)
+    (dropped spurious kink at t=-0.105066)
+    (dropped spurious kink at t=-0.08005)
+    (dropped spurious kink at t=-0.0581614)
+    (dropped spurious kink at t=-0.0550344)
+    (dropped spurious kink at t=0.20527)
+    (dropped spurious kink at t=0.205285)
+    (dropped spurious kink at t=0.205754)
+    (dropped spurious kink at t=0.20763)
+    (dropped spurious kink at t=0.215134)
+    (dropped spurious kink at t=0.55735)
+    (dropped spurious kink at t=0.557419)
+    (dropped spurious kink at t=0.557692)
+    (dropped spurious kink at t=0.558787)
+    (dropped spurious kink at t=0.560976)
+    (dropped spurious kink at t=0.565353)
+    (dropped spurious kink at t=0.600375)
+    (dropped spurious kink at t=0.617766)
+    (dropped spurious kink at t=0.617784)
+    (dropped spurious kink at t=0.617818)
+    (dropped spurious kink at t=0.617886)
+    (dropped spurious kink at t=0.633512)
+    (dropped spurious kink at t=0.633516)
+    (dropped spurious kink at t=0.63355)
+    (dropped spurious kink at t=0.633619)
+    (dropped spurious kink at t=0.633755)
+    (dropped spurious kink at t=0.634303)
+    (dropped spurious kink at t=0.635397)
+    (dropped spurious kink at t=0.891094)
+    (dropped spurious kink at t=0.891123)
+    (dropped spurious kink at t=0.891182)
+    (dropped spurious kink at t=0.893058)
+    (dropped spurious kink at t=0.900563)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35048)
+    (dropped spurious kink at t=1.35048)
+    (dropped spurious kink at t=1.35051)
+    (dropped spurious kink at t=1.35057)
+    (dropped spurious kink at t=1.35069)
+    (dropped spurious kink at t=1.35116)
+    (dropped spurious kink at t=1.3521)
+    (dropped spurious kink at t=1.35585)
+    (dropped spurious kink at t=1.93919)
+    (dropped spurious kink at t=1.93922)
+    (dropped spurious kink at t=1.93934)
+    (dropped spurious kink at t=1.94121)
+    (dropped spurious kink at t=2.22118)
+    (dropped spurious kink at t=2.22121)
+    (dropped spurious kink at t=2.22127)
+    (dropped spurious kink at t=2.22139)
+    (dropped spurious kink at t=2.54895)
+    (dropped spurious kink at t=2.54895)
+    (dropped spurious kink at t=2.54896)
+    (dropped spurious kink at t=2.54898)
+    (dropped spurious kink at t=2.54909)
+    (dropped spurious kink at t=2.5566)
+    (dropped spurious kink at t=3.46076)
+    (dropped spurious kink at t=3.46123)
+    (dropped spurious kink at t=3.46216)
+    (dropped spurious kink at t=11.6604)
+    (dropped spurious kink at t=11.6604)
+    (dropped spurious kink at t=11.6605)
+    (dropped spurious kink at t=11.6607)
+    (dropped spurious kink at t=11.6617)
+    (dropped spurious kink at t=11.6635)
+    (dropped spurious kink at t=11.6673)
+    (dropped spurious kink at t=-5.53996)
+    (dropped spurious kink at t=-5.53993)
+    (dropped spurious kink at t=-5.53987)
+    (dropped spurious kink at t=-5.5394)
+    (dropped spurious kink at t=-5.53846)
+    (dropped spurious kink at t=-5.52345)
+    (dropped spurious kink at t=-2.22155)
+    (dropped spurious kink at t=-2.22153)
+    (dropped spurious kink at t=-2.22147)
+    (dropped spurious kink at t=-2.22123)
+    (dropped spurious kink at t=-2.22076)
+    (dropped spurious kink at t=-2.21889)
+    (dropped spurious kink at t=-2.21138)
+    (dropped spurious kink at t=-2.21053)
+    (dropped spurious kink at t=-2.21052)
+    (dropped spurious kink at t=-2.2105)
+    (dropped spurious kink at t=-2.21044)
+    (dropped spurious kink at t=-2.20951)
+    (dropped spurious kink at t=-2.20763)
+    (dropped spurious kink at t=-2.20388)
+    (dropped spurious kink at t=-2.19637)
+    (dropped spurious kink at t=-2.18136)
+    (dropped spurious kink at t=-1.82997)
+    (dropped spurious kink at t=-1.82997)
+    (dropped spurious kink at t=-1.82995)
+    (dropped spurious kink at t=-1.82989)
+    (dropped spurious kink at t=-1.82614)
+    (dropped spurious kink at t=-1.81113)
+    (dropped spurious kink at t=-1.78111)
+    (dropped spurious kink at t=-0.912269)
+    (dropped spurious kink at t=-0.912211)
+    (dropped spurious kink at t=-0.911976)
+    (dropped spurious kink at t=-0.911507)
+    (dropped spurious kink at t=-0.910569)
+    (dropped spurious kink at t=-0.88055)
+    (dropped spurious kink at t=-0.493727)
+    (dropped spurious kink at t=-0.493707)
+    (dropped spurious kink at t=-0.493668)
+    (dropped spurious kink at t=-0.49359)
+    (dropped spurious kink at t=-0.493433)
+    (dropped spurious kink at t=-0.492808)
+    (dropped spurious kink at t=-0.490306)
+    (dropped spurious kink at t=-0.4803)
+    (dropped spurious kink at t=-0.440275)
+    (dropped spurious kink at t=-0.318949)
+    (dropped spurious kink at t=-0.317699)
+    (dropped spurious kink at t=-0.315197)
+    (dropped spurious kink at t=-0.310194)
+    (dropped spurious kink at t=-0.300188)
+    (dropped spurious kink at t=-0.280175)
+    (dropped spurious kink at t=-0.108493)
+    (dropped spurious kink at t=-0.108491)
+    (dropped spurious kink at t=-0.108486)
+    (dropped spurious kink at t=-0.108466)
+    (dropped spurious kink at t=-0.108427)
+    (dropped spurious kink at t=-0.108349)
+    (dropped spurious kink at t=-0.108193)
+    (dropped spurious kink at t=-0.107567)
+    (dropped spurious kink at t=-0.105066)
+    (dropped spurious kink at t=-0.100063)
+    (dropped spurious kink at t=-0.08005)
+    (dropped spurious kink at t=-0.0582004)
+    (dropped spurious kink at t=-0.0581614)
+    (dropped spurious kink at t=-0.057536)
+    (dropped spurious kink at t=-0.0550344)
+    (dropped spurious kink at t=-0.0500313)
+    (dropped spurious kink at t=-0.040025)
+    (dropped spurious kink at t=0.205267)
+    (dropped spurious kink at t=0.205269)
+    (dropped spurious kink at t=0.205272)
+    (dropped spurious kink at t=0.20528)
+    (dropped spurious kink at t=0.205294)
+    (dropped spurious kink at t=0.205324)
+    (dropped spurious kink at t=0.205441)
+    (dropped spurious kink at t=0.206379)
+    (dropped spurious kink at t=0.210131)
+    (dropped spurious kink at t=0.24015)
+    (dropped spurious kink at t=0.557315)
+    (dropped spurious kink at t=0.55732)
+    (dropped spurious kink at t=0.557328)
+    (dropped spurious kink at t=0.557345)
+    (dropped spurious kink at t=0.55738)
+    (dropped spurious kink at t=0.558474)
+    (dropped spurious kink at t=0.562852)
+    (dropped spurious kink at t=0.580363)
+    (dropped spurious kink at t=0.617766)
+    (dropped spurious kink at t=0.61777)
+    (dropped spurious kink at t=0.617779)
+    (dropped spurious kink at t=0.617847)
+    (dropped spurious kink at t=0.618121)
+    (dropped spurious kink at t=0.618668)
+    (dropped spurious kink at t=0.619762)
+    (dropped spurious kink at t=0.62414)
+    (dropped spurious kink at t=0.632896)
+    (dropped spurious kink at t=0.63358)
+    (dropped spurious kink at t=0.633716)
+    (dropped spurious kink at t=0.63399)
+    (dropped spurious kink at t=0.635084)
+    (dropped spurious kink at t=0.637273)
+    (dropped spurious kink at t=0.641651)
+    (dropped spurious kink at t=0.650407)
+    (dropped spurious kink at t=0.72045)
+    (dropped spurious kink at t=0.891096)
+    (dropped spurious kink at t=0.891114)
+    (dropped spurious kink at t=0.891182)
+    (dropped spurious kink at t=0.89556)
+    (dropped spurious kink at t=0.930582)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35053)
+    (dropped spurious kink at t=1.35147)
+    (dropped spurious kink at t=1.35335)
+    (dropped spurious kink at t=1.36085)
+    (dropped spurious kink at t=1.93917)
+    (dropped spurious kink at t=1.93918)
+    (dropped spurious kink at t=1.93919)
+    (dropped spurious kink at t=1.9392)
+    (dropped spurious kink at t=1.93926)
+    (dropped spurious kink at t=1.93949)
+    (dropped spurious kink at t=1.93996)
+    (dropped spurious kink at t=1.94371)
+    (dropped spurious kink at t=1.95122)
+    (dropped spurious kink at t=1.98124)
+    (dropped spurious kink at t=2.22117)
+    (dropped spurious kink at t=2.22117)
+    (dropped spurious kink at t=2.22123)
+    (dropped spurious kink at t=2.2217)
+    (dropped spurious kink at t=2.22264)
+    (dropped spurious kink at t=2.22639)
+    (dropped spurious kink at t=2.2414)
+    (dropped spurious kink at t=2.54895)
+    (dropped spurious kink at t=2.54897)
+    (dropped spurious kink at t=2.549)
+    (dropped spurious kink at t=2.54905)
+    (dropped spurious kink at t=2.54917)
+    (dropped spurious kink at t=2.54941)
+    (dropped spurious kink at t=2.55034)
+    (dropped spurious kink at t=2.5541)
+    (dropped spurious kink at t=2.5616)
+    (dropped spurious kink at t=3.46052)
+    (dropped spurious kink at t=3.46053)
+    (dropped spurious kink at t=3.46056)
+    (dropped spurious kink at t=3.46068)
+    (dropped spurious kink at t=3.46091)
+    (dropped spurious kink at t=3.46467)
+    (dropped spurious kink at t=3.47217)
+    (dropped spurious kink at t=3.50219)
+    (dropped spurious kink at t=11.6604)
+    (dropped spurious kink at t=11.6605)
+    (dropped spurious kink at t=11.6606)
+    (dropped spurious kink at t=11.661)
+    (dropped spurious kink at t=11.6648)
+    (dropped spurious kink at t=11.6723)
+    (dropped spurious kink at t=11.6873)
+    (dropped spurious kink at t=-5.53991)
+    (dropped spurious kink at t=-5.53979)
+    (dropped spurious kink at t=-5.53956)
+    (dropped spurious kink at t=-5.53909)
+    (dropped spurious kink at t=-5.53721)
+    (dropped spurious kink at t=-5.53346)
+    (dropped spurious kink at t=-5.50344)
+    (dropped spurious kink at t=-5.4434)
+    (dropped spurious kink at t=-2.22151)
+    (dropped spurious kink at t=-2.22141)
+    (dropped spurious kink at t=-2.221)
+    (dropped spurious kink at t=-2.21936)
+    (dropped spurious kink at t=-2.21607)
+    (dropped spurious kink at t=-2.21053)
+    (dropped spurious kink at t=-2.21052)
+    (dropped spurious kink at t=-2.21051)
+    (dropped spurious kink at t=-2.21048)
+    (dropped spurious kink at t=-2.21043)
+    (dropped spurious kink at t=-2.21033)
+    (dropped spurious kink at t=-2.20951)
+    (dropped spurious kink at t=-2.19637)
+    (dropped spurious kink at t=-2.09131)
+    (dropped spurious kink at t=-1.88118)
+    (dropped spurious kink at t=-1.82997)
+    (dropped spurious kink at t=-1.82996)
+    (dropped spurious kink at t=-1.82995)
+    (dropped spurious kink at t=-1.82993)
+    (dropped spurious kink at t=-1.82987)
+    (dropped spurious kink at t=-1.82946)
+    (dropped spurious kink at t=-1.82864)
+    (dropped spurious kink at t=-1.77611)
+    (dropped spurious kink at t=-1.67104)
+    (dropped spurious kink at t=-1.46091)
+    (dropped spurious kink at t=-1.04065)
+    (dropped spurious kink at t=-0.912275)
+    (dropped spurious kink at t=-0.912268)
+    (dropped spurious kink at t=-0.912243)
+    (dropped spurious kink at t=-0.912191)
+    (dropped spurious kink at t=-0.911781)
+    (dropped spurious kink at t=-0.91096)
+    (dropped spurious kink at t=-0.909318)
+    (dropped spurious kink at t=-0.883052)
+    (dropped spurious kink at t=-0.830519)
+    (dropped spurious kink at t=-0.620388)
+    (dropped spurious kink at t=-0.493724)
+    (dropped spurious kink at t=-0.493673)
+    (dropped spurious kink at t=-0.49357)
+    (dropped spurious kink at t=-0.49316)
+    (dropped spurious kink at t=-0.492339)
+    (dropped spurious kink at t=-0.489056)
+    (dropped spurious kink at t=-0.462789)
+    (dropped spurious kink at t=-0.410256)
+    (dropped spurious kink at t=-0.319262)
+    (dropped spurious kink at t=-0.31926)
+    (dropped spurious kink at t=-0.319247)
+    (dropped spurious kink at t=-0.319145)
+    (dropped spurious kink at t=-0.318324)
+    (dropped spurious kink at t=-0.305191)
+    (dropped spurious kink at t=-0.200125)
+    (dropped spurious kink at t=-0.108488)
+    (dropped spurious kink at t=-0.108475)
+    (dropped spurious kink at t=-0.108449)
+    (dropped spurious kink at t=-0.108398)
+    (dropped spurious kink at t=-0.108193)
+    (dropped spurious kink at t=-0.0950594)
+    (dropped spurious kink at t=-0.0582105)
+    (dropped spurious kink at t=-0.0582088)
+    (dropped spurious kink at t=-0.0582056)
+    (dropped spurious kink at t=-0.0581992)
+    (dropped spurious kink at t=-0.0581736)
+    (dropped spurious kink at t=-0.0581223)
+    (dropped spurious kink at t=-0.0573014)
+    (dropped spurious kink at t=-0.0556598)
+    (dropped spurious kink at t=-0.0425266)
+    (dropped spurious kink at t=0.0100063)
+    (dropped spurious kink at t=0.205273)
+    (dropped spurious kink at t=0.205286)
+    (dropped spurious kink at t=0.205311)
+    (dropped spurious kink at t=0.205363)
+    (dropped spurious kink at t=0.207004)
+    (dropped spurious kink at t=0.220138)
+    (dropped spurious kink at t=0.557317)
+    (dropped spurious kink at t=0.557343)
+    (dropped spurious kink at t=0.557394)
+    (dropped spurious kink at t=0.557497)
+    (dropped spurious kink at t=0.558318)
+    (dropped spurious kink at t=0.561601)
+    (dropped spurious kink at t=0.587867)
+    (dropped spurious kink at t=0.617765)
+    (dropped spurious kink at t=0.617767)
+    (dropped spurious kink at t=0.61777)
+    (dropped spurious kink at t=0.617776)
+    (dropped spurious kink at t=0.617828)
+    (dropped spurious kink at t=0.618238)
+    (dropped spurious kink at t=0.619059)
+    (dropped spurious kink at t=0.6207)
+    (dropped spurious kink at t=0.627267)
+    (dropped spurious kink at t=0.633513)
+    (dropped spurious kink at t=0.633526)
+    (dropped spurious kink at t=0.633628)
+    (dropped spurious kink at t=0.633834)
+    (dropped spurious kink at t=0.6404)
+    (dropped spurious kink at t=0.891088)
+    (dropped spurious kink at t=0.891092)
+    (dropped spurious kink at t=0.891098)
+    (dropped spurious kink at t=0.891111)
+    (dropped spurious kink at t=0.891162)
+    (dropped spurious kink at t=0.891573)
+    (dropped spurious kink at t=0.893215)
+    (dropped spurious kink at t=0.896498)
+    (dropped spurious kink at t=0.903064)
+    (dropped spurious kink at t=0.955597)
+    (dropped spurious kink at t=1.06066)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35048)
+    (dropped spurious kink at t=1.35049)
+    (dropped spurious kink at t=1.35052)
+    (dropped spurious kink at t=1.35062)
+    (dropped spurious kink at t=1.35082)
+    (dropped spurious kink at t=1.35124)
+    (dropped spurious kink at t=1.35288)
+    (dropped spurious kink at t=1.35616)
+    (dropped spurious kink at t=1.36273)
+    (dropped spurious kink at t=1.37586)
+    (dropped spurious kink at t=1.48093)
+    (dropped spurious kink at t=1.93918)
+    (dropped spurious kink at t=1.9392)
+    (dropped spurious kink at t=1.93925)
+    (dropped spurious kink at t=1.93936)
+    (dropped spurious kink at t=1.93977)
+    (dropped spurious kink at t=1.94059)
+    (dropped spurious kink at t=1.95372)
+    (dropped spurious kink at t=2.00625)
+    (dropped spurious kink at t=2.11132)
+    (dropped spurious kink at t=2.22118)
+    (dropped spurious kink at t=2.22121)
+    (dropped spurious kink at t=2.22131)
+    (dropped spurious kink at t=2.22295)
+    (dropped spurious kink at t=2.22952)
+    (dropped spurious kink at t=2.24265)
+    (dropped spurious kink at t=2.26892)
+    (dropped spurious kink at t=2.32145)
+    (dropped spurious kink at t=2.54897)
+    (dropped spurious kink at t=2.54902)
+    (dropped spurious kink at t=2.54923)
+    (dropped spurious kink at t=2.54964)
+    (dropped spurious kink at t=2.55128)
+    (dropped spurious kink at t=2.55785)
+    (dropped spurious kink at t=2.58412)
+    (dropped spurious kink at t=2.63665)
+    (dropped spurious kink at t=2.74171)
+    (dropped spurious kink at t=3.16198)
+    (dropped spurious kink at t=3.46055)
+    (dropped spurious kink at t=3.46076)
+    (dropped spurious kink at t=3.46404)
+    (dropped spurious kink at t=3.47717)
+    (dropped spurious kink at t=3.58224)
+    (dropped spurious kink at t=11.6623)
+    (dropped spurious kink at t=11.6773)
+    (dropped spurious kink at t=11.7073)
+    (dropped spurious kink at t=11.7674)
+    (dropped spurious kink at t=-5.53995)
+    (dropped spurious kink at t=-5.53956)
+    (dropped spurious kink at t=-5.53877)
+    (dropped spurious kink at t=-5.53721)
+    (dropped spurious kink at t=-5.53096)
+    (dropped spurious kink at t=-5.51845)
+    (dropped spurious kink at t=-5.49343)
+    (dropped spurious kink at t=-5.4434)
+    (dropped spurious kink at t=-3.8424)
+    (dropped spurious kink at t=-2.22156)
+    (dropped spurious kink at t=-2.22156)
+    (dropped spurious kink at t=-2.22155)
+    (dropped spurious kink at t=-2.22154)
+    (dropped spurious kink at t=-2.22152)
+    (dropped spurious kink at t=-2.22147)
+    (dropped spurious kink at t=-2.22108)
+    (dropped spurious kink at t=-2.21951)
+    (dropped spurious kink at t=-2.21639)
+    (dropped spurious kink at t=-2.21053)
+    (dropped spurious kink at t=-2.21052)
+    (dropped spurious kink at t=-2.21013)
+    (dropped spurious kink at t=-2.20388)
+    (dropped spurious kink at t=-2.19137)
+    (dropped spurious kink at t=-2.14134)
+    (dropped spurious kink at t=-2.04128)
+    (dropped spurious kink at t=-1.84115)
+    (dropped spurious kink at t=-1.82997)
+    (dropped spurious kink at t=-1.82997)
+    (dropped spurious kink at t=-1.82996)
+    (dropped spurious kink at t=-1.82991)
+    (dropped spurious kink at t=-1.82982)
+    (dropped spurious kink at t=-1.82942)
+    (dropped spurious kink at t=-1.82864)
+    (dropped spurious kink at t=-1.81614)
+    (dropped spurious kink at t=-1.79112)
+    (dropped spurious kink at t=-1.74109)
+    (dropped spurious kink at t=-1.64103)
+    (dropped spurious kink at t=-1.4409)
+    (dropped spurious kink at t=-0.912274)
+    (dropped spurious kink at t=-0.91225)
+    (dropped spurious kink at t=-0.912054)
+    (dropped spurious kink at t=-0.911664)
+    (dropped spurious kink at t=-0.910882)
+    (dropped spurious kink at t=-0.909318)
+    (dropped spurious kink at t=-0.903064)
+    (dropped spurious kink at t=-0.890557)
+    (dropped spurious kink at t=-0.840525)
+    (dropped spurious kink at t=-0.6404)
+    (dropped spurious kink at t=-0.493736)
+    (dropped spurious kink at t=-0.493733)
+    (dropped spurious kink at t=-0.493727)
+    (dropped spurious kink at t=-0.493629)
+    (dropped spurious kink at t=-0.493433)
+    (dropped spurious kink at t=-0.490306)
+    (dropped spurious kink at t=-0.440275)
+    (dropped spurious kink at t=-0.319261)
+    (dropped spurious kink at t=-0.319258)
+    (dropped spurious kink at t=-0.319252)
+    (dropped spurious kink at t=-0.319203)
+    (dropped spurious kink at t=-0.319106)
+    (dropped spurious kink at t=-0.318324)
+    (dropped spurious kink at t=-0.315197)
+    (dropped spurious kink at t=-0.290181)
+    (dropped spurious kink at t=-0.24015)
+    (dropped spurious kink at t=-0.108488)
+    (dropped spurious kink at t=-0.108476)
+    (dropped spurious kink at t=-0.108427)
+    (dropped spurious kink at t=-0.108036)
+    (dropped spurious kink at t=-0.107255)
+    (dropped spurious kink at t=-0.105691)
+    (dropped spurious kink at t=-0.102564)
+    (dropped spurious kink at t=-0.0900563)
+    (dropped spurious kink at t=-0.0582098)
+    (dropped spurious kink at t=-0.0582065)
+    (dropped spurious kink at t=-0.0582004)
+    (dropped spurious kink at t=-0.058005)
+    (dropped spurious kink at t=-0.0572233)
+    (dropped spurious kink at t=-0.0556598)
+    (dropped spurious kink at t=-0.0525328)
+    (dropped spurious kink at t=-0.040025)
+    (dropped spurious kink at t=0.1601)
+    (dropped spurious kink at t=0.205267)
+    (dropped spurious kink at t=0.20527)
+    (dropped spurious kink at t=0.205294)
+    (dropped spurious kink at t=0.205343)
+    (dropped spurious kink at t=0.205441)
+    (dropped spurious kink at t=0.207004)
+    (dropped spurious kink at t=0.210131)
+    (dropped spurious kink at t=0.260163)
+    (dropped spurious kink at t=0.360225)
+    (dropped spurious kink at t=0.557321)
+    (dropped spurious kink at t=0.557419)
+    (dropped spurious kink at t=0.557614)
+    (dropped spurious kink at t=0.558005)
+    (dropped spurious kink at t=0.558787)
+    (dropped spurious kink at t=0.56035)
+    (dropped spurious kink at t=0.617771)
+    (dropped spurious kink at t=0.617784)
+    (dropped spurious kink at t=0.617808)
+    (dropped spurious kink at t=0.618199)
+    (dropped spurious kink at t=0.619762)
+    (dropped spurious kink at t=0.622889)
+    (dropped spurious kink at t=0.633516)
+    (dropped spurious kink at t=0.63354)
+    (dropped spurious kink at t=0.633638)
+    (dropped spurious kink at t=0.633834)
+    (dropped spurious kink at t=0.635397)
+    (dropped spurious kink at t=0.660413)
+    (dropped spurious kink at t=0.760475)
+    (dropped spurious kink at t=0.891099)
+    (dropped spurious kink at t=0.891123)
+    (dropped spurious kink at t=0.891221)
+    (dropped spurious kink at t=0.891417)
+    (dropped spurious kink at t=0.891807)
+    (dropped spurious kink at t=0.898061)
+    (dropped spurious kink at t=0.910569)
+    (dropped spurious kink at t=0.9606)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35048)
+    (dropped spurious kink at t=1.35049)
+    (dropped spurious kink at t=1.35069)
+    (dropped spurious kink at t=1.35147)
+    (dropped spurious kink at t=1.3546)
+    (dropped spurious kink at t=1.36085)
+    (dropped spurious kink at t=1.7611)
+    (dropped spurious kink at t=1.93917)
+    (dropped spurious kink at t=1.93918)
+    (dropped spurious kink at t=1.93919)
+    (dropped spurious kink at t=1.93924)
+    (dropped spurious kink at t=1.93934)
+    (dropped spurious kink at t=1.94246)
+    (dropped spurious kink at t=1.94872)
+    (dropped spurious kink at t=1.96123)
+    (dropped spurious kink at t=2.16135)
+    (dropped spurious kink at t=2.22117)
+    (dropped spurious kink at t=2.22117)
+    (dropped spurious kink at t=2.22118)
+    (dropped spurious kink at t=2.2212)
+    (dropped spurious kink at t=2.22125)
+    (dropped spurious kink at t=2.22135)
+    (dropped spurious kink at t=2.22154)
+    (dropped spurious kink at t=2.22233)
+    (dropped spurious kink at t=2.22389)
+    (dropped spurious kink at t=2.2364)
+    (dropped spurious kink at t=2.26141)
+    (dropped spurious kink at t=2.36148)
+    (dropped spurious kink at t=2.54895)
+    (dropped spurious kink at t=2.54896)
+    (dropped spurious kink at t=2.54897)
+    (dropped spurious kink at t=2.549)
+    (dropped spurious kink at t=2.54909)
+    (dropped spurious kink at t=2.5616)
+    (dropped spurious kink at t=3.46053)
+    (dropped spurious kink at t=3.46055)
+    (dropped spurious kink at t=3.4606)
+    (dropped spurious kink at t=3.46216)
+    (dropped spurious kink at t=3.56223)
+    (dropped spurious kink at t=3.76235)
+    (dropped spurious kink at t=4.1626)
+    (dropped spurious kink at t=11.6623)
+    (dropped spurious kink at t=11.6773)
+    (dropped spurious kink at t=11.7073)
+    (dropped spurious kink at t=11.7674)
+    (dropped spurious kink at t=12.0075)
+    (dropped spurious kink at t=12.4878)
+    (dropped spurious kink at t=-5.53997)
+    (dropped spurious kink at t=-5.53996)
+    (dropped spurious kink at t=-5.53995)
+    (dropped spurious kink at t=-5.53971)
+    (dropped spurious kink at t=-5.53596)
+    (dropped spurious kink at t=-5.52846)
+    (dropped spurious kink at t=-5.51345)
+    (dropped spurious kink at t=-5.48343)
+    (dropped spurious kink at t=-5.36335)
+    (dropped spurious kink at t=-5.1232)
+    (dropped spurious kink at t=-2.22155)
+    (dropped spurious kink at t=-2.22153)
+    (dropped spurious kink at t=-2.22147)
+    (dropped spurious kink at t=-2.22123)
+    (dropped spurious kink at t=-2.22076)
+    (dropped spurious kink at t=-2.21889)
+    (dropped spurious kink at t=-2.21138)
+    (dropped spurious kink at t=-2.21053)
+    (dropped spurious kink at t=-2.21052)
+    (dropped spurious kink at t=-2.2105)
+    (dropped spurious kink at t=-2.21044)
+    (dropped spurious kink at t=-2.20951)
+    (dropped spurious kink at t=-2.20763)
+    (dropped spurious kink at t=-2.20388)
+    (dropped spurious kink at t=-2.19637)
+    (dropped spurious kink at t=-2.18136)
+    (dropped spurious kink at t=-2.12133)
+    (dropped spurious kink at t=-2.00125)
+    (dropped spurious kink at t=-1.82997)
+    (dropped spurious kink at t=-1.82996)
+    (dropped spurious kink at t=-1.82993)
+    (dropped spurious kink at t=-1.82982)
+    (dropped spurious kink at t=-1.82958)
+    (dropped spurious kink at t=-1.82864)
+    (dropped spurious kink at t=-1.82114)
+    (dropped spurious kink at t=-1.7611)
+    (dropped spurious kink at t=-1.2808)
+    (dropped spurious kink at t=-0.912276)
+    (dropped spurious kink at t=-0.912272)
+    (dropped spurious kink at t=-0.912265)
+    (dropped spurious kink at t=-0.91225)
+    (dropped spurious kink at t=-0.912133)
+    (dropped spurious kink at t=-0.911194)
+    (dropped spurious kink at t=-0.909318)
+    (dropped spurious kink at t=-0.905566)
+    (dropped spurious kink at t=-0.890557)
+    (dropped spurious kink at t=-0.860538)
+    (dropped spurious kink at t=-0.8005)
+    (dropped spurious kink at t=-0.493735)
+    (dropped spurious kink at t=-0.493731)
+    (dropped spurious kink at t=-0.493717)
+    (dropped spurious kink at t=-0.493687)
+    (dropped spurious kink at t=-0.493629)
+    (dropped spurious kink at t=-0.493512)
+    (dropped spurious kink at t=-0.493277)
+    (dropped spurious kink at t=-0.492808)
+    (dropped spurious kink at t=-0.485303)
+    (dropped spurious kink at t=-0.470294)
+    (dropped spurious kink at t=-0.440275)
+    (dropped spurious kink at t=-0.3202)
+    (dropped spurious kink at t=-0.318324)
+    (dropped spurious kink at t=-0.316448)
+    (dropped spurious kink at t=-0.312695)
+    (dropped spurious kink at t=-0.305191)
+    (dropped spurious kink at t=-0.290181)
+    (dropped spurious kink at t=-0.260163)
+    (dropped spurious kink at t=-0.200125)
+    (dropped spurious kink at t=-0.108486)
+    (dropped spurious kink at t=-0.108427)
+    (dropped spurious kink at t=-0.108193)
+    (dropped spurious kink at t=-0.106316)
+    (dropped spurious kink at t=-0.102564)
+    (dropped spurious kink at t=-0.0950594)
+    (dropped spurious kink at t=-0.08005)
+    (dropped spurious kink at t=-0.0581809)
+    (dropped spurious kink at t=-0.0581223)
+    (dropped spurious kink at t=-0.058005)
+    (dropped spurious kink at t=-0.057536)
+    (dropped spurious kink at t=-0.0500313)
+    (dropped spurious kink at t=-0.0200125)
+    (dropped spurious kink at t=0.040025)
+    (dropped spurious kink at t=0.1601)
+    (dropped spurious kink at t=0.205267)
+    (dropped spurious kink at t=0.205275)
+    (dropped spurious kink at t=0.205304)
+    (dropped spurious kink at t=0.205363)
+    (dropped spurious kink at t=0.205597)
+    (dropped spurious kink at t=0.206066)
+    (dropped spurious kink at t=0.207004)
+    (dropped spurious kink at t=0.208881)
+    (dropped spurious kink at t=0.212633)
+    (dropped spurious kink at t=0.220138)
+    (dropped spurious kink at t=0.280175)
+    (dropped spurious kink at t=0.40025)
+    (dropped spurious kink at t=0.557315)
+    (dropped spurious kink at t=0.557317)
+    (dropped spurious kink at t=0.557321)
+    (dropped spurious kink at t=0.55738)
+    (dropped spurious kink at t=0.557849)
+    (dropped spurious kink at t=0.565353)
+    (dropped spurious kink at t=0.580363)
+    (dropped spurious kink at t=0.617765)
+    (dropped spurious kink at t=0.617769)
+    (dropped spurious kink at t=0.617886)
+    (dropped spurious kink at t=0.625391)
+    (dropped spurious kink at t=0.63354)
+    (dropped spurious kink at t=0.633599)
+    (dropped spurious kink at t=0.633834)
+    (dropped spurious kink at t=0.634772)
+    (dropped spurious kink at t=0.636648)
+    (dropped spurious kink at t=0.6404)
+    (dropped spurious kink at t=0.891087)
+    (dropped spurious kink at t=0.891089)
+    (dropped spurious kink at t=0.891104)
+    (dropped spurious kink at t=0.891338)
+    (dropped spurious kink at t=0.891807)
+    (dropped spurious kink at t=0.89556)
+    (dropped spurious kink at t=0.910569)
+    (dropped spurious kink at t=0.940588)
+    (dropped spurious kink at t=1.00063)
+    (dropped spurious kink at t=1.1207)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35053)
+    (dropped spurious kink at t=1.35147)
+    (dropped spurious kink at t=1.35335)
+    (dropped spurious kink at t=1.36085)
+    (dropped spurious kink at t=1.601)
+    (dropped spurious kink at t=1.93918)
+    (dropped spurious kink at t=1.93918)
+    (dropped spurious kink at t=1.93965)
+    (dropped spurious kink at t=1.94059)
+    (dropped spurious kink at t=1.94246)
+    (dropped spurious kink at t=1.94622)
+    (dropped spurious kink at t=1.96123)
+    (dropped spurious kink at t=2.0813)
+    (dropped spurious kink at t=2.22117)
+    (dropped spurious kink at t=2.22118)
+    (dropped spurious kink at t=2.22119)
+    (dropped spurious kink at t=2.22131)
+    (dropped spurious kink at t=2.22154)
+    (dropped spurious kink at t=2.22201)
+    (dropped spurious kink at t=2.22389)
+    (dropped spurious kink at t=2.23139)
+    (dropped spurious kink at t=2.26141)
+    (dropped spurious kink at t=2.32145)
+    (dropped spurious kink at t=2.54895)
+    (dropped spurious kink at t=2.54897)
+    (dropped spurious kink at t=2.549)
+    (dropped spurious kink at t=2.54905)
+    (dropped spurious kink at t=2.54917)
+    (dropped spurious kink at t=2.54941)
+    (dropped spurious kink at t=2.55034)
+    (dropped spurious kink at t=2.5541)
+    (dropped spurious kink at t=2.5616)
+    (dropped spurious kink at t=3.46076)
+    (dropped spurious kink at t=3.46123)
+    (dropped spurious kink at t=3.46216)
+    (dropped spurious kink at t=3.5222)
+    (dropped spurious kink at t=4.4828)
+    (dropped spurious kink at t=6.404)
+    (dropped spurious kink at t=10.2464)
+    (dropped spurious kink at t=11.6604)
+    (dropped spurious kink at t=11.6605)
+    (dropped spurious kink at t=11.6606)
+    (dropped spurious kink at t=11.661)
+    (dropped spurious kink at t=11.6648)
+    (dropped spurious kink at t=11.6723)
+    (dropped spurious kink at t=11.6873)
+    (dropped spurious kink at t=12.1676)
+    (dropped spurious kink at t=14.0888)
+    (dropped spurious kink at t=-5.53995)
+    (dropped spurious kink at t=-5.53987)
+    (dropped spurious kink at t=-5.53971)
+    (dropped spurious kink at t=-5.53846)
+    (dropped spurious kink at t=-5.53346)
+    (dropped spurious kink at t=-5.52345)
+    (dropped spurious kink at t=-5.4434)
+    (dropped spurious kink at t=-5.1232)
+    (dropped spurious kink at t=-2.22156)
+    (dropped spurious kink at t=-2.22155)
+    (dropped spurious kink at t=-2.22154)
+    (dropped spurious kink at t=-2.22139)
+    (dropped spurious kink at t=-2.21052)
+    (dropped spurious kink at t=-2.21044)
+    (dropped spurious kink at t=-2.21013)
+    (dropped spurious kink at t=-2.20888)
+    (dropped spurious kink at t=-2.20638)
+    (dropped spurious kink at t=-2.20138)
+    (dropped spurious kink at t=-2.16135)
+    (dropped spurious kink at t=-2.0813)
+    (dropped spurious kink at t=-1.9212)
+    (dropped spurious kink at t=-1.82989)
+    (dropped spurious kink at t=-1.82864)
+    (dropped spurious kink at t=-1.82614)
+    (dropped spurious kink at t=-1.82114)
+    (dropped spurious kink at t=-1.80113)
+    (dropped spurious kink at t=-1.7611)
+    (dropped spurious kink at t=-1.601)
+    (dropped spurious kink at t=-1.2808)
+    (dropped spurious kink at t=-0.912277)
+    (dropped spurious kink at t=-0.912274)
+    (dropped spurious kink at t=-0.912269)
+    (dropped spurious kink at t=-0.91225)
+    (dropped spurious kink at t=-0.912211)
+    (dropped spurious kink at t=-0.912133)
+    (dropped spurious kink at t=-0.91182)
+    (dropped spurious kink at t=-0.910569)
+    (dropped spurious kink at t=-0.900563)
+    (dropped spurious kink at t=-0.88055)
+    (dropped spurious kink at t=-0.8005)
+    (dropped spurious kink at t=-0.6404)
+    (dropped spurious kink at t=-0.493727)
+    (dropped spurious kink at t=-0.493707)
+    (dropped spurious kink at t=-0.493668)
+    (dropped spurious kink at t=-0.49359)
+    (dropped spurious kink at t=-0.493433)
+    (dropped spurious kink at t=-0.492808)
+    (dropped spurious kink at t=-0.490306)
+    (dropped spurious kink at t=-0.4803)
+    (dropped spurious kink at t=-0.3202)
+    (dropped spurious kink at t=-0.318949)
+    (dropped spurious kink at t=-0.317699)
+    (dropped spurious kink at t=-0.315197)
+    (dropped spurious kink at t=-0.310194)
+    (dropped spurious kink at t=-0.300188)
+    (dropped spurious kink at t=-0.280175)
+    (dropped spurious kink at t=-0.24015)
+    (dropped spurious kink at t=-0.1601)
+    (dropped spurious kink at t=-0.108493)
+    (dropped spurious kink at t=-0.108491)
+    (dropped spurious kink at t=-0.108486)
+    (dropped spurious kink at t=-0.108466)
+    (dropped spurious kink at t=-0.108427)
+    (dropped spurious kink at t=-0.108349)
+    (dropped spurious kink at t=-0.108193)
+    (dropped spurious kink at t=-0.107567)
+    (dropped spurious kink at t=-0.105066)
+    (dropped spurious kink at t=-0.100063)
+    (dropped spurious kink at t=-0.08005)
+    (dropped spurious kink at t=-0.0582004)
+    (dropped spurious kink at t=-0.0581614)
+    (dropped spurious kink at t=-0.057536)
+    (dropped spurious kink at t=-0.0550344)
+    (dropped spurious kink at t=-0.0500313)
+    (dropped spurious kink at t=-0.040025)
+    (dropped spurious kink at t=-9.09495e-13)
+    (dropped spurious kink at t=0.205266)
+    (dropped spurious kink at t=0.205267)
+    (dropped spurious kink at t=0.20527)
+    (dropped spurious kink at t=0.205275)
+    (dropped spurious kink at t=0.205285)
+    (dropped spurious kink at t=0.205441)
+    (dropped spurious kink at t=0.205754)
+    (dropped spurious kink at t=0.206379)
+    (dropped spurious kink at t=0.20763)
+    (dropped spurious kink at t=0.210131)
+    (dropped spurious kink at t=0.220138)
+    (dropped spurious kink at t=0.24015)
+    (dropped spurious kink at t=0.3202)
+    (dropped spurious kink at t=0.557316)
+    (dropped spurious kink at t=0.557321)
+    (dropped spurious kink at t=0.557341)
+    (dropped spurious kink at t=0.55738)
+    (dropped spurious kink at t=0.557536)
+    (dropped spurious kink at t=0.557849)
+    (dropped spurious kink at t=0.56035)
+    (dropped spurious kink at t=0.617769)
+    (dropped spurious kink at t=0.617808)
+    (dropped spurious kink at t=0.617886)
+    (dropped spurious kink at t=0.620388)
+    (dropped spurious kink at t=0.633521)
+    (dropped spurious kink at t=0.634146)
+    (dropped spurious kink at t=0.635397)
+    (dropped spurious kink at t=0.6404)
+    (dropped spurious kink at t=0.891089)
+    (dropped spurious kink at t=0.891094)
+    (dropped spurious kink at t=0.891104)
+    (dropped spurious kink at t=0.891182)
+    (dropped spurious kink at t=0.891807)
+    (dropped spurious kink at t=0.893058)
+    (dropped spurious kink at t=0.89556)
+    (dropped spurious kink at t=0.900563)
+    (dropped spurious kink at t=0.920575)
+    (dropped spurious kink at t=0.9606)
+    (dropped spurious kink at t=1.2808)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35049)
+    (dropped spurious kink at t=1.35053)
+    (dropped spurious kink at t=1.35084)
+    (dropped spurious kink at t=1.36085)
+    (dropped spurious kink at t=1.4409)
+    (dropped spurious kink at t=1.601)
+    (dropped spurious kink at t=1.9212)
+    (dropped spurious kink at t=1.93918)
+    (dropped spurious kink at t=1.93918)
+    (dropped spurious kink at t=1.93934)
+    (dropped spurious kink at t=1.93996)
+    (dropped spurious kink at t=1.94121)
+    (dropped spurious kink at t=1.96123)
+    (dropped spurious kink at t=2.00125)
+    (dropped spurious kink at t=2.0813)
+    (dropped spurious kink at t=2.22117)
+    (dropped spurious kink at t=2.22119)
+    (dropped spurious kink at t=2.22123)
+    (dropped spurious kink at t=2.22139)
+    (dropped spurious kink at t=2.2414)
+    (dropped spurious kink at t=2.54895)
+    (dropped spurious kink at t=2.54896)
+    (dropped spurious kink at t=2.54898)
+    (dropped spurious kink at t=2.54902)
+    (dropped spurious kink at t=2.54909)
+    (dropped spurious kink at t=2.55159)
+    (dropped spurious kink at t=2.5616)
+    (dropped spurious kink at t=3.4606)
+    (dropped spurious kink at t=3.46091)
+    (dropped spurious kink at t=3.46216)
+    (dropped spurious kink at t=3.48218)
+    (dropped spurious kink at t=3.5222)
+    (dropped spurious kink at t=3.8424)
+    (dropped spurious kink at t=5.1232)
+    (dropped spurious kink at t=10.2464)
+    (dropped spurious kink at t=11.661)
+    (dropped spurious kink at t=11.6623)
+    (dropped spurious kink at t=11.6673)
+    (dropped spurious kink at t=11.6873)
+    (dropped spurious kink at t=11.8474)
+    (dropped spurious kink at t=12.1676)
+    (dropped spurious kink at t=12.808)
+    (dropped spurious kink at t=15.3696)
+    (dropped spurious kink at t=20.4928)
+    (dropped spurious kink at t=30.7392)
+    (dropped spurious kink at t=-5.53996)
+    (dropped spurious kink at t=-5.53993)
+    (dropped spurious kink at t=-5.53987)
+    (dropped spurious kink at t=-5.5394)
+    (dropped spurious kink at t=-5.53846)
+    (dropped spurious kink at t=-5.52345)
+    (dropped spurious kink at t=-5.2833)
+    (dropped spurious kink at t=-4.803)
+    (dropped spurious kink at t=-3.8424)
+    (dropped spurious kink at t=-2.22156)
+    (dropped spurious kink at t=-2.22156)
+    (dropped spurious kink at t=-2.22155)
+    (dropped spurious kink at t=-2.22153)
+    (dropped spurious kink at t=-2.22151)
+    (dropped spurious kink at t=-2.22139)
+    (dropped spurious kink at t=-2.21051)
+    (dropped spurious kink at t=-2.21048)
+    (dropped spurious kink at t=-2.21037)
+    (dropped spurious kink at t=-2.21013)
+    (dropped spurious kink at t=-2.20638)
+    (dropped spurious kink at t=-2.19137)
+    (dropped spurious kink at t=-2.16135)
+    (dropped spurious kink at t=-1.9212)
+    (dropped spurious kink at t=-1.82974)
+    (dropped spurious kink at t=-1.82927)
+    (dropped spurious kink at t=-1.82739)
+    (dropped spurious kink at t=-1.82364)
+    (dropped spurious kink at t=-1.81614)
+    (dropped spurious kink at t=-1.80113)
+    (dropped spurious kink at t=-1.68105)
+    (dropped spurious kink at t=-1.4409)
+    (dropped spurious kink at t=-0.9606)
+    (dropped spurious kink at t=-0.912276)
+    (dropped spurious kink at t=-0.912274)
+    (dropped spurious kink at t=-0.91226)
+    (dropped spurious kink at t=-0.91223)
+    (dropped spurious kink at t=-0.912172)
+    (dropped spurious kink at t=-0.912054)
+    (dropped spurious kink at t=-0.91182)
+    (dropped spurious kink at t=-0.908068)
+    (dropped spurious kink at t=-0.900563)
+    (dropped spurious kink at t=-0.840525)
+    (dropped spurious kink at t=-0.72045)
+    (dropped spurious kink at t=-0.493736)
+    (dropped spurious kink at t=-0.493734)
+    (dropped spurious kink at t=-0.493727)
+    (dropped spurious kink at t=-0.493668)
+    (dropped spurious kink at t=-0.493433)
+    (dropped spurious kink at t=-0.491557)
+    (dropped spurious kink at t=-0.487805)
+    (dropped spurious kink at t=-0.4803)
+    (dropped spurious kink at t=-0.319263)
+    (dropped spurious kink at t=-0.319261)
+    (dropped spurious kink at t=-0.319257)
+    (dropped spurious kink at t=-0.319242)
+    (dropped spurious kink at t=-0.319184)
+    (dropped spurious kink at t=-0.318949)
+    (dropped spurious kink at t=-0.315197)
+    (dropped spurious kink at t=-0.300188)
+    (dropped spurious kink at t=-0.24015)
+    (dropped spurious kink at t=-0.108494)
+    (dropped spurious kink at t=-0.108492)
+    (dropped spurious kink at t=-0.108488)
+    (dropped spurious kink at t=-0.108481)
+    (dropped spurious kink at t=-0.108466)
+    (dropped spurious kink at t=-0.108349)
+    (dropped spurious kink at t=-0.10788)
+    (dropped spurious kink at t=-0.106942)
+    (dropped spurious kink at t=-0.105066)
+    (dropped spurious kink at t=-0.0900563)
+    (dropped spurious kink at t=-0.0600375)
+    (dropped spurious kink at t=-0.058209)
+    (dropped spurious kink at t=-0.0582053)
+    (dropped spurious kink at t=-0.0581907)
+    (dropped spurious kink at t=-0.0581614)
+    (dropped spurious kink at t=-0.0562852)
+    (dropped spurious kink at t=-0.0525328)
+    (dropped spurious kink at t=-0.0450281)
+    (dropped spurious kink at t=-0.0300188)
+    (dropped spurious kink at t=0)
+    (dropped spurious kink at t=0.205267)
+    (dropped spurious kink at t=0.205269)
+    (dropped spurious kink at t=0.205272)
+    (dropped spurious kink at t=0.20528)
+    (dropped spurious kink at t=0.205294)
+    (dropped spurious kink at t=0.205324)
+    (dropped spurious kink at t=0.205441)
+    (dropped spurious kink at t=0.206379)
+    (dropped spurious kink at t=0.210131)
+    (dropped spurious kink at t=0.24015)
+    (dropped spurious kink at t=0.4803)
+    (dropped spurious kink at t=0.557319)
+    (dropped spurious kink at t=0.557326)
+    (dropped spurious kink at t=0.557341)
+    (dropped spurious kink at t=0.557458)
+    (dropped spurious kink at t=0.557692)
+    (dropped spurious kink at t=0.558161)
+    (dropped spurious kink at t=0.559099)
+    (dropped spurious kink at t=0.562852)
+    (dropped spurious kink at t=0.570356)
+    (dropped spurious kink at t=0.600375)
+    (dropped spurious kink at t=0.617765)
+    (dropped spurious kink at t=0.617766)
+    (dropped spurious kink at t=0.617774)
+    (dropped spurious kink at t=0.617788)
+    (dropped spurious kink at t=0.617847)
+    (dropped spurious kink at t=0.617964)
+    (dropped spurious kink at t=0.618199)
+    (dropped spurious kink at t=0.619137)
+    (dropped spurious kink at t=0.622889)
+    (dropped spurious kink at t=0.630394)
+    (dropped spurious kink at t=0.63351)
+    (dropped spurious kink at t=0.633512)
+    (dropped spurious kink at t=0.633516)
+    (dropped spurious kink at t=0.633531)
+    (dropped spurious kink at t=0.63356)
+    (dropped spurious kink at t=0.633677)
+    (dropped spurious kink at t=0.634146)
+    (dropped spurious kink at t=0.637899)
+    (dropped spurious kink at t=0.645403)
+    (dropped spurious kink at t=0.660413)
+    (dropped spurious kink at t=0.72045)
+    (dropped spurious kink at t=0.891094)
+    (dropped spurious kink at t=0.891123)
+    (dropped spurious kink at t=0.891182)
+    (dropped spurious kink at t=0.893058)
+    (dropped spurious kink at t=0.900563)
+    (dropped spurious kink at t=0.9606)
+    (dropped spurious kink at t=1.35047)
+    (dropped spurious kink at t=1.35048)
+    (dropped spurious kink at t=1.35049)
+    (dropped spurious kink at t=1.35061)
+    (dropped spurious kink at t=1.35084)
+    (dropped spurious kink at t=1.38086)
+    (dropped spurious kink at t=1.4409)
+    (dropped spurious kink at t=1.9212)
+    (dropped spurious kink at t=1.93917)
+    (dropped spurious kink at t=1.93918)
+    (dropped spurious kink at t=1.93919)
+    (dropped spurious kink at t=1.9392)
+    (dropped spurious kink at t=1.93926)
+    (dropped spurious kink at t=1.93949)
+    (dropped spurious kink at t=1.93996)
+    (dropped spurious kink at t=1.94371)
+    (dropped spurious kink at t=1.95122)
+    (dropped spurious kink at t=1.98124)
+    (dropped spurious kink at t=2.04128)
+    (dropped spurious kink at t=2.16135)
+    (dropped spurious kink at t=2.22118)
+    (dropped spurious kink at t=2.22121)
+    (dropped spurious kink at t=2.22127)
+    (dropped spurious kink at t=2.22139)
+    (dropped spurious kink at t=2.28143)
+    (dropped spurious kink at t=2.4015)
+    (dropped spurious kink at t=2.54895)
+    (dropped spurious kink at t=2.54896)
+    (dropped spurious kink at t=2.54902)
+    (dropped spurious kink at t=2.54925)
+    (dropped spurious kink at t=2.54972)
+    (dropped spurious kink at t=2.55159)
+    (dropped spurious kink at t=2.58161)
+    (dropped spurious kink at t=2.64165)
+    (dropped spurious kink at t=2.8818)
+    (dropped spurious kink at t=3.46053)
+    (dropped spurious kink at t=3.46054)
+    (dropped spurious kink at t=3.4606)
+    (dropped spurious kink at t=3.46154)
+    (dropped spurious kink at t=3.46341)
+    (dropped spurious kink at t=3.46717)
+    (dropped spurious kink at t=3.48218)
+    (dropped spurious kink at t=3.60225)
+    (dropped spurious kink at t=3.8424)
+    (dropped spurious kink at t=7.6848)
+    (dropped spurious kink at t=11.6623)
+    (dropped spurious kink at t=11.6773)
+    (dropped spurious kink at t=11.7073)
+    (dropped spurious kink at t=11.7674)
+    (dropped spurious kink at t=12.0075)
+    (dropped spurious kink at t=12.4878)
+    (dropped spurious kink at t=13.4484)
+    (dropped spurious kink at t=15.3696)
+    (dropped spurious kink at t=30.7392)
+    (dropped spurious kink at t=61.4784)
+line1: 8 kinks, line2: 8 kinks
+  [warn] coincident-hyperplane kink could not be decomposed; keeping its summed row
+  [warn] coincident-hyperplane kink could not be decomposed; keeping its summed row
+  [warn] coincident-hyperplane kink could not be decomposed; keeping its summed row
+  [warn] coincident-hyperplane kink could not be decomposed; keeping its summed row
+recovered 5 distinct directions, 15 rows in total
+  [warn] self-check: residual=2.562e-01, relu-structure violations=10/15 -> stolen rows may contain errors
+saved matrix of shape (15, 10) to /app/stolen_A1.npy (total forward calls: 123593)
+[?2004hroot@072bedd94a5f:/app# wc -l /tmp/steal_stdout.txt && head -n 20 /tmp/steal_stdout.txt
+[?2004l15 /tmp/steal_stdout.txt
+[[-0.397456207  0.284716314  0.012481696  0.33268411   0.346782597  0.527812845  0.372577234 -0.247662881 -0.197742805 -0.109695897]
+ [-0.397456207  0.284716314  0.012481696  0.33268411   0.346782597  0.527812845  0.372577234 -0.247662881 -0.197742805 -0.109695897]
+ [-0.397456207  0.284716314  0.012481696  0.33268411   0.346782597  0.527812845  0.372577234 -0.247662881 -0.197742805 -0.109695897]
+ [-0.397456207  0.284716314  0.012481696  0.33268411   0.346782597  0.527812845  0.372577234 -0.247662881 -0.197742805 -0.109695897]
+ [-0.397456207  0.284716314  0.012481696  0.33268411   0.346782597  0.527812845  0.372577234 -0.247662881 -0.197742805 -0.109695897]
+ [-0.397456207  0.284716314  0.012481696  0.33268411   0.346782597  0.527812845  0.372577234 -0.247662881 -0.197742805 -0.109695897]
+ [-0.397456207  0.284716314  0.012481696  0.33268411   0.346782597  0.527812845  0.372577234 -0.247662881 -0.197742805 -0.109695897]
+ [-0.052949314 -0.131920386  0.308240123  0.693528509  0.120061159 -0.055421896 -0.427993196 -0.416971265  0.13491578   0.105203935]
+ [-0.269737875 -0.365213347 -0.438946123  0.502263895 -0.131098552 -0.112674116 -0.322315572  0.200045822 -0.414890037 -0.054738307]
+ [ 0.042440125  0.770936619 -0.034598916  0.073913094  0.092353638  0.184989182 -0.265994517  0.297345364 -0.432813486 -0.089164347]
+ [ 0.042440125  0.770936619 -0.034598916  0.073913094  0.092353638  0.184989182 -0.265994517  0.297345364 -0.432813486 -0.089164347]
+ [ 0.042440125  0.770936619 -0.034598916  0.073913094  0.092353638  0.184989182 -0.265994517  0.297345364 -0.432813486 -0.089164347]
+ [ 0.042440125  0.770936619 -0.034598916  0.073913094  0.092353638  0.184989182 -0.265994517  0.297345364 -0.432813486 -0.089164347]
+ [ 0.042440125  0.770936619 -0.034598916  0.073913094  0.092353638  0.184989182 -0.265994517  0.297345364 -0.432813486 -0.089164347]
+ [-0.319860992 -0.056586391 -0.499869072  0.541733263 -0.176512234  0.300434601  0.382029407  0.253948468  0.136681922 -0.024640426]]
+[?2004hroot@072bedd94a5f:/app# python3 -c "import numpy as np; M=np.load('/app/stolen_A1.npy'); print(M.shape); print('row norms:', np.linalg.norm(M, axis=1)[:20])"
+[?2004l(15, 10)
+row norms: [1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1. 1.]
+[?2004hroot@072bedd94a5f:/app# head -n 60 /tmp/steal_stderr.txt
+[?2004lforward(0) = -0.09423482539555281
+scanning line 1: x0 = 0
+    (dropped spurious kink at t=-0.740096)
+    (dropped spurious kink at t=-0.740082)
+    (dropped spurious kink at t=-0.740052)
+    (dropped spurious kink at t=-0.739994)
+    (dropped spurious kink at t=-0.739525)
+    (dropped spurious kink at t=-0.495867)
+    (dropped spurious kink at t=-0.495837)
+    (dropped spurious kink at t=-0.495779)
+    (dropped spurious kink at t=-0.49531)
+    (dropped spurious kink at t=-0.212274)
+    (dropped spurious kink at t=-0.212266)
+    (dropped spurious kink at t=-0.212252)
+    (dropped spurious kink at t=-0.212222)
+    (dropped spurious kink at t=-0.212164)
+    (dropped spurious kink at t=-0.211695)
+    (dropped spurious kink at t=-0.121132)
+    (dropped spurious kink at t=-0.121128)
+    (dropped spurious kink at t=-0.121121)
+    (dropped spurious kink at t=-0.121091)
+    (dropped spurious kink at t=-0.120857)
+    (dropped spurious kink at t=-0.120388)
+    (dropped spurious kink at t=-0.021747)
+    (dropped spurious kink at t=-0.0217323)
+    (dropped spurious kink at t=-0.0212633)
+    (dropped spurious kink at t=0.03099)
+    (dropped spurious kink at t=0.030991)
+    (dropped spurious kink at t=0.0310057)
+    (dropped spurious kink at t=0.031035)
+    (dropped spurious kink at t=0.0312695)
+    (dropped spurious kink at t=0.119015)
+    (dropped spurious kink at t=0.119029)
+    (dropped spurious kink at t=0.119059)
+    (dropped spurious kink at t=0.119293)
+    (dropped spurious kink at t=0.119762)
+    (dropped spurious kink at t=0.173961)
+    (dropped spurious kink at t=0.173976)
+    (dropped spurious kink at t=0.174093)
+    (dropped spurious kink at t=0.174328)
+    (dropped spurious kink at t=0.174797)
+    (dropped spurious kink at t=0.484281)
+    (dropped spurious kink at t=0.484283)
+    (dropped spurious kink at t=0.484287)
+    (dropped spurious kink at t=0.484522)
+    (dropped spurious kink at t=0.484991)
+    (dropped spurious kink at t=0.507165)
+    (dropped spurious kink at t=0.507168)
+    (dropped spurious kink at t=0.507182)
+    (dropped spurious kink at t=0.507212)
+    (dropped spurious kink at t=0.50727)
+    (dropped spurious kink at t=0.507505)
+    (dropped spurious kink at t=0.514672)
+    (dropped spurious kink at t=0.514687)
+    (dropped spurious kink at t=0.514716)
+    (dropped spurious kink at t=0.514775)
+    (dropped spurious kink at t=0.515009)
+    (dropped spurious kink at t=0.551695)
+    (dropped spurious kink at t=0.551697)
+    (dropped spurious kink at t=0.551712)
+[?2004hroot@072bedd94a5f:/app# python3 << 'PYEOF'
+[?2004l[?2004h> import numpy as np
+[?2004l[?2004h> from forward import forward as fwd
+[?2004l[?2004h> f0 = float(fwd(np.zeros(10)))
+[?2004l[?2004h> print("f0 =", f0)
+[?2004l[?2004h> rng = np.random.default_rng(1)
+[?2004l[?2004h> for trial in range(6):
+[?2004l[?2004h>     x = rng.normal(size=10)
+[?2004l[?2004h>     x /= np.linalg.norm(x)
+[?2004l[?2004h>     err_max = 0.0
+[?2004l[?2004h>     tmax = 0.0
+[?2004l[?2004h>     for t in np.linspace(0.01, 3.0, 60):
+[?2004l[?2004h>         pred = f0 + (float(fwd(x)) - f0) * t
+[?2004l[?2004h>         err = abs(float(fwd(t * x)) - pred)
+[?2004l[?2004h>         if err > err_max:
+[?2004l[?2004h>             err_max = err; tmax = t
+[?2004l[?2004h>     print(f"trial {trial}: max linearity error on t in [0.01,3] = {err_max:.3e} at t={tmax:.3f} (scale |f|~{abs(float(fwd(x))):.3g})")
+[?2004l[?2004h> PYEOF
+[?2004lf0 = -0.09423482539555281
+trial 0: max linearity error on t in [0.01,3] = 6.431e-02 at t=3.000 (scale |f|~0.0717)
+trial 1: max linearity error on t in [0.01,3] = 8.191e-03 at t=3.000 (scale |f|~0.0984)
+trial 2: max linearity error on t in [0.01,3] = 1.097e-03 at t=1.632 (scale |f|~0.106)
+trial 3: max linearity error on t in [0.01,3] = 1.140e-02 at t=3.000 (scale |f|~0.18)
+trial 4: max linearity error on t in [0.01,3] = 2.881e-02 at t=3.000 (scale |f|~0.0691)
+trial 5: max linearity error on t in [0.01,3] = 4.780e-02 at t=3.000 (scale |f|~0.0706)
+[?2004hroot@072bedd94a5f:/app# 

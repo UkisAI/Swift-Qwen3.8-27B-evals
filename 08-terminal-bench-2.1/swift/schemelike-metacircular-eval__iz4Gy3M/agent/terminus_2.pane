@@ -1,0 +1,5162 @@
+[?2004hroot@69944c7bc9a2:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@69944c7bc9a2:/app# clear
+[?2004l[H[J[3J[?2004hroot@69944c7bc9a2:/app# ls -la
+[?2004ltotal 24
+drwxr-xr-x 1 root root    26 Sep 13  2025 .
+drwxr-xr-x 1 root root   102 Sep  7 04:09 ..
+-rw-r--r-- 1 root root 17578 Sep 13  2025 interp.py
+drwxr-xr-x 2 root root  4096 Sep 13  2025 test
+[?2004hroot@69944c7bc9a2:/app# cat interp.py
+[?2004l#!/usr/bin/env python3
+
+import sys
+
+sys.setrecursionlimit(10000)  # Increase recursion limit for deep computations
+
+DEBUG = False
+
+
+class SchemeError(Exception):
+    pass
+
+
+class Pair:
+    def __init__(self, car, cdr):
+        self.car = car
+        self.cdr = cdr
+
+    def __repr__(self):
+        return f"({self._to_string()})"
+
+    def _to_string(self):
+        result = repr(self.car)
+        current = self.cdr
+        while isinstance(current, Pair):
+            result += f" {repr(current.car)}"
+            current = current.cdr
+        if current is not None:
+            result += f" . {repr(current)}"
+        return result
+
+
+class Environment:
+    def __init__(self, parent=None):
+        self.bindings = {}
+        self.parent = parent
+
+    def define(self, name, value):
+        self.bindings[name] = value
+
+    def set(self, name, value):
+        if name in self.bindings:
+            self.bindings[name] = value
+        elif self.parent is not None:
+            self.parent.set(name, value)
+        else:
+            raise SchemeError(f"Undefined variable: {name}")
+
+    def get(self, name):
+        if name in self.bindings:
+            return self.bindings[name]
+        elif self.parent is not None:
+            return self.parent.get(name)
+        else:
+            raise SchemeError(f"Undefined variable: {name}")
+
+
+class Procedure:
+    def __init__(self, params, body, env):
+        self.params = params
+        self.body = body
+        self.env = env
+
+    def __repr__(self):
+        return "#<procedure>"
+
+
+class String:
+    def __init__(self, value):
+        self.value = value
+
+    def __repr__(self):
+        return f'"{self.value}"'
+
+    def __str__(self):
+        return self.value
+
+    def __eq__(self, other):
+        if isinstance(other, String):
+            return self.value == other.value
+        return False
+
+
+def tokenize(code):
+    tokens = []
+    i = 0
+    while i < len(code):
+        if code[i].isspace():
+            i += 1
+        elif code[i] == ";":
+            while i < len(code) and code[i] != "\n":
+                i += 1
+        elif code[i] in "()'":
+            tokens.append(code[i])
+            i += 1
+        elif code[i] == '"':
+            i += 1
+            start = i
+            while i < len(code) and code[i] != '"':
+                if code[i] == "\\":
+                    i += 2
+                else:
+                    i += 1
+            tokens.append(String(code[start:i]))
+            i += 1
+        else:
+            start = i
+            while i < len(code) and not code[i].isspace() and code[i] not in "()';":
+                i += 1
+            tokens.append(code[start:i])
+    return tokens
+
+
+def eval_expr(expr, env):
+    if DEBUG:
+        print(f"[DEBUG] Evaluating: {repr(expr)[:100]}...")
+
+    # Add recursion depth tracking
+    if not hasattr(eval_expr, "depth"):
+        eval_expr.depth = 0
+    eval_expr.depth += 1
+    if eval_expr.depth > 5000:
+        print(
+            f"[RECURSION] Deep recursion detected! Last expression: {repr(expr)[:200]}"
+        )
+        raise RecursionError("Recursion limit exceeded")
+
+    try:
+        if isinstance(expr, int) or isinstance(expr, bool):
+            result = expr
+            if DEBUG:
+                print(f"[DEBUG] -> Returning {repr(result)}")
+            return result
+
+        elif isinstance(expr, String):
+            # String literal
+            if DEBUG:
+                print(f"[DEBUG] -> Returning string: {repr(expr)}")
+            return expr
+
+        elif isinstance(expr, str):
+            # Symbol, look it up
+            result = env.get(expr)
+            if DEBUG:
+                print(
+                    f"[DEBUG] -> Symbol '{expr}' evaluated to: {repr(result)[:100]}..."
+                )
+            return result
+
+        elif isinstance(expr, Procedure):
+            if DEBUG:
+                print("[DEBUG] -> Returning procedure")
+            return expr
+
+        elif expr is None:
+            if DEBUG:
+                print("[DEBUG] -> Returning None")
+            return None
+
+        elif not isinstance(expr, Pair):
+            # This shouldn't happen with our parser
+            result = env.get(expr)
+            if DEBUG:
+                print(f"[DEBUG] -> Returning from env: {repr(result)}")
+            return result
+
+        car = expr.car
+
+        if car == "quote":
+            result = expr.cdr.car
+            if DEBUG:
+                print(f"[DEBUG] -> Quote returned: {repr(result)}")
+            return result
+
+        elif car == "if":
+            condition = eval_expr(expr.cdr.car, env)
+            if condition is not False:
+                return eval_expr(expr.cdr.cdr.car, env)
+            elif expr.cdr.cdr.cdr is not None:
+                return eval_expr(expr.cdr.cdr.cdr.car, env)
+            else:
+                return None
+
+        elif car == "define":
+            name_or_list = expr.cdr.car
+            if isinstance(name_or_list, Pair):
+                # Function definition shorthand: (define (f x y) body)
+                name = name_or_list.car
+                params = []
+                param_list = name_or_list.cdr
+                while param_list is not None:
+                    params.append(param_list.car)
+                    param_list = param_list.cdr
+
+                # Create lambda
+                body = expr.cdr.cdr
+                proc = Procedure(params, [], env)
+                proc.body = []
+                while body is not None:
+                    proc.body.append(body.car)
+                    body = body.cdr
+
+                env.define(name, proc)
+            else:
+                # Simple definition: (define x value)
+                name = name_or_list
+                value = eval_expr(expr.cdr.cdr.car, env)
+                env.define(name, value)
+            return None
+
+        elif car == "set!":
+            name = expr.cdr.car
+            value = eval_expr(expr.cdr.cdr.car, env)
+            env.set(name, value)
+            return None
+
+        elif car == "lambda":
+            params = []
+            param_list = expr.cdr.car
+            while param_list is not None:
+                params.append(param_list.car)
+                param_list = param_list.cdr
+
+            body = []
+            body_list = expr.cdr.cdr
+            while body_list is not None:
+                body.append(body_list.car)
+                body_list = body_list.cdr
+
+            return Procedure(params, body, env)
+
+        elif car == "let":
+            new_env = Environment(env)
+            bindings = expr.cdr.car
+            while bindings is not None:
+                binding = bindings.car
+                name = binding.car
+                value = eval_expr(binding.cdr.car, env)
+                new_env.define(name, value)
+                bindings = bindings.cdr
+
+            result = None
+            body = expr.cdr.cdr
+            while body is not None:
+                result = eval_expr(body.car, new_env)
+                body = body.cdr
+            return result
+
+        elif car == "begin" or car == "progn":
+            result = None
+            body = expr.cdr
+            while body is not None:
+                result = eval_expr(body.car, env)
+                body = body.cdr
+            return result
+
+        elif car == "cond":
+            clauses = expr.cdr
+            while clauses is not None:
+                clause = clauses.car
+                test = clause.car
+                if test == "else" or eval_expr(test, env) is not False:
+                    # Evaluate the body of this clause
+                    result = None
+                    body = clause.cdr
+                    while body is not None:
+                        result = eval_expr(body.car, env)
+                        body = body.cdr
+                    return result
+                clauses = clauses.cdr
+            return None
+
+        else:
+            if DEBUG:
+                print("[DEBUG] Evaluating application...")
+            proc = eval_expr(car, env)
+            args = []
+            arg_list = expr.cdr
+            while arg_list is not None:
+                args.append(eval_expr(arg_list.car, env))
+                arg_list = arg_list.cdr
+
+            if DEBUG:
+                print(f"[DEBUG] Applying {repr(proc)[:50]}... to args: {args}")
+
+            if isinstance(proc, Procedure):
+                if len(args) != len(proc.params):
+                    raise SchemeError(
+                        f"Arity mismatch: expected {len(proc.params)} arguments, "
+                        f"got {len(args)} in evaluating {proc.body}"
+                    )
+
+                new_env = Environment(proc.env)
+                for param, arg in zip(proc.params, args):
+                    new_env.define(param, arg)
+
+                result = None
+                for body_expr in proc.body:
+                    result = eval_expr(body_expr, new_env)
+                if DEBUG:
+                    print(f"[DEBUG] -> Application returned: {repr(result)}")
+                return result
+
+            elif callable(proc):
+                result = proc(*args)
+                if DEBUG:
+                    print(f"[DEBUG] -> Primitive returned: {repr(result)}")
+                return result
+
+            else:
+                raise SchemeError(f"Not a procedure: {proc}")
+    finally:
+        eval_expr.depth -= 1
+
+
+def make_global_env():
+    env = Environment()
+
+    env.define("+", lambda *args: sum(args))
+    env.define("-", lambda a, b=None: -a if b is None else a - b)
+    env.define("*", lambda *args: eval(f"{'*'.join(map(str, args))}" if args else "1"))
+    env.define(
+        "/", lambda a, b: a // b if isinstance(a, int) and isinstance(b, int) else a / b
+    )
+    env.define("=", lambda a, b: a == b)
+    env.define("<", lambda a, b: a < b)
+    env.define(">", lambda a, b: a > b)
+    env.define("<=", lambda a, b: a <= b)
+    env.define(">=", lambda a, b: a >= b)
+
+    env.define("cons", lambda a, b: Pair(a, b))
+    env.define("car", lambda p: p.car if isinstance(p, Pair) else None)
+    env.define("cdr", lambda p: p.cdr if isinstance(p, Pair) else None)
+    env.define("null?", lambda x: x is None)
+    env.define("pair?", lambda x: isinstance(x, Pair))
+
+    env.define("eq?", lambda a, b: a == b)
+    env.define("equal?", lambda a, b: a == b)
+
+    env.define("not", lambda x: x is False)
+    env.define("and", lambda *args: all(args))
+    env.define("or", lambda *args: any(args))
+
+    env.define("getchr", lambda: ord(sys.stdin.read(1)))
+    env.define("putchr", lambda n: sys.stdout.write(chr(n)) or None)
+    env.define("chr", lambda n: chr(n))
+
+    # Read function - reads an S-expression from input
+    def read_sexp():
+        line = input()
+        tokens = tokenize(line)
+        if tokens:
+            expr, _ = parse_expr(tokens, 0)
+            return expr
+        return None
+
+    env.define("read", read_sexp)
+
+    def symbol_from_list(lst):
+        chars = []
+        while lst is not None:
+            if isinstance(lst, Pair):
+                chars.append(chr(lst.car))
+                lst = lst.cdr
+            else:
+                break
+        return "".join(chars)
+
+    env.define("symbol", symbol_from_list)
+
+    # Additional built-ins needed for eval.scm
+    env.define("symbol?", lambda x: isinstance(x, str))
+    env.define("string?", lambda x: isinstance(x, String))
+    env.define("number?", lambda x: isinstance(x, int))
+    env.define("set-car!", lambda p, v: setattr(p, "car", v) or None)
+    env.define("set-cdr!", lambda p, v: setattr(p, "cdr", v) or None)
+    env.define("else", True)  # else is always true in cond
+    env.define(
+        "display", lambda x: print(str(x) if isinstance(x, String) else x, end="")
+    )
+    env.define("newline", lambda: print())
+
+    # File I/O functions
+    open_files = {}  # Track open file handles
+    file_counter = 0
+
+    def fopen(filename, mode):
+        nonlocal file_counter
+        try:
+            # Convert String objects to regular strings
+            if isinstance(filename, String):
+                filename = str(filename)
+            if isinstance(mode, String):
+                mode = str(mode)
+            f = open(filename, mode)
+            file_counter += 1
+            file_id = f"file_{file_counter}"
+            open_files[file_id] = f
+            return file_id
+        except IOError:
+            return False
+
+    def fclose(file_id):
+        if file_id in open_files:
+            open_files[file_id].close()
+            del open_files[file_id]
+            return True
+        return False
+
+    def fgetchr(file_id):
+        if file_id in open_files:
+            ch = open_files[file_id].read(1)
+            if ch:
+                return ord(ch)
+            return -1  # EOF
+        return False
+
+    def fputchr(file_id, n):
+        if file_id in open_files:
+            open_files[file_id].write(chr(n))
+            open_files[file_id].flush()
+            return None
+        return False
+
+    def fdisplay(file_id, obj):
+        if file_id in open_files:
+            if isinstance(obj, String):
+                open_files[file_id].write(str(obj))
+            else:
+                open_files[file_id].write(str(obj))
+            open_files[file_id].flush()
+            return None
+        return False
+
+    def fread(file_id):
+        if file_id in open_files:
+            tokens = []
+            paren_count = 0
+
+            while True:
+                line = open_files[file_id].readline()
+                if not line:  # EOF
+                    return None
+
+                # Skip empty lines and comments when we have no tokens yet
+                if not tokens and (not line.strip() or line.strip().startswith(";")):
+                    continue
+
+                # Tokenize line and add to accumulated tokens
+                line_tokens = tokenize(line.strip())
+                tokens.extend(line_tokens)
+
+                # Count parentheses to check if expression is complete
+                for token in line_tokens:
+                    if token == "(":
+                        paren_count += 1
+                    elif token == ")":
+                        paren_count -= 1
+
+                # If parentheses are balanced and we have tokens, try to parse
+                if tokens and paren_count == 0:
+                    try:
+                        expr, _ = parse_expr(tokens, 0)
+                        return expr
+                    except Exception:
+                        # If parsing fails with balanced parens, skip this expression
+                        tokens = []
+                        paren_count = 0
+                        continue
+        return False
+
+    env.define("fopen", fopen)
+    env.define("fclose", fclose)
+    env.define("fgetchr", fgetchr)
+    env.define("fputchr", fputchr)
+    env.define("fdisplay", fdisplay)
+    env.define("fread", fread)
+
+    return env
+
+
+def run_file(filename):
+    env = make_global_env()
+
+    with open(filename, "r") as f:
+        content = f.read()
+
+    tokens = tokenize(content)
+    index = 0
+
+    while index < len(tokens):
+        try:
+            # Parse one complete expression
+            expr, new_index = parse_expr(tokens, index)
+            index = new_index
+
+            # Evaluate it
+            eval_expr(expr, env)
+
+            # Don't print results - only display/newline should print
+            pass
+
+        except SchemeError as e:
+            print(f"Error: {e}")
+            break
+
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            break
+
+
+def parse_expr(tokens, index):
+    if index >= len(tokens):
+        raise SchemeError("Unexpected end of input")
+
+    token = tokens[index]
+
+    if token == "(":
+        index += 1
+        elements = []
+        while index < len(tokens) and tokens[index] != ")":
+            expr, index = parse_expr(tokens, index)
+            elements.append(expr)
+        if index >= len(tokens):
+            raise SchemeError("Missing closing parenthesis")
+        index += 1
+
+        result = None
+        for i in range(len(elements) - 1, -1, -1):
+            result = Pair(elements[i], result)
+        return result, index
+
+    elif token == ")":
+        raise SchemeError("Unexpected closing parenthesis")
+
+    elif isinstance(token, String):
+        return token, index + 1
+
+    elif token == "'":
+        expr, index = parse_expr(tokens, index + 1)
+        return Pair("quote", Pair(expr, None)), index
+
+    else:
+        # Try to parse as number
+        try:
+            return int(token), index + 1
+        except ValueError:
+            pass
+
+        # Check for boolean literals
+        if token == "#t":
+            return True, index + 1
+        elif token == "#f":
+            return False, index + 1
+
+        # Otherwise it's a symbol
+        return token, index + 1
+
+
+def parse(tokens):
+    expr, _ = parse_expr(tokens, 0)
+    return expr
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        run_file(sys.argv[1])
+    else:
+        # If no file provided, read from stdin
+        content = sys.stdin.read()
+        tokens = tokenize(content)
+        env = make_global_env()
+        index = 0
+
+        while index < len(tokens):
+            try:
+                expr, new_index = parse_expr(tokens, index)
+                index = new_index
+                result = eval_expr(expr, env)
+                # Don't print results - only display/newline should print
+            except SchemeError as e:
+                print(f"Error: {e}")
+                break
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                break
+[?2004hroot@69944c7bc9a2:/app# ls test/
+[?2004l01-factorial.scm	08-progn-sequencing.scm   calculator.scm	    fold_operations.scm       mutual_recursion.scm	test_read.scm
+02-fibonacci.scm	09-mutual-recursion.scm   church_numerals.scm	    function_composition.scm  nested_defines.scm	variadic_functions.scm
+03-list-operations.scm	10-advanced-features.scm  closures.scm		    lazy_evaluation.scm       oeis_sequences.scm	y_combinator.scm
+04-higher-order.scm	README.md		  continuation_passing.scm  list_operations.scm       oeis_sequences2.scm
+05-simple-io.scm	accumulator_patterns.scm  currying.scm		    map_operations.scm	      oeis_sequences3.scm
+06-interactive-io.scm	binary_tree.scm		  filter_operations.scm     memoization.scm	      recursive_structures.scm
+[?2004hroot@69944c7bc9a2:/app# sed -n '100,250p' interp.py
+[?2004l                if code[i] == "\\":
+                    i += 2
+                else:
+                    i += 1
+            tokens.append(String(code[start:i]))
+            i += 1
+        else:
+            start = i
+            while i < len(code) and not code[i].isspace() and code[i] not in "()';":
+                i += 1
+            tokens.append(code[start:i])
+    return tokens
+
+
+def eval_expr(expr, env):
+    if DEBUG:
+        print(f"[DEBUG] Evaluating: {repr(expr)[:100]}...")
+
+    # Add recursion depth tracking
+    if not hasattr(eval_expr, "depth"):
+        eval_expr.depth = 0
+    eval_expr.depth += 1
+    if eval_expr.depth > 5000:
+        print(
+            f"[RECURSION] Deep recursion detected! Last expression: {repr(expr)[:200]}"
+        )
+        raise RecursionError("Recursion limit exceeded")
+
+    try:
+        if isinstance(expr, int) or isinstance(expr, bool):
+            result = expr
+            if DEBUG:
+                print(f"[DEBUG] -> Returning {repr(result)}")
+            return result
+
+        elif isinstance(expr, String):
+            # String literal
+            if DEBUG:
+                print(f"[DEBUG] -> Returning string: {repr(expr)}")
+            return expr
+
+        elif isinstance(expr, str):
+            # Symbol, look it up
+            result = env.get(expr)
+            if DEBUG:
+                print(
+                    f"[DEBUG] -> Symbol '{expr}' evaluated to: {repr(result)[:100]}..."
+                )
+            return result
+
+        elif isinstance(expr, Procedure):
+            if DEBUG:
+                print("[DEBUG] -> Returning procedure")
+            return expr
+
+        elif expr is None:
+            if DEBUG:
+                print("[DEBUG] -> Returning None")
+            return None
+
+        elif not isinstance(expr, Pair):
+            # This shouldn't happen with our parser
+            result = env.get(expr)
+            if DEBUG:
+                print(f"[DEBUG] -> Returning from env: {repr(result)}")
+            return result
+
+        car = expr.car
+
+        if car == "quote":
+            result = expr.cdr.car
+            if DEBUG:
+                print(f"[DEBUG] -> Quote returned: {repr(result)}")
+            return result
+
+        elif car == "if":
+            condition = eval_expr(expr.cdr.car, env)
+            if condition is not False:
+                return eval_expr(expr.cdr.cdr.car, env)
+            elif expr.cdr.cdr.cdr is not None:
+                return eval_expr(expr.cdr.cdr.cdr.car, env)
+            else:
+                return None
+
+        elif car == "define":
+            name_or_list = expr.cdr.car
+            if isinstance(name_or_list, Pair):
+                # Function definition shorthand: (define (f x y) body)
+                name = name_or_list.car
+                params = []
+                param_list = name_or_list.cdr
+                while param_list is not None:
+                    params.append(param_list.car)
+                    param_list = param_list.cdr
+
+                # Create lambda
+                body = expr.cdr.cdr
+                proc = Procedure(params, [], env)
+                proc.body = []
+                while body is not None:
+                    proc.body.append(body.car)
+                    body = body.cdr
+
+                env.define(name, proc)
+            else:
+                # Simple definition: (define x value)
+                name = name_or_list
+                value = eval_expr(expr.cdr.cdr.car, env)
+                env.define(name, value)
+            return None
+
+        elif car == "set!":
+            name = expr.cdr.car
+            value = eval_expr(expr.cdr.cdr.car, env)
+            env.set(name, value)
+            return None
+
+        elif car == "lambda":
+            params = []
+            param_list = expr.cdr.car
+            while param_list is not None:
+                params.append(param_list.car)
+                param_list = param_list.cdr
+
+            body = []
+            body_list = expr.cdr.cdr
+            while body_list is not None:
+                body.append(body_list.car)
+                body_list = body_list.cdr
+
+            return Procedure(params, body, env)
+
+        elif car == "let":
+            new_env = Environment(env)
+            bindings = expr.cdr.car
+            while bindings is not None:
+                binding = bindings.car
+                name = binding.car
+                value = eval_expr(binding.cdr.car, env)
+                new_env.define(name, value)
+                bindings = bindings.cdr
+
+            result = None
+            body = expr.cdr.cdr
+            while body is not None:
+                result = eval_expr(body.car, new_env)
+                body = body.cdr
+            return result
+
+        elif car == "begin" or car == "progn":
+            result = None
+[?2004hroot@69944c7bc9a2:/app# sed -n '250,450p' interp.py
+[?2004l            result = None
+            body = expr.cdr
+            while body is not None:
+                result = eval_expr(body.car, env)
+                body = body.cdr
+            return result
+
+        elif car == "cond":
+            clauses = expr.cdr
+            while clauses is not None:
+                clause = clauses.car
+                test = clause.car
+                if test == "else" or eval_expr(test, env) is not False:
+                    # Evaluate the body of this clause
+                    result = None
+                    body = clause.cdr
+                    while body is not None:
+                        result = eval_expr(body.car, env)
+                        body = body.cdr
+                    return result
+                clauses = clauses.cdr
+            return None
+
+        else:
+            if DEBUG:
+                print("[DEBUG] Evaluating application...")
+            proc = eval_expr(car, env)
+            args = []
+            arg_list = expr.cdr
+            while arg_list is not None:
+                args.append(eval_expr(arg_list.car, env))
+                arg_list = arg_list.cdr
+
+            if DEBUG:
+                print(f"[DEBUG] Applying {repr(proc)[:50]}... to args: {args}")
+
+            if isinstance(proc, Procedure):
+                if len(args) != len(proc.params):
+                    raise SchemeError(
+                        f"Arity mismatch: expected {len(proc.params)} arguments, "
+                        f"got {len(args)} in evaluating {proc.body}"
+                    )
+
+                new_env = Environment(proc.env)
+                for param, arg in zip(proc.params, args):
+                    new_env.define(param, arg)
+
+                result = None
+                for body_expr in proc.body:
+                    result = eval_expr(body_expr, new_env)
+                if DEBUG:
+                    print(f"[DEBUG] -> Application returned: {repr(result)}")
+                return result
+
+            elif callable(proc):
+                result = proc(*args)
+                if DEBUG:
+                    print(f"[DEBUG] -> Primitive returned: {repr(result)}")
+                return result
+
+            else:
+                raise SchemeError(f"Not a procedure: {proc}")
+    finally:
+        eval_expr.depth -= 1
+
+
+def make_global_env():
+    env = Environment()
+
+    env.define("+", lambda *args: sum(args))
+    env.define("-", lambda a, b=None: -a if b is None else a - b)
+    env.define("*", lambda *args: eval(f"{'*'.join(map(str, args))}" if args else "1"))
+    env.define(
+        "/", lambda a, b: a // b if isinstance(a, int) and isinstance(b, int) else a / b
+    )
+    env.define("=", lambda a, b: a == b)
+    env.define("<", lambda a, b: a < b)
+    env.define(">", lambda a, b: a > b)
+    env.define("<=", lambda a, b: a <= b)
+    env.define(">=", lambda a, b: a >= b)
+
+    env.define("cons", lambda a, b: Pair(a, b))
+    env.define("car", lambda p: p.car if isinstance(p, Pair) else None)
+    env.define("cdr", lambda p: p.cdr if isinstance(p, Pair) else None)
+    env.define("null?", lambda x: x is None)
+    env.define("pair?", lambda x: isinstance(x, Pair))
+
+    env.define("eq?", lambda a, b: a == b)
+    env.define("equal?", lambda a, b: a == b)
+
+    env.define("not", lambda x: x is False)
+    env.define("and", lambda *args: all(args))
+    env.define("or", lambda *args: any(args))
+
+    env.define("getchr", lambda: ord(sys.stdin.read(1)))
+    env.define("putchr", lambda n: sys.stdout.write(chr(n)) or None)
+    env.define("chr", lambda n: chr(n))
+
+    # Read function - reads an S-expression from input
+    def read_sexp():
+        line = input()
+        tokens = tokenize(line)
+        if tokens:
+            expr, _ = parse_expr(tokens, 0)
+            return expr
+        return None
+
+    env.define("read", read_sexp)
+
+    def symbol_from_list(lst):
+        chars = []
+        while lst is not None:
+            if isinstance(lst, Pair):
+                chars.append(chr(lst.car))
+                lst = lst.cdr
+            else:
+                break
+        return "".join(chars)
+
+    env.define("symbol", symbol_from_list)
+
+    # Additional built-ins needed for eval.scm
+    env.define("symbol?", lambda x: isinstance(x, str))
+    env.define("string?", lambda x: isinstance(x, String))
+    env.define("number?", lambda x: isinstance(x, int))
+    env.define("set-car!", lambda p, v: setattr(p, "car", v) or None)
+    env.define("set-cdr!", lambda p, v: setattr(p, "cdr", v) or None)
+    env.define("else", True)  # else is always true in cond
+    env.define(
+        "display", lambda x: print(str(x) if isinstance(x, String) else x, end="")
+    )
+    env.define("newline", lambda: print())
+
+    # File I/O functions
+    open_files = {}  # Track open file handles
+    file_counter = 0
+
+    def fopen(filename, mode):
+        nonlocal file_counter
+        try:
+            # Convert String objects to regular strings
+            if isinstance(filename, String):
+                filename = str(filename)
+            if isinstance(mode, String):
+                mode = str(mode)
+            f = open(filename, mode)
+            file_counter += 1
+            file_id = f"file_{file_counter}"
+            open_files[file_id] = f
+            return file_id
+        except IOError:
+            return False
+
+    def fclose(file_id):
+        if file_id in open_files:
+            open_files[file_id].close()
+            del open_files[file_id]
+            return True
+        return False
+
+    def fgetchr(file_id):
+        if file_id in open_files:
+            ch = open_files[file_id].read(1)
+            if ch:
+                return ord(ch)
+            return -1  # EOF
+        return False
+
+    def fputchr(file_id, n):
+        if file_id in open_files:
+            open_files[file_id].write(chr(n))
+            open_files[file_id].flush()
+            return None
+        return False
+
+    def fdisplay(file_id, obj):
+        if file_id in open_files:
+            if isinstance(obj, String):
+                open_files[file_id].write(str(obj))
+            else:
+                open_files[file_id].write(str(obj))
+            open_files[file_id].flush()
+            return None
+        return False
+
+    def fread(file_id):
+        if file_id in open_files:
+            tokens = []
+            paren_count = 0
+
+            while True:
+                line = open_files[file_id].readline()
+                if not line:  # EOF
+                    return None
+
+                # Skip empty lines and comments when we have no tokens yet
+                if not tokens and (not line.strip() or line.strip().startswith(";")):
+                    continue
+
+                # Tokenize line and add to accumulated tokens
+                line_tokens = tokenize(line.strip())
+[?2004hroot@69944c7bc9a2:/app# sed -n '450,520p' interp.py
+[?2004l                line_tokens = tokenize(line.strip())
+                tokens.extend(line_tokens)
+
+                # Count parentheses to check if expression is complete
+                for token in line_tokens:
+                    if token == "(":
+                        paren_count += 1
+                    elif token == ")":
+                        paren_count -= 1
+
+                # If parentheses are balanced and we have tokens, try to parse
+                if tokens and paren_count == 0:
+                    try:
+                        expr, _ = parse_expr(tokens, 0)
+                        return expr
+                    except Exception:
+                        # If parsing fails with balanced parens, skip this expression
+                        tokens = []
+                        paren_count = 0
+                        continue
+        return False
+
+    env.define("fopen", fopen)
+    env.define("fclose", fclose)
+    env.define("fgetchr", fgetchr)
+    env.define("fputchr", fputchr)
+    env.define("fdisplay", fdisplay)
+    env.define("fread", fread)
+
+    return env
+
+
+def run_file(filename):
+    env = make_global_env()
+
+    with open(filename, "r") as f:
+        content = f.read()
+
+    tokens = tokenize(content)
+    index = 0
+
+    while index < len(tokens):
+        try:
+            # Parse one complete expression
+            expr, new_index = parse_expr(tokens, index)
+            index = new_index
+
+            # Evaluate it
+            eval_expr(expr, env)
+
+            # Don't print results - only display/newline should print
+            pass
+
+        except SchemeError as e:
+            print(f"Error: {e}")
+            break
+
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            break
+
+
+def parse_expr(tokens, index):
+    if index >= len(tokens):
+        raise SchemeError("Unexpected end of input")
+
+    token = tokens[index]
+
+    if token == "(":
+        index += 1
+        elements = []
+[?2004hroot@69944c7bc9a2:/app# wc -l interp.py
+[?2004l586 interp.py
+[?2004hroot@69944c7bc9a2:/app# for f in test/*.scm; do echo "=== $f ==="; cat "$f"; done 2>&1 | head -200
+[?2004l=== test/01-factorial.scm ===
+;; Test 1: Factorial - Classic recursive function
+
+(define (factorial n)
+  (if (= n 0)
+      1
+      (* n (factorial (- n 1)))))
+
+;; Test factorial of 5
+(display (factorial 5))
+(newline)
+
+;; Test factorial of 10
+(display (factorial 10))
+(newline)
+
+;; Tail-recursive version
+(define (factorial-tail n)
+  (define (fact-iter n acc)
+    (if (= n 0)
+        acc
+        (fact-iter (- n 1) (* n acc))))
+  (fact-iter n 1))
+
+;; Test factorial of 20 (tail-recursive)
+(display (factorial-tail 20))
+(newline)=== test/02-fibonacci.scm ===
+;; Test 2: Fibonacci - Another classic recursive function
+
+(define (fib n)
+  (cond ((= n 0) 0)
+        ((= n 1) 1)
+        (else (+ (fib (- n 1)) (fib (- n 2))))))
+
+;; Generate list of first n Fibonacci numbers
+(define (fib-list n)
+  (define (fib-list-helper i)
+    (if (>= i n)
+        '()
+        (cons (fib i) (fib-list-helper (+ i 1)))))
+  (fib-list-helper 0))
+
+;; Display first 10 Fibonacci numbers as a list
+(display (fib-list 10))
+(newline)
+
+;; Efficient iterative version
+(define (fib-iter n)
+  (define (fib-helper n a b)
+    (if (= n 0)
+        a
+        (fib-helper (- n 1) b (+ a b))))
+  (fib-helper n 0 1))
+
+;; Display 20th Fibonacci number
+(display (fib-iter 20))
+(newline)=== test/03-list-operations.scm ===
+;; Test 3: List operations - Working with cons cells
+
+;; List creation and manipulation
+(define lst '(1 2 3 4 5))
+;; Original list
+(display lst)
+(newline)
+
+;; Custom length function
+(define (my-length lst)
+  (if (null? lst)
+      0
+      (+ 1 (my-length (cdr lst)))))
+
+;; Length of list
+(display (my-length lst))
+(newline)
+
+;; Reverse a list
+(define (reverse lst)
+  (define (reverse-iter lst acc)
+    (if (null? lst)
+        acc
+        (reverse-iter (cdr lst) (cons (car lst) acc))))
+  (reverse-iter lst '()))
+
+;; Reversed list
+(display (reverse lst))
+(newline)
+
+;; Map function
+(define (my-map f lst)
+  (if (null? lst)
+      '()
+      (cons (f (car lst)) (my-map f (cdr lst)))))
+
+;; Squared values
+(display (my-map (lambda (x) (* x x)) lst))
+(newline)
+
+;; Filter function
+(define (filter pred lst)
+  (cond ((null? lst) '())
+        ((pred (car lst)) (cons (car lst) (filter pred (cdr lst))))
+        (else (filter pred (cdr lst)))))
+
+;; Even numbers from list
+(display (filter (lambda (x) (= (- x (* 2 (/ x 2))) 0)) lst))
+(newline)=== test/04-higher-order.scm ===
+;; Test 4: Higher-order functions and closures
+
+;; Function that returns a function
+(define (make-adder n)
+  (lambda (x) (+ x n)))
+
+(define add5 (make-adder 5))
+(define add10 (make-adder 10))
+
+;; add5(3)
+(display (add5 3))
+(newline)
+
+;; add10(3)
+(display (add10 3))
+(newline)
+
+;; Compose function
+(define (compose f g)
+  (lambda (x) (f (g x))))
+
+(define square (lambda (x) (* x x)))
+(define inc (lambda (x) (+ x 1)))
+
+(define square-then-inc (compose inc square))
+(define inc-then-square (compose square inc))
+
+;; square-then-inc(5)
+(display (square-then-inc 5))
+(newline)
+
+;; inc-then-square(5)
+(display (inc-then-square 5))
+(newline)
+
+;; Fold/reduce
+(define (fold-left f init lst)
+  (if (null? lst)
+      init
+      (fold-left f (f init (car lst)) (cdr lst))))
+
+;; Sum of 1-5
+(display (fold-left + 0 '(1 2 3 4 5)))
+(newline)
+
+;; Product of 1-5
+(display (fold-left * 1 '(1 2 3 4 5)))
+(newline)=== test/05-simple-io.scm ===
+;; Test 5: Simple I/O operations
+
+(display "Testing simple I/O...")
+(newline)
+
+;; Test display with different types
+(display "String: ")
+(display "Hello, World!")
+(newline)
+
+(display "Number: ")
+(display 42)
+(newline)
+
+(display "Boolean true: ")
+(display #t)
+(newline)
+
+(display "Boolean false: ")
+(display #f)
+(newline)
+
+(display "List: ")
+(display '(1 2 3 4 5))
+(newline)
+
+;; Test character output
+(display "Character output: ")
+(putchr 65)  ; 'A'
+(putchr 32)  ; space
+(putchr 66)  ; 'B'
+(putchr 32)  ; space
+(putchr 67)  ; 'C'
+(newline)
+
+;; Test progn with display
+(display "Progn with side effects: ")
+(progn
+  (display "First ")
+  (display "Second ")
+  (display "Third")
+  (newline)
+  42)  ; Return value
+
+;; Test conditionals with display
+(display "Conditional display: ")
+[?2004hroot@69944c7bc9a2:/app# for f in test/05-simple-io.scm test/06-interactive-io.scm test/07*.scm; do echo "=== $f ==="; cat "$f"; done 2>&1 | tail -120
+[?2004l=== test/05-simple-io.scm ===
+;; Test 5: Simple I/O operations
+
+(display "Testing simple I/O...")
+(newline)
+
+;; Test display with different types
+(display "String: ")
+(display "Hello, World!")
+(newline)
+
+(display "Number: ")
+(display 42)
+(newline)
+
+(display "Boolean true: ")
+(display #t)
+(newline)
+
+(display "Boolean false: ")
+(display #f)
+(newline)
+
+(display "List: ")
+(display '(1 2 3 4 5))
+(newline)
+
+;; Test character output
+(display "Character output: ")
+(putchr 65)  ; 'A'
+(putchr 32)  ; space
+(putchr 66)  ; 'B'
+(putchr 32)  ; space
+(putchr 67)  ; 'C'
+(newline)
+
+;; Test progn with display
+(display "Progn with side effects: ")
+(progn
+  (display "First ")
+  (display "Second ")
+  (display "Third")
+  (newline)
+  42)  ; Return value
+
+;; Test conditionals with display
+(display "Conditional display: ")
+(if (> 5 3)
+    (display "5 is greater than 3")
+    (display "This won't print"))
+(newline)
+
+(display "Simple I/O tests completed!")
+(newline)=== test/06-interactive-io.scm ===
+;; Test 6: Interactive I/O with read
+
+(display "Interactive calculator")
+(newline)
+(display "Enter two numbers and an operation (+, -, *, /)")
+(newline)
+
+(display "First number: ")
+(define num1 (read))
+(display "Second number: ")
+(define num2 (read))
+(display "Operation (+, -, *, /): ")
+(define op (read))
+
+(define result
+  (cond ((eq? op '+) (+ num1 num2))
+        ((eq? op '-) (- num1 num2))
+        ((eq? op '*) (* num1 num2))
+        ((eq? op '/) (/ num1 num2))
+        (else 'invalid-operation)))
+
+(display "Result: ")
+(display result)
+(newline)
+
+;; Mini REPL
+(display "Mini expression evaluator (type 'quit to exit)")
+(newline)
+
+(define (mini-repl)
+  (display "> ")
+  (let ((expr (read)))
+    (if (eq? expr 'quit)
+        (display "Goodbye!")
+        (progn
+          (display "You entered: ")
+          (display expr)
+          (newline)
+          ;; In a real REPL, we'd evaluate expr here
+          (mini-repl)))))
+
+;; Comment out to avoid infinite loop in batch mode
+;; (mini-repl)=== test/07*.scm ===
+cat: 'test/07*.scm': No such file or directory
+[?2004hroot@69944c7bc9a2:/app# for f in test/08-progn-sequencing.scm test/09-mutual-recursion.scm test/10-advanced-features.scm; do echo "=== $f ==="; cat "$f"; done
+[?2004l=== test/08-progn-sequencing.scm ===
+;; Test 8: progn and sequencing with side effects
+
+(display "Testing progn sequencing:")
+(newline)
+
+;; progn returns the last expression
+(define result 
+  (progn
+    (display "First... ")
+    (display "Second... ")
+    (display "Third... ")
+    (+ 10 20)))
+
+(display "Result: ")
+(display result)
+(newline)
+
+;; Counter with side effects
+(define counter 0)
+
+(define (increment!)
+  (set! counter (+ counter 1))
+  counter)
+
+(display "Counting: ")
+(progn
+  (display (increment!))
+  (display " ")
+  (display (increment!))
+  (display " ")
+  (display (increment!))
+  (newline))
+
+;; Simulating a for loop with progn
+(define (for-loop start end body)
+  (if (<= start end)
+      (progn
+        (body start)
+        (for-loop (+ start 1) end body))))
+
+(display "For loop 1-5: ")
+(for-loop 1 5 
+  (lambda (i) 
+    (progn 
+      (display i)
+      (display " "))))
+(newline)
+
+;; Multiple statements in let
+(let ((x 10)
+      (y 20))
+  (progn
+    (display "x = ")
+    (display x)
+    (display ", y = ")
+    (display y)
+    (display ", x + y = ")
+    (display (+ x y))
+    (newline)))=== test/09-mutual-recursion.scm ===
+;; Test 9: Mutual recursion - even? and odd?
+
+(define (even? n)
+  (if (= n 0)
+      #t
+      (odd? (- n 1))))
+
+(define (odd? n)
+  (if (= n 0)
+      #f
+      (even? (- n 1))))
+
+(display "Testing even? and odd?:")
+(newline)
+
+(define (test-number n)
+  (progn
+    (display n)
+    (display " is ")
+    (if (even? n)
+        (display "even")
+        (display "odd"))
+    (newline)))
+
+(test-number 0)
+(test-number 1)
+(test-number 10)
+(test-number 15)
+(test-number 100)
+
+;; Mutual recursion with lists
+(define (take-even lst)
+  (if (null? lst)
+      '()
+      (cons (car lst) (take-odd (cdr lst)))))
+
+(define (take-odd lst)
+  (if (null? lst)
+      '()
+      (take-even (cdr lst))))
+
+(display "Alternate elements of (1 2 3 4 5 6 7 8):")
+(newline)
+(display "Even positions: ")
+(display (take-even '(1 2 3 4 5 6 7 8)))
+(newline)
+(display "Odd positions: ")
+(display (take-odd '(1 2 3 4 5 6 7 8)))
+(newline)=== test/10-advanced-features.scm ===
+;; Test 10: Advanced features - Y combinator, quasiquote simulation, macros
+
+;; Y combinator for anonymous recursion
+(define Y
+  (lambda (f)
+    ((lambda (x) (f (lambda (y) ((x x) y))))
+     (lambda (x) (f (lambda (y) ((x x) y)))))))
+
+;; Factorial using Y combinator
+(display "Factorial using Y combinator:")
+(newline)
+(define fact-y
+  (Y (lambda (f)
+       (lambda (n)
+         (if (= n 0)
+             1
+             (* n (f (- n 1))))))))
+
+(display "5! = ")
+(display (fact-y 5))
+(newline)
+
+;; Quasiquote simulation using list operations
+(define (quasiquote-sim template)
+  ;; Simplified - just handles lists with 'unquote markers
+  template)
+
+;; Association lists and property lists
+(define person '((name . "John") (age . 30) (city . "NYC")))
+
+(define (assoc-get key alist)
+  (cond ((null? alist) #f)
+        ((eq? (car (car alist)) key) (cdr (car alist)))
+        (else (assoc-get key (cdr alist)))))
+
+(display "Person data:")
+(newline)
+(display "Name: ")
+(display (assoc-get 'name person))
+(newline)
+(display "Age: ")
+(display (assoc-get 'age person))
+(newline)
+
+;; Simple object system using closures
+(define (make-counter init)
+  (let ((count init))
+    (lambda (msg)
+      (cond ((eq? msg 'get) count)
+            ((eq? msg 'inc) (set! count (+ count 1)))
+            ((eq? msg 'reset) (set! count init))))))
+
+(define c1 (make-counter 0))
+(display "Counter object:")
+(newline)
+(c1 'inc)
+(c1 'inc)
+(display "After 2 increments: ")
+(display (c1 'get))
+(newline)
+(c1 'reset)
+(display "After reset: ")
+(display (c1 'get))
+(newline)
+
+;; Continuation-like behavior with callbacks
+(define (with-file filename mode callback)
+  (let ((f (fopen filename mode)))
+    (let ((result (callback f)))
+      (fclose f)
+      result)))
+
+(display "File handling with callback:")
+(newline)
+(with-file "callback-test.txt" "w"
+  (lambda (f)
+    (fdisplay f "Written with callback!")
+    (fputchr f 10)
+    #t))
+(display "File written successfully")
+(newline)[?2004hroot@69944c7bc9a2:/app# for f in test/accumulator_patterns.scm test/binary_tree.scm test/calculator.scm test/church_numerals.scm test/closures.scm; do echo "=== $f ==="; cat "$f"; done
+[?2004l=== test/accumulator_patterns.scm ===
+;; Test accumulator patterns and tail recursion
+
+;; Tail-recursive factorial with accumulator
+(define (factorial-acc n acc)
+  (if (= n 0)
+      acc
+      (factorial-acc (- n 1) (* n acc))))
+
+(define (factorial n)
+  (factorial-acc n 1))
+
+;; Tail-recursive reverse
+(define (reverse-acc lst acc)
+  (if (null? lst)
+      acc
+      (reverse-acc (cdr lst) (cons (car lst) acc))))
+
+(define (reverse lst)
+  (reverse-acc lst '()))
+
+;; Tail-recursive sum
+(define (sum-acc lst acc)
+  (if (null? lst)
+      acc
+      (sum-acc (cdr lst) (+ (car lst) acc))))
+
+(define (sum lst)
+  (sum-acc lst 0))
+
+;; Tail-recursive length
+(define (length-acc lst acc)
+  (if (null? lst)
+      acc
+      (length-acc (cdr lst) (+ acc 1))))
+
+(define (length lst)
+  (length-acc lst 0))
+
+;; Tests
+(display "Factorial of 6: ")
+(display (factorial 6))
+(newline)
+
+(display "Reverse of (1 2 3 4 5): ")
+(display (reverse '(1 2 3 4 5)))
+(newline)
+
+(display "Sum of (10 20 30 40): ")
+(display (sum '(10 20 30 40)))
+(newline)
+
+(display "Length of (a b c d e f): ")
+(display (length '(a b c d e f)))
+(newline)
+
+;; Multi-accumulator pattern
+(define (sum-and-product lst sum-acc prod-acc)
+  (if (null? lst)
+      (cons sum-acc prod-acc)
+      (sum-and-product (cdr lst) 
+                       (+ sum-acc (car lst))
+                       (* prod-acc (car lst)))))
+
+(display "Sum and product of (2 3 4): ")
+(display (sum-and-product '(2 3 4) 0 1))
+(newline)=== test/binary_tree.scm ===
+;; Test binary tree operations
+;; Binary tree as nested pairs: (value left right)
+
+;; Define append function
+(define (append lst1 lst2)
+  (if (null? lst1)
+      lst2
+      (cons (car lst1) (append (cdr lst1) lst2))))
+
+(define (make-tree value left right)
+  (cons value (cons left right)))
+
+(define (tree-value tree)
+  (car tree))
+
+(define (tree-left tree)
+  (car (cdr tree)))
+
+(define (tree-right tree)
+  (cdr (cdr tree)))
+
+(define (tree-insert value tree)
+  (if (null? tree)
+      (make-tree value '() '())
+      (if (< value (tree-value tree))
+          (make-tree (tree-value tree)
+                     (tree-insert value (tree-left tree))
+                     (tree-right tree))
+          (make-tree (tree-value tree)
+                     (tree-left tree)
+                     (tree-insert value (tree-right tree))))))
+
+(define (tree-inorder tree)
+  (if (null? tree)
+      '()
+      (append (tree-inorder (tree-left tree))
+              (cons (tree-value tree)
+                    (tree-inorder (tree-right tree))))))
+
+;; Test tree operations
+(define tree1 (make-tree 5 '() '()))
+(define tree2 (tree-insert 3 tree1))
+(define tree3 (tree-insert 7 tree2))
+(define tree4 (tree-insert 1 tree3))
+(define tree5 (tree-insert 9 tree4))
+
+(display "Tree in-order traversal: ")
+(display (tree-inorder tree5))
+(newline)=== test/calculator.scm ===
+(display "Reading")
+(newline)
+(let ((line (read)))
+  (cond
+   ((= (car line) '+)
+    (display (+ (car (cdr line)) (car (cdr (cdr line))))))
+   ((= (car line) '-)
+    (display (- (car (cdr line)) (car (cdr (cdr line))))))
+   ((= (car line) '*)
+    (display (* (car (cdr line)) (car (cdr (cdr line))))))))
+(newline)
+(display "Done")
+(newline)
+=== test/church_numerals.scm ===
+;; Test Church numerals - numbers as functions
+
+;; Church numeral definitions
+(define zero (lambda (f) (lambda (x) x)))
+(define one (lambda (f) (lambda (x) (f x))))
+(define two (lambda (f) (lambda (x) (f (f x)))))
+
+;; Successor function
+(define succ
+  (lambda (n)
+    (lambda (f)
+      (lambda (x)
+        (f ((n f) x))))))
+
+;; Addition
+(define add
+  (lambda (m)
+    (lambda (n)
+      (lambda (f)
+        (lambda (x)
+          ((m f) ((n f) x)))))))
+
+;; Multiplication
+(define mult
+  (lambda (m)
+    (lambda (n)
+      (lambda (f)
+        (m (n f))))))
+
+;; Convert Church numeral to regular number
+(define church-to-int
+  (lambda (n)
+    ((n (lambda (x) (+ x 1))) 0)))
+
+;; Test Church numerals
+(define three (succ two))
+(define four (succ three))
+
+(display "zero as int: ")
+(display (church-to-int zero))
+(newline)
+
+(display "one as int: ")
+(display (church-to-int one))
+(newline)
+
+(display "two as int: ")
+(display (church-to-int two))
+(newline)
+
+(display "three (succ two) as int: ")
+(display (church-to-int three))
+(newline)
+
+(display "2 + 3 = ")
+(display (church-to-int ((add two) three)))
+(newline)
+
+(display "2 * 3 = ")
+(display (church-to-int ((mult two) three)))
+(newline)=== test/closures.scm ===
+;; Test closures and lexical scoping
+
+(define (make-counter)
+  (let ((count 0))
+    (lambda ()
+      (set! count (+ count 1))
+      count)))
+
+(define (make-adder n)
+  (lambda (x) (+ x n)))
+
+(define (make-multiplier n)
+  (lambda (x) (* x n)))
+
+;; Test counter closure
+(define counter1 (make-counter))
+(define counter2 (make-counter))
+
+(display "Counter1 first call: ")
+(display (counter1))
+(newline)
+
+(display "Counter1 second call: ")
+(display (counter1))
+(newline)
+
+(display "Counter2 first call: ")
+(display (counter2))
+(newline)
+
+(display "Counter1 third call: ")
+(display (counter1))
+(newline)
+
+;; Test adder closures
+(define add5 (make-adder 5))
+(define add10 (make-adder 10))
+
+(display "add5 to 3: ")
+(display (add5 3))
+(newline)
+
+(display "add10 to 3: ")
+(display (add10 3))
+(newline)
+
+;; Test multiplier
+(define times3 (make-multiplier 3))
+(display "times3 of 4: ")
+(display (times3 4))
+(newline)[?2004hroot@69944c7bc9a2:/app# for f in test/continuation_passing.scm test/currying.scm test/fold_operations.scm test/function_composition.scm test/lazy_evaluation.scm; do echo "=== $f ==="; cat "$f"; done
+[?2004l=== test/continuation_passing.scm ===
+;; Test continuation-passing style
+
+;; Regular factorial
+(define (fact-normal n)
+  (if (= n 0)
+      1
+      (* n (fact-normal (- n 1)))))
+
+;; CPS factorial
+(define (fact-cps n cont)
+  (if (= n 0)
+      (cont 1)
+      (fact-cps (- n 1)
+                (lambda (res) (cont (* n res))))))
+
+(display "Normal factorial of 5: ")
+(display (fact-normal 5))
+(newline)
+
+(display "CPS factorial of 5: ")
+(display (fact-cps 5 (lambda (x) x)))
+(newline)
+
+;; CPS fibonacci
+(define (fib-cps n cont)
+  (cond ((= n 0) (cont 0))
+        ((= n 1) (cont 1))
+        (else 
+         (fib-cps (- n 1)
+                  (lambda (a)
+                    (fib-cps (- n 2)
+                             (lambda (b)
+                               (cont (+ a b)))))))))
+
+(display "CPS fibonacci of 6: ")
+(display (fib-cps 6 (lambda (x) x)))
+(newline)
+
+;; CPS list sum
+(define (sum-cps lst cont)
+  (if (null? lst)
+      (cont 0)
+      (sum-cps (cdr lst)
+               (lambda (rest-sum)
+                 (cont (+ (car lst) rest-sum))))))
+
+(display "CPS sum of (1 2 3 4 5): ")
+(display (sum-cps '(1 2 3 4 5) (lambda (x) x)))
+(newline)=== test/currying.scm ===
+;; Test currying and partial application
+
+;; Manual currying
+(define (curry2 f)
+  (lambda (x)
+    (lambda (y)
+      (f x y))))
+
+(define (curry3 f)
+  (lambda (x)
+    (lambda (y)
+      (lambda (z)
+        (f x y z)))))
+
+;; Uncurry
+(define (uncurry2 f)
+  (lambda (x y)
+    ((f x) y)))
+
+(define (uncurry3 f)
+  (lambda (x y z)
+    (((f x) y) z)))
+
+;; Test functions
+(define (add x y) (+ x y))
+(define (multiply x y) (* x y))
+(define (combine x y z) (+ (* x y) z))
+
+;; Curry the functions
+(define curried-add (curry2 add))
+(define curried-mult (curry2 multiply))
+(define curried-combine (curry3 combine))
+
+;; Test curried functions
+(display "Curried add 5 to 3: ")
+(display ((curried-add 5) 3))
+(newline)
+
+(define add5 (curried-add 5))
+(display "add5 to 10: ")
+(display (add5 10))
+(newline)
+
+(define mult3 (curried-mult 3))
+(display "mult3 by 7: ")
+(display (mult3 7))
+(newline)
+
+;; Test curried combine
+(display "Curried combine 2 * 3 + 4: ")
+(display (((curried-combine 2) 3) 4))
+(newline)
+
+(define combine2 (curried-combine 2))
+(define combine2-3 (combine2 3))
+(display "Partially applied combine2-3 + 5: ")
+(display (combine2-3 5))
+(newline)
+
+;; Flip arguments
+(define (flip f)
+  (lambda (y)
+    (lambda (x)
+      ((f x) y))))
+
+(define flipped-sub (flip (curry2 -)))
+(display "Flipped subtraction 10 - 3: ")
+(display ((flipped-sub 10) 3))
+(newline)
+
+;; Composition with curried functions
+(define (compose-curried f g)
+  (lambda (x)
+    (f (g x))))
+
+(define add2-then-mult3 (compose-curried mult3 (curried-add 2)))
+(display "(2 + 4) * 3 = ")
+(display (add2-then-mult3 4))
+(newline)=== test/fold_operations.scm ===
+;; Test fold/reduce operations
+
+(define (fold-left f init lst)
+  (if (null? lst)
+      init
+      (fold-left f (f init (car lst)) (cdr lst))))
+
+(define (fold-right f init lst)
+  (if (null? lst)
+      init
+      (f (car lst) (fold-right f init (cdr lst)))))
+
+(define numbers '(1 2 3 4 5))
+
+(display "Sum using fold-left: ")
+(display (fold-left + 0 numbers))
+(newline)
+
+(display "Product using fold-left: ")
+(display (fold-left * 1 numbers))
+(newline)
+
+;; List reversal using fold
+(define (reverse-fold lst)
+  (fold-left (lambda (acc x) (cons x acc)) '() lst))
+
+(display "Original: ")
+(display numbers)
+(newline)
+
+(display "Reversed: ")
+(display (reverse-fold numbers))
+(newline)
+
+;; Build list using fold-right
+(display "Copy list using fold-right: ")
+(display (fold-right cons '() numbers))
+(newline)=== test/function_composition.scm ===
+;; Test function composition and higher-order functions
+
+(define (compose f g)
+  (lambda (x) (f (g x))))
+
+(define (twice f)
+  (compose f f))
+
+(define (identity x) x)
+
+(define (add1 x) (+ x 1))
+(define (square x) (* x x))
+(define (double x) (* x 2))
+
+;; Test basic composition
+(define square-then-add1 (compose add1 square))
+(display "square then add1 of 3: ")
+(display (square-then-add1 3))
+(newline)
+
+(define add1-then-square (compose square add1))
+(display "add1 then square of 3: ")
+(display (add1-then-square 3))
+(newline)
+
+;; Test twice
+(define add2 (twice add1))
+(display "add2 (twice add1) of 5: ")
+(display (add2 5))
+(newline)
+
+(define quad (twice double))
+(display "quad (twice double) of 3: ")
+(display (quad 3))
+(newline)
+
+;; Compose multiple functions
+(define (compose3 f g h)
+  (lambda (x) (f (g (h x)))))
+
+(define complex (compose3 square add1 double))
+(display "double, add1, then square of 2: ")
+(display (complex 2))
+(newline)
+
+;; Function that returns composed function
+(define (make-pipeline . funcs)
+  (if (null? funcs)
+      identity
+      (if (null? (cdr funcs))
+          (car funcs)
+          (compose (car funcs)
+                   (make-pipeline (cdr funcs))))))
+
+;; This won't work without rest parameters, so simplified version:
+(define pipeline (compose square (compose add1 double)))
+(display "Pipeline (double, add1, square) of 3: ")
+(display (pipeline 3))
+(newline)=== test/lazy_evaluation.scm ===
+;; Test lazy evaluation patterns using thunks
+
+;; Force - evaluates a thunk
+(define (force thunk)
+  (thunk))
+
+;; Lazy cons (streams) - b must be a thunk
+(define (cons-stream a b-thunk)
+  (cons a b-thunk))
+
+(define (stream-car stream)
+  (car stream))
+
+(define (stream-cdr stream)
+  (force (cdr stream)))
+
+;; Infinite stream of integers starting from n
+(define (integers-from n)
+  (cons-stream n (lambda () (integers-from (+ n 1)))))
+
+;; Take first n elements from stream
+(define (stream-take n stream)
+  (if (= n 0)
+      '()
+      (cons (stream-car stream)
+            (stream-take (- n 1) (stream-cdr stream)))))
+
+;; Stream map
+(define (stream-map f stream)
+  (cons-stream (f (stream-car stream))
+               (lambda () (stream-map f (stream-cdr stream)))))
+
+;; Test basic streams
+(define nats (integers-from 1))
+
+(display "First 10 natural numbers: ")
+(display (stream-take 10 nats))
+(newline)
+
+;; Stream of squares
+(define squares (stream-map (lambda (x) (* x x)) nats))
+
+(display "First 8 squares: ")
+(display (stream-take 8 squares))
+(newline)
+
+;; Fibonacci stream
+(define (fib-stream)
+  (define (fib-gen a b)
+    (cons-stream a (lambda () (fib-gen b (+ a b)))))
+  (fib-gen 0 1))
+
+(display "First 10 Fibonacci numbers: ")
+(display (stream-take 10 (fib-stream)))
+(newline)[?2004hroot@69944c7bc9a2:/app# cat test/continuation_passing.scm
+[?2004l;; Test continuation-passing style
+
+;; Regular factorial
+(define (fact-normal n)
+  (if (= n 0)
+      1
+      (* n (fact-normal (- n 1)))))
+
+;; CPS factorial
+(define (fact-cps n cont)
+  (if (= n 0)
+      (cont 1)
+      (fact-cps (- n 1)
+                (lambda (res) (cont (* n res))))))
+
+(display "Normal factorial of 5: ")
+(display (fact-normal 5))
+(newline)
+
+(display "CPS factorial of 5: ")
+(display (fact-cps 5 (lambda (x) x)))
+(newline)
+
+;; CPS fibonacci
+(define (fib-cps n cont)
+  (cond ((= n 0) (cont 0))
+        ((= n 1) (cont 1))
+        (else 
+         (fib-cps (- n 1)
+                  (lambda (a)
+                    (fib-cps (- n 2)
+                             (lambda (b)
+                               (cont (+ a b)))))))))
+
+(display "CPS fibonacci of 6: ")
+(display (fib-cps 6 (lambda (x) x)))
+(newline)
+
+;; CPS list sum
+(define (sum-cps lst cont)
+  (if (null? lst)
+      (cont 0)
+      (sum-cps (cdr lst)
+               (lambda (rest-sum)
+                 (cont (+ (car lst) rest-sum))))))
+
+(display "CPS sum of (1 2 3 4 5): ")
+(display (sum-cps '(1 2 3 4 5) (lambda (x) x)))
+(newline)[?2004hroot@69944c7bc9a2:/app# cat test/currying.scm
+[?2004l;; Test currying and partial application
+
+;; Manual currying
+(define (curry2 f)
+  (lambda (x)
+    (lambda (y)
+      (f x y))))
+
+(define (curry3 f)
+  (lambda (x)
+    (lambda (y)
+      (lambda (z)
+        (f x y z)))))
+
+;; Uncurry
+(define (uncurry2 f)
+  (lambda (x y)
+    ((f x) y)))
+
+(define (uncurry3 f)
+  (lambda (x y z)
+    (((f x) y) z)))
+
+;; Test functions
+(define (add x y) (+ x y))
+(define (multiply x y) (* x y))
+(define (combine x y z) (+ (* x y) z))
+
+;; Curry the functions
+(define curried-add (curry2 add))
+(define curried-mult (curry2 multiply))
+(define curried-combine (curry3 combine))
+
+;; Test curried functions
+(display "Curried add 5 to 3: ")
+(display ((curried-add 5) 3))
+(newline)
+
+(define add5 (curried-add 5))
+(display "add5 to 10: ")
+(display (add5 10))
+(newline)
+
+(define mult3 (curried-mult 3))
+(display "mult3 by 7: ")
+(display (mult3 7))
+(newline)
+
+;; Test curried combine
+(display "Curried combine 2 * 3 + 4: ")
+(display (((curried-combine 2) 3) 4))
+(newline)
+
+(define combine2 (curried-combine 2))
+(define combine2-3 (combine2 3))
+(display "Partially applied combine2-3 + 5: ")
+(display (combine2-3 5))
+(newline)
+
+;; Flip arguments
+(define (flip f)
+  (lambda (y)
+    (lambda (x)
+      ((f x) y))))
+
+(define flipped-sub (flip (curry2 -)))
+(display "Flipped subtraction 10 - 3: ")
+(display ((flipped-sub 10) 3))
+(newline)
+
+;; Composition with curried functions
+(define (compose-curried f g)
+  (lambda (x)
+    (f (g x))))
+
+(define add2-then-mult3 (compose-curried mult3 (curried-add 2)))
+(display "(2 + 4) * 3 = ")
+(display (add2-then-mult3 4))
+(newline)[?2004hroot@69944c7bc9a2:/app# echo "======================"
+[?2004l======================
+[?2004hroot@69944c7bc9a2:/app# cat test/fold_operations.scm
+[?2004l;; Test fold/reduce operations
+
+(define (fold-left f init lst)
+  (if (null? lst)
+      init
+      (fold-left f (f init (car lst)) (cdr lst))))
+
+(define (fold-right f init lst)
+  (if (null? lst)
+      init
+      (f (car lst) (fold-right f init (cdr lst)))))
+
+(define numbers '(1 2 3 4 5))
+
+(display "Sum using fold-left: ")
+(display (fold-left + 0 numbers))
+(newline)
+
+(display "Product using fold-left: ")
+(display (fold-left * 1 numbers))
+(newline)
+
+;; List reversal using fold
+(define (reverse-fold lst)
+  (fold-left (lambda (acc x) (cons x acc)) '() lst))
+
+(display "Original: ")
+(display numbers)
+(newline)
+
+(display "Reversed: ")
+(display (reverse-fold numbers))
+(newline)
+
+;; Build list using fold-right
+(display "Copy list using fold-right: ")
+(display (fold-right cons '() numbers))
+(newline)[?2004hroot@69944c7bc9a2:/app# cat test/function_composition.scm test/list_operations.scm 2>&1 | head -100
+[?2004l;; Test function composition and higher-order functions
+
+(define (compose f g)
+  (lambda (x) (f (g x))))
+
+(define (twice f)
+  (compose f f))
+
+(define (identity x) x)
+
+(define (add1 x) (+ x 1))
+(define (square x) (* x x))
+(define (double x) (* x 2))
+
+;; Test basic composition
+(define square-then-add1 (compose add1 square))
+(display "square then add1 of 3: ")
+(display (square-then-add1 3))
+(newline)
+
+(define add1-then-square (compose square add1))
+(display "add1 then square of 3: ")
+(display (add1-then-square 3))
+(newline)
+
+;; Test twice
+(define add2 (twice add1))
+(display "add2 (twice add1) of 5: ")
+(display (add2 5))
+(newline)
+
+(define quad (twice double))
+(display "quad (twice double) of 3: ")
+(display (quad 3))
+(newline)
+
+;; Compose multiple functions
+(define (compose3 f g h)
+  (lambda (x) (f (g (h x)))))
+
+(define complex (compose3 square add1 double))
+(display "double, add1, then square of 2: ")
+(display (complex 2))
+(newline)
+
+;; Function that returns composed function
+(define (make-pipeline . funcs)
+  (if (null? funcs)
+      identity
+      (if (null? (cdr funcs))
+          (car funcs)
+          (compose (car funcs)
+                   (make-pipeline (cdr funcs))))))
+
+;; This won't work without rest parameters, so simplified version:
+(define pipeline (compose square (compose add1 double)))
+(display "Pipeline (double, add1, square) of 3: ")
+(display (pipeline 3))
+(newline);; Test complex list operations
+
+;; Define helper functions
+(define (or a b)
+  (if a #t b))
+
+(define (append lst1 lst2)
+  (if (null? lst1)
+      lst2
+      (cons (car lst1) (append (cdr lst1) lst2))))
+
+;; Zip two lists together
+(define (zip lst1 lst2)
+  (if (or (null? lst1) (null? lst2))
+      '()
+      (cons (cons (car lst1) (car lst2))
+            (zip (cdr lst1) (cdr lst2)))))
+
+;; Flatten a nested list
+(define (flatten lst)
+  (cond ((null? lst) '())
+        ((pair? (car lst))
+         (append (flatten (car lst)) (flatten (cdr lst))))
+        (else (cons (car lst) (flatten (cdr lst))))))
+
+;; Partition list by predicate
+(define (partition pred lst)
+  (if (null? lst)
+      (cons '() '())
+      (let ((rest (partition pred (cdr lst))))
+        (if (pred (car lst))
+            (cons (cons (car lst) (car rest)) (cdr rest))
+            (cons (car rest) (cons (car lst) (cdr rest)))))))
+
+;; Remove duplicates
+(define (member? x lst)
+  (cond ((null? lst) #f)
+        ((equal? x (car lst)) #t)
+        (else (member? x (cdr lst)))))
+
+(define (remove-duplicates lst)
+  (if (null? lst)
+[?2004hroot@69944c7bc9a2:/app# cat test/oeis_sequences.scm | head -60
+[?2004l;; Test OEIS sequences
+
+;; A000045 - Fibonacci sequence
+(define (fibonacci n)
+  (cond ((= n 0) 0)
+        ((= n 1) 1)
+        (else (+ (fibonacci (- n 1))
+                 (fibonacci (- n 2))))))
+
+;; A001045 - Jacobsthal numbers: a(n) = a(n-1) + 2*a(n-2)
+(define (jacobsthal n)
+  (cond ((= n 0) 0)
+        ((= n 1) 1)
+        (else (+ (jacobsthal (- n 1))
+                 (* 2 (jacobsthal (- n 2)))))))
+
+;; A000041 - Partition numbers (simplified recursive version)
+;; Number of ways to partition n
+(define (partition-count n)
+  (define (p n k)
+    (cond ((= n 0) 1)
+          ((< n 0) 0)
+          ((= k 0) 0)
+          (else (+ (p n (- k 1))
+                   (p (- n k) k)))))
+  (p n n))
+
+;; A000142 - Factorial numbers
+(define (factorial n)
+  (if (= n 0)
+      1
+      (* n (factorial (- n 1)))))
+
+;; A000110 - Bell numbers (number of partitions of a set)
+;; Using recursive formula with Stirling numbers
+(define (bell n)
+  (define (stirling2 n k)
+    (cond ((= n 0) (if (= k 0) 1 0))
+          ((= k 0) 0)
+          ((= k n) 1)
+          (else (+ (* k (stirling2 (- n 1) k))
+                   (stirling2 (- n 1) (- k 1))))))
+  (define (sum-stirling n k acc)
+    (if (> k n)
+        acc
+        (sum-stirling n (+ k 1) (+ acc (stirling2 n k)))))
+  (if (= n 0)
+      1
+      (sum-stirling n 0 0)))
+
+;; Generate first n terms of a sequence
+(define (generate-sequence f n)
+  (define (gen i)
+    (if (>= i n)
+        '()
+        (cons (f i) (gen (+ i 1)))))
+  (gen 0))
+
+;; Display sequences
+(display "First 10 Fibonacci numbers (A000045): ")
+[?2004hroot@69944c7bc9a2:/app# cat test/oeis_sequences2.scm | head -60
+[?2004l;; More OEIS sequences
+
+;; Define and function
+(define (and a b)
+  (if a b #f))
+
+;; A000108 - Catalan numbers - using iterative approach to avoid timeout
+(define (catalan n)
+  (if (= n 0)
+      1
+      (if (= n 1)
+          1
+          (if (= n 2)
+              2
+              (if (= n 3)
+                  5
+                  (if (= n 4)
+                      14
+                      (if (= n 5)
+                          42
+                          (if (= n 6)
+                              132
+                              (if (= n 7)
+                                  429
+                                  0)))))))))
+
+;; A000040 - Prime numbers (using trial division)
+(define (is-prime? n)
+  (cond ((< n 2) #f)
+        ((= n 2) #t)
+        ((= (- n (* (/ n 2) 2)) 0) #f)
+        (else
+         (define (check d)
+           (cond ((> (* d d) n) #t)
+                 ((= (- n (* (/ n d) d)) 0) #f)
+                 (else (check (+ d 2)))))
+         (check 3))))
+
+(define (nth-prime n)
+  (define (find-prime count num)
+    (cond ((= count n) (- num 1))
+          ((is-prime? num) (find-prime (+ count 1) (+ num 1)))
+          (else (find-prime count (+ num 1)))))
+  (if (= n 0)
+      2
+      (find-prime 0 2)))
+
+;; A001097 - Twin primes (primes p where p+2 is also prime)
+(define (is-twin-prime? p)
+  (and (is-prime? p) (is-prime? (+ p 2))))
+
+(define (nth-twin-prime n)
+  (define (find-twin count num)
+    (cond ((= count n) (- num 1))
+          ((is-twin-prime? num) (find-twin (+ count 1) (+ num 1)))
+          (else (find-twin count (+ num 1)))))
+  (find-twin 0 2))
+
+;; A000217 - Triangular numbers: T(n) = n*(n+1)/2
+(define (triangular n)
+[?2004hroot@69944c7bc9a2:/app# tail -30 test/oeis_sequences.scm; echo ===; tail -40 test/oeis_sequences2.scm; echo ===; head -50 test/oeis_sequences3.scm
+[?2004l      (sum-stirling n 0 0)))
+
+;; Generate first n terms of a sequence
+(define (generate-sequence f n)
+  (define (gen i)
+    (if (>= i n)
+        '()
+        (cons (f i) (gen (+ i 1)))))
+  (gen 0))
+
+;; Display sequences
+(display "First 10 Fibonacci numbers (A000045): ")
+(display (generate-sequence fibonacci 10))
+(newline)
+
+(display "First 10 Jacobsthal numbers (A001045): ")
+(display (generate-sequence jacobsthal 10))
+(newline)
+
+(display "First 8 Partition numbers (A000041): ")
+(display (generate-sequence partition-count 8))
+(newline)
+
+(display "First 8 Factorial numbers (A000142): ")
+(display (generate-sequence factorial 8))
+(newline)
+
+(display "First 6 Bell numbers (A000110): ")
+(display (generate-sequence bell 6))
+(newline)===
+    (cond ((= count n) (- num 1))
+          ((is-twin-prime? num) (find-twin (+ count 1) (+ num 1)))
+          (else (find-twin count (+ num 1)))))
+  (find-twin 0 2))
+
+;; A000217 - Triangular numbers: T(n) = n*(n+1)/2
+(define (triangular n)
+  (/ (* n (+ n 1)) 2))
+
+;; A000290 - Square numbers
+(define (square-num n)
+  (* n n))
+
+;; Generate sequences
+(define (generate-n f n)
+  (define (gen i)
+    (if (>= i n)
+        '()
+        (cons (f i) (gen (+ i 1)))))
+  (gen 0))
+
+(display "First 8 Catalan numbers (A000108): ")
+(display (generate-n catalan 8))
+(newline)
+
+(display "First 8 Prime numbers (A000040): ")
+(display (generate-n nth-prime 8))
+(newline)
+
+(display "First 5 Twin primes (A001097): ")
+(display (generate-n nth-twin-prime 5))
+(newline)
+
+(display "First 10 Triangular numbers (A000217): ")
+(display (generate-n triangular 10))
+(newline)
+
+(display "First 10 Square numbers (A000290): ")
+(display (generate-n square-num 10))
+(newline)===
+;; More interesting OEIS sequences
+
+;; A006577 - Number of steps for Collatz sequence to reach 1
+(define (collatz-steps n)
+  (define (collatz n steps)
+    (cond ((= n 1) steps)
+          ((= (- n (* (/ n 2) 2)) 0) 
+           (collatz (/ n 2) (+ steps 1)))
+          (else 
+           (collatz (+ (* 3 n) 1) (+ steps 1)))))
+  (if (<= n 0)
+      0
+      (collatz n 0)))
+
+;; A000129 - Pell numbers: a(n) = 2*a(n-1) + a(n-2)
+(define (pell n)
+  (cond ((= n 0) 0)
+        ((= n 1) 1)
+        (else (+ (* 2 (pell (- n 1)))
+                 (pell (- n 2))))))
+
+;; A002110 - Primorial numbers: product of first n primes
+(define (is-prime? n)
+  (cond ((< n 2) #f)
+        ((= n 2) #t)
+        ((= (- n (* (/ n 2) 2)) 0) #f)
+        (else
+         (define (check d)
+           (cond ((> (* d d) n) #t)
+                 ((= (- n (* (/ n d) d)) 0) #f)
+                 (else (check (+ d 2)))))
+         (check 3))))
+
+(define (nth-prime n)
+  (define (find-prime count num)
+    (cond ((= count n) (- num 1))
+          ((is-prime? num) (find-prime (+ count 1) (+ num 1)))
+          (else (find-prime count (+ num 1)))))
+  (if (= n 0)
+      2
+      (find-prime 0 2)))
+
+(define (primorial n)
+  (if (= n 0)
+      1
+      (* (nth-prime (- n 1)) (primorial (- n 1)))))
+
+;; A000984 - Central binomial coefficients: C(2n,n)
+(define (factorial n)
+  (if (= n 0)
+[?2004hroot@69944c7bc9a2:/app# cat test/memoization.scm test/nested_defines.scm 2>&1 | head -120
+[?2004l;; Test memoization pattern
+
+;; Define assoc function
+(define (assoc key alist)
+  (cond ((null? alist) #f)
+        ((equal? key (car (car alist))) (car alist))
+        (else (assoc key (cdr alist)))))
+
+;; Simple association list
+(define (make-alist) '())
+
+(define (alist-get key alist)
+  (let ((pair (assoc key alist)))
+    (if pair
+        (cdr pair)
+        #f)))
+
+(define (alist-set key val alist)
+  (cons (cons key val) alist))
+
+;; Memoized fibonacci
+(define (make-memo-fib)
+  (let ((cache (make-alist)))
+    (define (fib n)
+      (let ((cached (alist-get n cache)))
+        (if cached
+            cached
+            (let ((result
+                   (cond ((= n 0) 0)
+                         ((= n 1) 1)
+                         (else (+ (fib (- n 1))
+                                  (fib (- n 2)))))))
+              (set! cache (alist-set n result cache))
+              result))))
+    fib))
+
+(define memo-fib (make-memo-fib))
+
+(display "Memoized fib(10): ")
+(display (memo-fib 10))
+(newline)
+
+(display "Memoized fib(10) again (from cache): ")
+(display (memo-fib 10))
+(newline)
+
+;; Generic memoizer
+(define (memoize f)
+  (let ((cache (make-alist)))
+    (lambda (x)
+      (let ((cached (alist-get x cache)))
+        (if cached
+            cached
+            (let ((result (f x)))
+              (set! cache (alist-set x result cache))
+              result))))))
+
+;; Test with expensive computation
+(define (slow-square x)
+  (display "Computing square of ")
+  (display x)
+  (display "...")
+  (newline)
+  (* x x))
+
+(define fast-square (memoize slow-square))
+
+(display "First call: ")
+(display (fast-square 5))
+(newline)
+
+(display "Second call (cached): ")
+(display (fast-square 5))
+(newline);; Test nested defines and lexical scoping
+
+(define (outer-function x)
+  (define a 10)
+  (define b 20)
+  
+  (define (middle-function y)
+    (define c 30)
+    
+    (define (inner-function z)
+      (define d 40)
+      (+ (+ (+ (+ (+ (+ a b) c) d) x) y) z))
+    
+    (define (another-inner w)
+      (* (* c w) y))
+    
+    (+ (inner-function 5) (another-inner 2)))
+  
+  (define (parallel-middle m)
+    (define e 50)
+    (* (* (* (* a b) e) m) x))
+  
+  (+ (middle-function 3) (parallel-middle 2)))
+
+(display "Nested defines result: ")
+(display (outer-function 1))
+(newline)
+
+;; Test mutual recursion with nested defines
+(define (test-mutual n)
+  (define (even? x)
+    (if (= x 0)
+        #t
+        (odd? (- x 1))))
+  
+  (define (odd? x)
+    (if (= x 0)
+        #f
+        (even? (- x 1))))
+  
+  (display n)
+  (display " is ")
+  (display (if (even? n) "even" "odd"))
+  (newline))
+
+(test-mutual 4)
+(test-mutual 7)
+[?2004hroot@69944c7bc9a2:/app# cat test/test_read.scm test/variadic_functions.scm
+[?2004l(display "Reading")
+(newline)
+(display (read))
+(newline)
+(display "Done")
+(newline)
+;; Test variable argument functions (simulated)
+
+;; Define helper functions
+(define (append lst1 lst2)
+  (if (null? lst1)
+      lst2
+      (cons (car lst1) (append (cdr lst1) lst2))))
+
+(define (list3 a b c)
+  (cons a (cons b (cons c '()))))
+
+;; Since we don't have rest parameters, simulate with lists
+
+;; Sum any number of arguments
+(define (sum-all lst)
+  (if (null? lst)
+      0
+      (+ (car lst) (sum-all (cdr lst)))))
+
+;; Product of all arguments
+(define (product-all lst)
+  (if (null? lst)
+      1
+      (* (car lst) (product-all (cdr lst)))))
+
+;; Max of all arguments
+(define (max-all lst)
+  (if (null? lst)
+      #f
+      (if (null? (cdr lst))
+          (car lst)
+          (let ((rest-max (max-all (cdr lst))))
+            (if (> (car lst) rest-max)
+                (car lst)
+                rest-max)))))
+
+;; Min of all arguments
+(define (min-all lst)
+  (if (null? lst)
+      #f
+      (if (null? (cdr lst))
+          (car lst)
+          (let ((rest-min (min-all (cdr lst))))
+            (if (< (car lst) rest-min)
+                (car lst)
+                rest-min)))))
+
+;; Create list from arguments
+(define (list-of lst) lst)
+
+;; Concatenate all lists
+(define (concat-all lsts)
+  (if (null? lsts)
+      '()
+      (append (car lsts) (concat-all (cdr lsts)))))
+
+;; Tests
+(display "Sum of (1 2 3 4 5): ")
+(display (sum-all '(1 2 3 4 5)))
+(newline)
+
+(display "Product of (2 3 4): ")
+(display (product-all '(2 3 4)))
+(newline)
+
+(display "Max of (3 1 4 1 5 9 2 6): ")
+(display (max-all '(3 1 4 1 5 9 2 6)))
+(newline)
+
+(display "Min of (3 1 4 1 5 9 2 6): ")
+(display (min-all '(3 1 4 1 5 9 2 6)))
+(newline)
+
+(display "Concatenate ((1 2) (3 4) (5 6)): ")
+(display (concat-all '((1 2) (3 4) (5 6))))
+(newline)
+
+;; Function that takes function and applies to all args
+(define (apply-to-all f lst)
+  (if (null? lst)
+      '()
+      (cons (f (car lst)) (apply-to-all f (cdr lst)))))
+
+(display "Square all (1 2 3 4): ")
+(display (apply-to-all (lambda (x) (* x x)) '(1 2 3 4)))
+(newline)
+
+;; Compose functions variadic style
+(define (compose-all funcs)
+  (if (null? funcs)
+      (lambda (x) x)
+      (if (null? (cdr funcs))
+          (car funcs)
+          (lambda (x)
+            ((car funcs) ((compose-all (cdr funcs)) x))))))
+
+(define add1 (lambda (x) (+ x 1)))
+(define double (lambda (x) (* x 2)))
+(define square (lambda (x) (* x x)))
+
+(define complex-fn (compose-all (list3 square double add1)))
+(display "((x + 1) * 2)^2 of 3: ")
+(display (complex-fn 3))
+(newline)[?2004hroot@69944c7bc9a2:/app# head -40 test/y_combinator.scm; echo ====; head -40 test/recursive_structures.scm
+[?2004l;; Test Y combinator and fixed-point recursion
+
+;; Y combinator (applicative order version)
+(define Y
+  (lambda (f)
+    ((lambda (x) (f (lambda (v) ((x x) v))))
+     (lambda (x) (f (lambda (v) ((x x) v)))))))
+
+;; Factorial using Y combinator
+(define factorial
+  (Y (lambda (fact)
+       (lambda (n)
+         (if (= n 0)
+             1
+             (* n (fact (- n 1))))))))
+
+(display "Factorial of 5 using Y combinator: ")
+(display (factorial 5))
+(newline)
+
+;; Fibonacci using Y combinator
+(define fib
+  (Y (lambda (fib)
+       (lambda (n)
+         (cond ((= n 0) 0)
+               ((= n 1) 1)
+               (else (+ (fib (- n 1)) (fib (- n 2)))))))))
+
+(display "First 8 Fibonacci numbers: ")
+(define (show-fibs n)
+  (if (>= n 0)
+      (begin
+        (show-fibs (- n 1))
+        (display (fib n))
+        (display " "))))
+(show-fibs 7)
+(newline)====
+;; Test recursive data structures
+
+;; Define helper functions
+(define (append lst1 lst2)
+  (if (null? lst1)
+      lst2
+      (cons (car lst1) (append (cdr lst1) lst2))))
+
+(define (list x)
+  (cons x '()))
+
+;; Simple stack implementation
+(define (make-stack) '())
+(define (push stack val) (cons val stack))
+(define (pop stack) (cdr stack))
+(define (top stack) (car stack))
+(define (empty? stack) (null? stack))
+
+;; Queue implementation using two stacks
+(define (make-queue) (cons '() '()))
+(define (enqueue q val)
+  (cons (cons val (car q)) (cdr q)))
+
+(define (dequeue q)
+  (if (null? (cdr q))
+      (let ((reversed (reverse (car q))))
+        (cons '() (cdr reversed)))
+      (cons (car q) (cdr (cdr q)))))
+
+(define (front q)
+  (if (null? (cdr q))
+      (car (reverse (car q)))
+      (car (cdr q))))
+
+(define (reverse lst)
+  (if (null? lst)
+      '()
+      (append (reverse (cdr lst)) (list (car lst)))))
+
+;; Association list (dictionary)
+[?2004hroot@69944c7bc9a2:/app# echo '(+ 7 8)' | python3 interp.py test/calculator.scm
+[?2004lReading
+15
+Done
+[?2004hroot@69944c7bc9a2:/app# mkdir -p /tmp/base /tmp/eval && cd /app
+[?2004l[?2004hroot@69944c7bc9a2:/app# for f in test/*.scm; do
+[?2004l[?2004h>   name=$(basename $f .scm)
+[?2004l[?2004h>   case $name in
+[?2004l[?2004h>     calculator | test_read) printf '(+ 7 8)\n' | python3 interp.py $f > /tmp/base/$name.txt 2>&1;;
+[?2004l[?2004h>     06-interactive-io) printf '3 4 +\nquit\n' | python3 interp.py $f > /tmp/base/$name.txt 2>&1;;
+[?2004l[?2004h>     *) python3 interp.py $f < /dev/null > /tmp/base/$name.txt 2>&1;;
+[?2004l[?2004h>   esac
+[?2004l[?2004h> done
+[?2004l[?2004hroot@69944c7bc9a2:/app# echo DONE; for f in /tmp/base/*.txt; do echo "=== $f ==="; head -c 300 $f; echo; done
+[?2004lDONE
+=== /tmp/base/01-factorial.txt ===
+120
+3628800
+2432902008176640000
+
+=== /tmp/base/02-fibonacci.txt ===
+(0 1 1 2 3 5 8 13 21 34)
+6765
+
+=== /tmp/base/03-list-operations.txt ===
+(1 2 3 4 5)
+5
+(5 4 3 2 1)
+(1 4 9 16 25)
+(2 4)
+
+=== /tmp/base/04-higher-order.txt ===
+8
+13
+26
+36
+15
+120
+
+=== /tmp/base/05-simple-io.txt ===
+Testing simple I/O...
+String: Hello, World!
+Number: 42
+Boolean true: True
+Boolean false: False
+List: (1 2 3 4 5)
+Character output: A B C
+Progn with side effects: First Second Third
+Conditional display: 5 is greater than 3
+Simple I/O tests completed!
+
+=== /tmp/base/06-interactive-io.txt ===
+Interactive calculator
+Enter two numbers and an operation (+, -, *, /)
+First number: Second number: Operation (+, -, *, /): Unexpected error: EOF when reading a line
+
+=== /tmp/base/08-progn-sequencing.txt ===
+Testing progn sequencing:
+First... Second... Third... Result: 30
+Counting: 1 2 3
+For loop 1-5: 1 2 3 4 5 
+x = 10, y = 20, x + y = 30
+
+=== /tmp/base/09-mutual-recursion.txt ===
+Testing even? and odd?:
+0 is even
+1 is odd
+10 is even
+15 is odd
+100 is even
+Alternate elements of (1 2 3 4 5 6 7 8):
+Even positions: (1 3 5 7)
+Odd positions: (2 4 6 8)
+
+=== /tmp/base/10-advanced-features.txt ===
+Factorial using Y combinator:
+5! = 120
+Person data:
+Name: ('.' "John")
+Age: ('.' 30)
+Counter object:
+After 2 increments: 2
+After reset: 0
+File handling with callback:
+File written successfully
+
+=== /tmp/base/accumulator_patterns.txt ===
+Factorial of 6: 720
+Reverse of (1 2 3 4 5): (5 4 3 2 1)
+Sum of (10 20 30 40): 100
+Length of (a b c d e f): 6
+Sum and product of (2 3 4): (9 . 24)
+
+=== /tmp/base/binary_tree.txt ===
+Tree in-order traversal: (1 3 5 7 9)
+
+=== /tmp/base/calculator.txt ===
+Reading
+15
+Done
+
+=== /tmp/base/church_numerals.txt ===
+zero as int: 0
+one as int: 1
+two as int: 2
+three (succ two) as int: 3
+2 + 3 = 5
+2 * 3 = 6
+
+=== /tmp/base/closures.txt ===
+Counter1 first call: 1
+Counter1 second call: 2
+Counter2 first call: 1
+Counter1 third call: 3
+add5 to 3: 8
+add10 to 3: 13
+times3 of 4: 12
+
+=== /tmp/base/continuation_passing.txt ===
+Normal factorial of 5: 120
+CPS factorial of 5: 120
+CPS fibonacci of 6: 8
+CPS sum of (1 2 3 4 5): 15
+
+=== /tmp/base/currying.txt ===
+Curried add 5 to 3: 8
+add5 to 10: 15
+mult3 by 7: 21
+Curried combine 2 * 3 + 4: 10
+Partially applied combine2-3 + 5: 11
+Flipped subtraction 10 - 3: -7
+(2 + 4) * 3 = 18
+
+=== /tmp/base/filter_operations.txt ===
+All numbers: (1 2 3 4 5 6 7 8 9 10)
+Even numbers: (2 4 6 8 10)
+Odd numbers: (1 3 5 7 9)
+Mixed numbers: (-3 -2 -1 0 1 2 3)
+Positive numbers: (1 2 3)
+
+=== /tmp/base/fold_operations.txt ===
+Sum using fold-left: 15
+Product using fold-left: 120
+Original: (1 2 3 4 5)
+Reversed: (5 4 3 2 1)
+Copy list using fold-right: (1 2 3 4 5)
+
+=== /tmp/base/function_composition.txt ===
+square then add1 of 3: 10
+add1 then square of 3: 16
+add2 (twice add1) of 5: 7
+quad (twice double) of 3: 12
+double, add1, then square of 2: 25
+Pipeline (double, add1, square) of 3: 49
+
+=== /tmp/base/lazy_evaluation.txt ===
+First 10 natural numbers: (1 2 3 4 5 6 7 8 9 10)
+First 8 squares: (1 4 9 16 25 36 49 64)
+First 10 Fibonacci numbers: (0 1 1 2 3 5 8 13 21 34)
+
+=== /tmp/base/list_operations.txt ===
+Zip (1 2 3) with (a b c): ((1 . 'a') (2 . 'b') (3 . 'c'))
+Flatten ((1 2) (3 (4 5)) 6): (1 2 3 4 5 6)
+Partition evens from (1 2 3 4 5 6): ((2 4 6) 1 3 5)
+Remove duplicates from (1 2 3 2 4 3 5): (1 2 4 3 5)
+
+=== /tmp/base/map_operations.txt ===
+Original list: (1 2 3 4 5)
+Squared: (1 4 9 16 25)
+Doubled: (2 4 6 8 10)
+Add 1: (2 3 4 5 6)
+Double then double again: (4 8 12 16 20)
+
+=== /tmp/base/memoization.txt ===
+Memoized fib(10): 55
+Memoized fib(10) again (from cache): 55
+First call: Computing square of 5...
+25
+Second call (cached): 25
+
+=== /tmp/base/mutual_recursion.txt ===
+Is 4 even? True
+Is 7 even? False
+Is 7 odd? True
+First 10 Female sequence values: 1 1 2 2 3 3 4 5 5 6 
+First 10 Male sequence values: 0 0 1 2 2 3 4 4 5 6 
+Nodes in tree: 6
+Parse expression: ('a' 'b' 'c' 'd' 'e' 'f')
+
+=== /tmp/base/nested_defines.txt ===
+Nested defines result: 20289
+4 is even
+7 is odd
+Nested define: 25
+
+=== /tmp/base/oeis_sequences.txt ===
+First 10 Fibonacci numbers (A000045): (0 1 1 2 3 5 8 13 21 34)
+First 10 Jacobsthal numbers (A001045): (0 1 1 3 5 11 21 43 85 171)
+First 8 Partition numbers (A000041): (1 1 2 3 5 7 11 15)
+First 8 Factorial numbers (A000142): (1 1 2 6 24 120 720 5040)
+First 6 Bell numbers (A000110): (1 1 2 5 15 52)
+
+=== /tmp/base/oeis_sequences2.txt ===
+First 8 Catalan numbers (A000108): (1 1 2 5 14 42 132 429)
+First 8 Prime numbers (A000040): (2 2 3 5 7 11 13 17)
+First 5 Twin primes (A001097): (1 3 5 11 17)
+First 10 Triangular numbers (A000217): (0 1 3 6 10 15 21 28 36 45)
+First 10 Square numbers (A000290): (0 1 4 9 16 25 36 49 64 81)
+
+=== /tmp/base/oeis_sequences3.txt ===
+Collatz steps for 1-10 (A006577): (0 1 7 2 5 8 16 3 19 6)
+First 10 Pell numbers (A000129): (0 1 2 5 12 29 70 169 408 985)
+First 6 Primorial numbers (A002110): (2 4 12 60 420 4620)
+First 6 Central binomial coefficients (A000984): (1 2 6 20 70 252)
+First 8 Derangements (A000166): (1 0 1 2 9 44 265 185
+=== /tmp/base/recursive_structures.txt ===
+Stack operations: Top: 3, After pop: 2
+Queue operations: Front: 1, After dequeue: 2
+Dictionary operations: Get 'b': 2, Get 'x': False
+Tree map (double all values): Root: 2, First child: 4
+
+=== /tmp/base/test_read.txt ===
+Reading
+('+' 7 8)
+Done
+
+=== /tmp/base/variadic_functions.txt ===
+Sum of (1 2 3 4 5): 15
+Product of (2 3 4): 24
+Max of (3 1 4 1 5 9 2 6): 9
+Min of (3 1 4 1 5 9 2 6): 1
+Concatenate ((1 2) (3 4) (5 6)): (1 2 3 4 5 6)
+Square all (1 2 3 4): (1 4 9 16)
+((x + 1) * 2)^2 of 3: 64
+
+=== /tmp/base/y_combinator.txt ===
+Factorial of 5 using Y combinator: 120
+First 8 Fibonacci numbers: 0 1 1 2 3 5 8 13 
+
+[?2004hroot@69944c7bc9a2:/app# ls /tmp/base | wc -l; grep -l -i "error\|traceback\|recursion" /tmp/base/*.txt; echo CHECK-DONE
+[?2004l32
+/tmp/base/06-interactive-io.txt
+CHECK-DONE
+[?2004hroot@69944c7bc9a2:/app# cat /tmp/base/01-factorial.txt /tmp/base/02-fibonacci.txt /tmp/base/03-list-operations.txt /tmp/base/05-simple-io.txt
+[?2004l120
+3628800
+2432902008176640000
+(0 1 1 2 3 5 8 13 21 34)
+6765
+(1 2 3 4 5)
+5
+(5 4 3 2 1)
+(1 4 9 16 25)
+(2 4)
+Testing simple I/O...
+String: Hello, World!
+Number: 42
+Boolean true: True
+Boolean false: False
+List: (1 2 3 4 5)
+Character output: A B C
+Progn with side effects: First Second Third
+Conditional display: 5 is greater than 3
+Simple I/O tests completed!
+[?2004hroot@69944c7bc9a2:/app# cat /tmp/base/06-interactive-io.txt | head -20; grep -i "error\|traceback\|recursion" /tmp/base/06-interactive-io.txt
+[?2004lInteractive calculator
+Enter two numbers and an operation (+, -, *, /)
+First number: Second number: Operation (+, -, *, /): Unexpected error: EOF when reading a line
+First number: Second number: Operation (+, -, *, /): Unexpected error: EOF when reading a line
+[?2004hroot@69944c7bc9a2:/app# cat > /app/eval.scm <<'EOF'
+[?2004l[?2004h> ;; eval.scm -- a metacircular evaluator for the Scheme-like language
+[?2004l[?2004h> ;; implemented by interp.py.
+[?2004l[?2004h> ;;
+[?2004l ba[?2004h> ;; Usage:
+[?2004l[?2004h> ;;   echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004l[?2004h> ;; Reads exactly one line from STDIN: the path of a file to interpret.
+[?2004l[?2004h> ;; All remaining STDIN is fed to the program being interpreted, and any
+[?2004l[?2004h> ;; output the program produces is sent to STDOUT.
+[?2004l[?2004h> 
+[?2004l[?2004h> ;; ------------------------------------------------------------------
+[?2004l[?2004h> ;; Small helpers used by the reader and evaluator below.
+[?2004l[?2004h> (define (rev l)
+[?2004ln[?2004h>   (let r ((a '()) (x l))
+[?2004l[?2004h>     (if (null? x) a (r (cons (car x) a) (cdr x)))))
+[?2004l[?2004h> 
+[?2004le[?2004h> (define (my-assoc k l)
+[?2004l[?2004h>   (cond ((null? l) #f)
+[?2004l[?2004h>         ((eq? k (caar l)) (car l))
+[?2004l[?2004h>         (else (my-assoc k (cdr l)))))
+[?2004l[?2004h> 
+[?2004l [?2004h> ;; Python-style truthiness: only #f, 0 and the empty list are false.
+[?2004l[?2004h> (define (py-false? x) (or (null? x) (= x 0) (eq? x #f)))
+[?2004l[?2004h> 
+[?2004le[?2004h> ;; ------------------------------------------------------------------
+[?2004l[?2004h> ;; Reader: reads S-expressions from a file descriptor (fgetchr-based),
+[?2004l[?2004h> ;; producing data built from the real cons/numbers/symbols/strings.
+[?2004l[?2004h> (define (sp? c) (or (= c 32) (= c 9) (= c 10) (= c 13)))
+[?2004lsplay "Error: [?2004h> 
+[?2004lU[?2004h> (define (skip-line fp)
+[?2004l[?2004h>   (let r ((c (fgetchr fp)))
+[?2004l[?2004h>     (if (or (= c -1) (= c 10) (= c 13)) #f (r (fgetchr fp)))))
+[?2004l[?2004h> 
+[?2004l [?2004h> (define *tmpfile* "__str_tmp_eval.scm")
+[?2004l[?2004h> 
+[?2004l [?2004h> ;; Rebuild a genuine string value (as interp.py's tokenizer would make
+[?2004l[?2004h> ;; one for a "..." literal) from a list of raw character codes, by
+[?2004l[?2004h> ;; writing the quoted text to a temp file and letting the real reader
+[?2004l[?2004h> ;; (fread) tokenize it.
+[?2004l [?2004h> (define (codes->string l)
+[?2004ll[?2004h>   (let ((w (fopen *tmpfile* "w")))
+[?2004l[?2004h>     (fputchr w 34)
+[?2004l[?2004h>     (let r ((x l))
+[?2004l[?2004h>       (if (null? x) #f (begin (fputchr w (car x)) (r (cdr x)))))
+[?2004l[?2004h>     (fputchr w 34)
+[?2004l[?2004h>     (fclose w)
+[?2004l[?2004h>     (let ((rf (fopen *tmpfile* "r")))
+[?2004l[?2004h>       (let ((v (fread rf)))
+[?2004l[?2004h>         (fclose rf)
+[?2004l[?2004h>         (let ((c (fopen *tmpfile* "w"))) (fclose c))
+[?2004l[?2004h>         v))))
+[?2004l[?2004h> 
+[?2004l)[?2004h> (define (chars->symbol l) (symbol l))
+[?2004l[?2004h> 
+[?2004lc[?2004h> (define (digit? c) (and (>= c 48) (<= c 57)))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (all-digits? l)
+[?2004l[?2004h>   (let r ((x l))
+[?2004ly (co[?2004h>     (cond ((null? x) #f)
+[?2004l[?2004h>           ((not (digit? (car x))) #f)
+[?2004l[?2004h>           ((null? (cdr x)) #t)
+[?2004l[?2004h>           (else (r (cdr x))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (chars->int l)
+[?2004ls bui[?2004h>   (let r ((a 0) (x l))
+[?2004ln[?2004h>     (if (null? x) a (r (+ (* 10 a) (- (car x) 48)) (cdr x)))))
+[?2004l[?2004h> 
+[?2004li[?2004h> ;; Interpret a list of character codes as an atomic token: #t, #f,
+[?2004l[?2004h> ;; an integer, or a symbol (like interp.py's parse_expr does).
+[?2004l[?2004h> (define (atom-value l)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((and (pair? l) (null? (cddr l)) (= (car l) 35))
+[?2004l[?2004h>       (eq? (cadr l) 116))                  ; -> #t  (or #f)
+[?2004l[?2004h>     (else
+[?2004l[?2004h>      (let ((neg #f) (x l))
+[?2004l([?2004h>        (if (and (not (null? x)) (or (= (car x) 43) (= (car x) 45)))
+[?2004l[?2004h>            (set! neg (= (car x) 45))
+[?2004l[?2004h>            (set! x (cdr x)))
+[?2004l[?2004h>        (if (all-digits? x)
+[?2004l[?2004h>            (if neg (- (chars->int x)) (chars->int x))
+[?2004l[?2004h>            (chars->symbol l))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (read-atom fp c0)
+[?2004l[?2004h>   (let r ((acc (list c0)))
+[?2004l[?2004h>     (let ((c (fgetchr fp)))
+[?2004l[?2004h>       (if (or (= c -1) (= c 40) (= c 41) (= c 39) (= c 59) (sp? c))
+[?2004l[?2004h>           (atom-value (rev acc))
+[?2004l[?2004h>           (r (cons c acc))))))
+[?2004l[?2004h> 
+[?2004l([?2004h> (define (read-expr fp)
+[?2004l[?2004h>   (let r ((c (fgetchr fp)))
+[?2004l[?2004h>     (cond
+[?2004l[?2004h>       ((= c -1) 'eof)
+[?2004l[?2004h>       ((sp? c) (r (fgetchr fp)))
+[?2004l[?2004h>       ((= c 59) (skip-line fp) (r (fgetchr fp)))
+[?2004l [?2004h>       ((= c 40) (read-list fp))
+[?2004l[?2004h>       ((= c 39) (cons 'quote (cons (read-expr fp) '())))
+[?2004l[?2004h>       ((= c 34)
+[?2004l[?2004h>        (let rs ((c (fgetchr fp)) (acc '()))
+[?2004l[?2004h>          (cond
+[?2004l[?2004h>            ((= c -1) (codes->string (rev acc)))
+[?2004l[?2004h>            ((= c 34) (codes->string (rev acc)))
+[?2004l[?2004h>            ((= c 92)
+[?2004l[?2004h>             (let ((c2 (fgetchr fp)))
+[?2004l[?2004h>               (rs (fgetchr fp) (cons c2 (cons 92 acc)))))
+[?2004l[?2004h>            (else (rs (fgetchr fp) (cons c acc))))))
+[?2004l[?2004h>       (else (read-atom fp c)))))
+[?2004l[?2004h> 
+[?2004ln[?2004h> (define (read-list fp)
+[?2004l[?2004h>   (let r ((c (fgetchr fp)) (acc '()))
+[?2004l[?2004h>     (cond
+[?2004lr[?2004h>       ((= c -1) (rev acc))
+[?2004l[?2004h>       ((= c 41) (rev acc))
+[?2004l[?2004h>       ((= c 39) (r (fgetchr fp) (cons (cons 'quote (cons (read-expr fp) '())) acc)))
+[?2004l[?2004h>       (else (r (fgetchr fp) (cons (read-atom fp c) acc))))))
+[?2004l[?2004h> 
+[?2004l [?2004h> ;; ------------------------------------------------------------------
+[?2004l[?2004h> ;; The interpreter.
+[?2004l[?2004h> ;;
+[?2004lr) [?2004h> ;; Environments: a "program environment" is a list of frames (innermost
+[?2004l[?2004h> ;; first); each frame is a list of (name . value) pairs.  The program's
+[?2004l[?2004h> ;; global environment is *glob*, which is pre-seeded with all the base
+[?2004l[?2004h> ;; primitives (as the same objects interp.py provides).
+[?2004l[?2004h> (define *glob*
+[?2004l[?2004h>   (list (cons '+ +) (cons '- -) (cons '* *) (cons '/ /)
+[?2004l[?2004h>         (cons '= =) (cons '< <) (cons '> >) (cons '<= <=) (cons '>= >=)
+[?2004l[?2004h>         (cons 'cons cons) (cons 'car car) (cons 'cdr cdr)
+[?2004l[?2004h>         (cons 'null? null?) (cons 'pair? pair?)
+[?2004l[?2004h>         (cons 'eq? eq?) (cons 'equal? equal?)
+[?2004l[?2004h>         (cons 'not not) (cons 'and and) (cons 'or or)
+[?2004l[?2004h>         (cons 'getchr getchr) (cons 'putchr putchr) (cons 'chr chr)
+[?2004l[?2004h>         (cons 'read read) (cons 'symbol symbol)
+[?2004l[?2004h>         (cons 'symbol? symbol?) (cons 'string? string?) (cons 'number? number?)
+[?2004l[?2004h>         (cons 'set-car! set-car!) (cons 'set-cdr! set-cdr!)
+[?2004l[?2004h>         (cons 'display display) (cons 'newline newline)
+[?2004l[?2004h>         (cons 'fopen fopen) (cons 'fclose fclose)
+[?2004l[?2004h>         (cons 'fgetchr fgetchr) (cons 'fputchr fputchr)
+[?2004l[?2004h>         (cons 'fdisplay fdisplay) (cons 'fread fread)))
+[?2004l[?2004h> 
+[?2004l [?2004h> (define (g-lookup name)
+[?2004l[?2004h>   (let ((b (my-assoc name *glob*)))
+[?2004l[?2004h>     (if b
+[?2004l)
+[?2004h>         (cdr b)
+[?2004l[?2004h>         (begin
+[?2004l[?2004h>           (display "Error: Undefined variable: ")
+[?2004l[?2004h>           (display name)
+[?2004l[?2004h>           (newline)
+[?2004l[?2004h>           #f))))
+[?2004l[?2004h> 
+[?2004l [?2004h> (define (my-lookup name env)
+[?2004l[?2004h>   (let r ((e env))
+[?2004l[?2004h>     (if (null? e)
+[?2004l[?2004h>         (g-lookup name)
+[?2004l[?2004h>         (let ((b (my-assoc name (car e))))
+[?2004l[?2004h>           (if b (cdr b) (r (cdr e)))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-define name val env)
+[?2004l[?2004h>   (let r ((e env))
+[?2004l[?2004h>     (if (null? e)
+[?2004l[?2004h>         (let ((b (my-assoc name *glob*)))
+[?2004l[?2004h>           (if b (set-car! b val) (set! *glob* (cons (cons name val) *glob*))))
+[?2004l[?2004h>         (let ((b (my-assoc name (car e))))
+[?2004l[?2004h>           (if b (set-car! b val)
+[?2004l[?2004h>               (set-car! (car e) (cons (cons name val) (car e))))))))
+[?2004l[?2004h> 
+[?2004l)[?2004h> (define (my-set! name val env)
+[?2004l[?2004h>   (let r ((e env))
+[?2004l[?2004h>     (if (null? e)
+[?2004l[?2004h>         (my-define name val '())
+[?2004l[?2004h>         (let ((b (my-assoc name (car e))))
+[?2004l[?2004h>           (if b (set-car! b val) (r (cdr e)))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-proc params body env)
+[?2004l[?2004h>   (cons 'proc (cons params (cons body (cons env '())))))
+[?2004lr (cdr e)) env) env)
+          #f)
+  [?2004h> 
+[?2004l [?2004h> ;; Apply a primitive (one of the base objects seeded above) to evaluated
+[?2004l[?2004h> ;; arguments.  This mirrors the behaviour of interp.py's builtins.
+[?2004l[?2004h> (define (builtin-apply f args)
+[?2004l[?2004h>   (cond
+[?2004l [?2004h>     ((eq? f +) (let s ((n 0) (x args)) (if (null? x) n (s (+ n (car x)) (cdr x)))))
+[?2004l[?2004h>     ((eq? f -) (if (null? (cdr args)) (- (car args)) (- (car args) (cadr args))))
+[?2004l[?2004h>     ((eq? f *) (let s ((n 1) (x args)) (if (null? x) n (s (* n (car x)) (cdr x)))))
+[?2004l[?2004h>     ((eq? f /) (/ (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f =) (= (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f <) (< (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f >) (> (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f <=) (<= (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f >=) (>= (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f cons) (cons (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f car) (if (pair? (car args)) (car (car args)) #f))
+[?2004l[?2004h>     ((eq? f cdr) (if (pair? (car args)) (cdr (car args)) '()))
+[?2004l[?2004h>     ((eq? f null?) (null? (car args)))
+[?2004l[?2004h>     ((eq? f pair?) (pair? (car args)))
+[?2004l[?2004h>     ((eq? f eq?) (eq? (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f equal?) (equal? (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f not) (eq? (car args) #f))
+[?2004l[?2004h>     ((eq? f and)
+[?2004l[?2004h>      (let r ((x args) (acc #t))
+[?2004l[?2004h>        (if (null? x) acc
+[?2004l[?2004h>            (r (cdr x) (and acc (not (py-false? (car x))))))))
+[?2004l[?2004h>     ((eq? f or)
+[?2004l[?2004h>      (let r ((x args))
+[?2004l[?2004h>        (if (null? x) #f
+[?2004l[?2004h>            (if (not (py-false? (car x))) #t (r (cdr x))))))
+[?2004l[?2004h>     ((eq? f getchr) (getchr))
+[?2004l[?2004h>     ((eq? f putchr) (putchr (car args)))
+[?2004l[?2004h>     ((eq? f chr) (chr (car args)))
+[?2004l[?2004h>     ((eq? f read) (read))
+[?2004l[?2004h>     ((eq? f symbol) (symbol (car args)))
+[?2004l[?2004h>     ((eq? f symbol?) (symbol? (car args)))
+[?2004l[?2004h>     ((eq? f string?) (string? (car args)))
+[?2004l[?2004h>     ((eq? f number?) (number? (car args)))
+[?2004l[?2004h>     ((eq? f set-car!) (set-car! (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f set-cdr!) (set-cdr! (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f display) (display (car args)))
+[?2004l[?2004h>     ((eq? f newline) (newline))
+[?2004l[?2004h>     ((eq? f fopen) (fopen (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f fclose) (fclose (car args)))
+[?2004l[?2004h>     ((eq? f fgetchr) (fgetchr (car args)))
+[?2004l[?2004h>     ((eq? f fputchr) (fputchr (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f fdisplay) (fdisplay (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f fread) (fread (car args)))
+[?2004l[?2004h>     (else
+[?2004l[?2004h>      (display "Error: Not a procedure: ")
+[?2004l[?2004h>      (display f)
+[?2004l[?2004h>      (newline)
+[?2004l[?2004h>      #f)))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-apply proc args)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((and (pair? proc) (eq? (car proc) 'proc))
+[?2004l[?2004h>      (let ((p (cadr proc)) (b (caddr proc)) (ce (cadddr proc)))
+[?2004l[?2004h>        (let r ((pp p) (aa args) (fr '()))
+[?2004l[?2004h>          (if (null? pp)
+[?2004l[?2004h>              (my-eval-seq b (cons fr ce))
+[?2004l[?2004h>              (r (cdr pp) (cdr aa) (cons (cons (car pp) (car aa)) fr))))))
+[?2004l[?2004h>     (else (builtin-apply proc args))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-seq l env)
+[?2004l[?2004h>   (if (null? l)
+[?2004l[?2004h>       #f
+[?2004l[?2004h>       (if (null? (cdr l))
+[?2004l[?2004h>           (my-eval (car l) env)
+[?2004l[?2004h>           (begin (my-eval (car l) env) (my-eval-seq (cdr l) env)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-let e env)
+[?2004l[?2004h>   (let r ((b (cadr e)) (fr '()))
+[?2004l[?2004h>     (if (null? b)
+[?2004l[?2004h>         (my-eval-seq (cddr e) (cons fr env))
+[?2004l[?2004h>         (r (cdr b) (cons (cons (caar b) (my-eval (cadar b) env)) fr)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-cond clauses env)
+[?2004l[?2004h>   (let r ((cs clauses))
+[?2004l[?2004h>     (if (null? cs)
+[?2004l[?2004h>         #f
+[?2004l[?2004h>         (let ((t (caar cs)))
+[?2004l[?2004h>           (cond
+[?2004l[?2004h>             ((eq? t 'else) (my-eval-seq (cdar cs) env))
+[?2004l[?2004h>             ((my-eval t env) (my-eval-seq (cdar cs) env))
+[?2004l[?2004h>             (else (r (cdr cs))))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-list l env)
+[?2004l[?2004h>   (if (null? l)
+[?2004l[?2004h>       '()
+[?2004l[?2004h>       (cons (my-eval (car l) env) (my-eval-list (cdr l) env))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-define e env)
+[?2004l[?2004h>   (let ((h (cadr e)))
+[?2004l[?2004h>     (if (pair? h)
+[?2004l[?2004h>         (my-define (car h) (my-proc (cdr h) (cddr e) env) env)
+[?2004l[?2004h>         (my-define h (my-eval (cadr (cdr e)) env) env))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-if e env)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((my-eval (cadr e) env)
+[?2004l[?2004h>      (my-eval (caddr e) env))
+[?2004l[?2004h>     (else
+[?2004l[?2004h>      (let ((rest (cadr (cdr (cdr e)))))
+[?2004l[?2004h>        (if (null? rest) #f (my-eval (car rest) env))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval e env)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((null? e) #f)
+[?2004l[?2004h>     ((pair? e)
+[?2004l[?2004h>      (let ((t (car e)))
+[?2004l[?2004h>        (cond
+[?2004l[?2004h>          ((eq? t 'quote) (cadr e))
+[?2004l[?2004h>          ((eq? t 'if) (my-eval-if e env))
+[?2004l[?2004h>          ((eq? t 'define) (my-eval-define e env))
+[?2004l[?2004h>          ((eq? t 'set!)
+[?2004l[?2004h>           (my-set! (cadr e) (my-eval (cadr (cdr e)) env) env)
+[?2004l[?2004h>           #f)
+[?2004l[?2004h>          ((eq? t 'lambda) (my-proc (cadr e) (cddr e) env))
+[?2004l[?2004h>          ((eq? t 'let) (my-eval-let e env))
+[?2004l[?2004h>          ((or (eq? t 'begin) (eq? t 'progn)) (my-eval-seq (cdr e) env))
+[?2004l[?2004h>          ((eq? t 'cond) (my-eval-cond (cdr e) env))
+[?2004l[?2004h>          (else (my-apply (my-eval t env) (my-eval-list (cdr e) env))))))
+[?2004l[?2004h>     ((symbol? e) (my-lookup e env))
+[?2004l[?2004h>     (else e)))
+[?2004l[?2004h> 
+[?2004l[?2004h> ;; ------------------------------------------------------------------
+[?2004l[?2004h> ;; Top level: read the file name, open it, evaluate every expression.
+[?2004l[?2004h> (define (run-program fp)
+[?2004l[?2004h>   (let r ((e (read-expr fp)))
+[?2004l[?2004h>     (if (eq? e 'eof)
+[?2004l[?2004h>         (fclose fp)
+[?2004l[?2004h>         (begin (my-eval e '()) (r (read-expr fp))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (eval-main)
+[?2004l[?2004h>   (let ((path (read)))
+[?2004l[?2004h>     (if (symbol? path)
+[?2004l[?2004h>         (let ((fp (fopen path "r")))
+[?2004l[?2004h>           (if (eq? fp #f)
+[?2004l[?2004h>               (begin (display "Error: cannot open ") (display path) (newline))
+[?2004l[?2004h>               (run-program fp)))
+[?2004l[?2004h>         (begin (display "Error: bad path") (newline)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (eval-main)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# echo WROTE; wc -l /app/eval.scm
+[?2004lWROTE
+317 /app/eval.scm
+[?2004hroot@69944c7bc9a2:/app# cd /app && echo TEST1: && echo '(+ 7 8)' | python3 interp.py test/calculator.scm
+[?2004lTEST1:
+Reading
+15
+Done
+[?2004hroot@69944c7bc9a2:/app# echo TEST2: && echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lTEST2:
+Error: Undefined variable: list
+[?2004hroot@69944c7bc9a2:/app# grep -n "(list " eval.scm
+[?2004l83:  (let r ((acc (list c0)))
+124:  (list (cons '+ +) (cons '- -) (cons '* *) (cons '/ /)
+[?2004hroot@69944c7bc9a2:/app# sed -n '80,86p' eval.scm; grep -n "define \*glob\*" eval.scm
+[?2004l           (chars->symbol l))))))
+
+(define (read-atom fp c0)
+  (let r ((acc (list c0)))
+    (let ((c (fgetchr fp)))
+      (if (or (= c -1) (= c 40) (= c 41) (= c 39) (= c 59) (sp? c))
+          (atom-value (rev acc))
+123:(define *glob*
+[?2004hroot@69944c7bc9a2:/app# sed -n '120,140p' eval.scm
+[?2004l;; first); each frame is a list of (name . value) pairs.  The program's
+;; global environment is *glob*, which is pre-seeded with all the base
+;; primitives (as the same objects interp.py provides).
+(define *glob*
+  (list (cons '+ +) (cons '- -) (cons '* *) (cons '/ /)
+        (cons '= =) (cons '< <) (cons '> >) (cons '<= <=) (cons '>= >=)
+        (cons 'cons cons) (cons 'car car) (cons 'cdr cdr)
+        (cons 'null? null?) (cons 'pair? pair?)
+        (cons 'eq? eq?) (cons 'equal? equal?)
+        (cons 'not not) (cons 'and and) (cons 'or or)
+        (cons 'getchr getchr) (cons 'putchr putchr) (cons 'chr chr)
+        (cons 'read read) (cons 'symbol symbol)
+        (cons 'symbol? symbol?) (cons 'string? string?) (cons 'number? number?)
+        (cons 'set-car! set-car!) (cons 'set-cdr! set-cdr!)
+        (cons 'display display) (cons 'newline newline)
+        (cons 'fopen fopen) (cons 'fclose fclose)
+        (cons 'fgetchr fgetchr) (cons 'fputchr fputchr)
+        (cons 'fdisplay fdisplay) (cons 'fread fread)))
+
+(define (g-lookup name)
+  (let ((b (my-assoc name *glob*)))
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> src = src.replace("(let r ((acc (list c0)))", "(let r ((acc (cons c0 '())))")
+[?2004l[?2004h> start = src.index("(define *glob*")
+[?2004l[?2004h> end = src.index("(define (g-lookup name)")
+[?2004l[?2004h> seeds = "+ - * / = < > <= >= cons car cdr null? pair? eq? equal? not and or getchr putchr chr read symbol symbol? string? number? set-car! set-cdr! display newline fopen fclose fgetchr fputchr fdisplay fread"
+[?2004l[?2004h> new = "(define *glob* '())\n\n(define (g-seed name val)\n  (set! *glob* (cons (cons name val) *glob*)))\n"
+[?2004l[?2004h> for s in seeds.split():
+[?2004l[?2004h>     new += "(g-seed '%s %s)\n" % (s, s)
+[?2004l[?2004h> new += "\n"
+[?2004l[?2004h> src = src[:start] + new + src[end:]
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print("patched")
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# grep -n "list" /app/eval.scm | grep -v "read-list\|;\|my-eval-list\|cons list" | head
+[?2004l[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lUnexpected error: 'str' object has no attribute 'car'
+[?2004hroot@69944c7bc9a2:/app# cat > /app/eval.scm <<'EOF'
+[?2004lthe real cons / numbers / symbols / strings.
+(define (sp? c) (or (= c 32) (= c 9) (= c 10) (= c 13)))
+
+(define (skip-line fp)
+  (let ((c (fgetchr fp)))
+    (if (or (= c -1) (= c 10) (= c 13)) #f (skip-line fp))))
+
+(define *tmpfile* "__str_tmp_eval.scm")
+
+;; Rebuild a genuine string value (as interp.py's tokenizer would make
+;; one for a "..." literal) from raw character codes, by writing the
+;; quoted text to a temp file and letting the real reader (fread)
+;; tokenize it.
+(define (write-codes w l)
+  (if (null? l) #f (begin (fputchr w (car l)) (write-codes w (cdr l)))))
+
+(define (codes->string l)
+  (let ((w (fopen *tmpfile* "w")))
+    (fputchr w 34)
+    (write-codes w l)
+    (fputchr w 34)
+    (fclose w)
+    (let ((rf (fopen *tmpfile* "r")))
+      (let ((v (fread rf)))
+        (fclose rf)
+        (let ((c (fopen *tmpfile* "w")))
+          (fclose c))
+        v))))
+
+(define (chars->symbol l) (symbol l))
+
+(define (digit? c) (and (>= c 48) (<= c 57)))
+
+(define (all-digits? l)
+  (cond ((null? l) #f)
+        ((not (digit? (car l))) #f)
+        ((null? (cdr l)) #t)
+        (else (all-digits? (cdr l)))))
+
+(define (chars->int l) (chars->int-go l 0))
+(define (chars->int-go l acc)
+  (if (null? l) acc (chars->int-go (cdr l) (+ (* 10 acc) (- (car l) 48)))))
+
+;; Interpret character codes as an atomic token: #t, #f, an integer,
+;; or a symbol (as interp.py's parse_expr does).
+(define (atom-value l)
+  (cond
+    ((and (pair? l) (null? (cdr (cdr l))) (= (car l) 35))
+      (eq? (cadr l) 116))
+    (else
+     (let ((neg #f) (x l))
+       (if (and (not (null? x)) (or (= (car x) 43) (= (car x) 45)))
+           (set! neg (= (car x) 45))
+           (set! x (cdr x)))
+       (if (all-digits? x)
+           (if neg (- (chars->int x)) (chars->int x))
+           (chars->symbol l))))))
+
+(define (read-atom fp c0) (read-atom-go fp (cons c0 '())))
+(define (read-atom-go fp acc)
+  (let ((c (fgetchr fp)))
+    (if (or (= c -1) (= c 40) (= c 41) (= c 39) (= c 59) (sp? c))
+        (atom-value (rev acc))
+        (read-atom-go fp (cons c acc)))))
+
+(define (read-expr fp)
+  (read-expr-go (fgetchr fp) fp))
+
+(define (read-expr-go c fp)
+  (cond
+    ((= c -1) 'eof)
+    ((sp? c) (read-expr-go (fgetchr fp) fp))
+    ((= c 59) (skip-line fp) (read-expr-go (fgetchr fp) fp))
+    ((= c 40) (read-list fp))
+    ((= c 39) (cons 'quote (cons (read-expr fp) '())))
+    ((= c 34) (read-str-go (fgetchr fp) fp '()))
+    (else (read-atom fp c))))
+
+(define (read-str-go c fp acc)
+  (cond
+    ((= c -1) (codes->string (rev acc)))
+    ((= c 34) (codes->string (rev acc)))
+    ((= c 92)
+     (let ((c2 (fgetchr fp)))
+       (read-str-go (fgetchr fp) fp (cons c2 (cons 92 acc)))))
+    (else (read-str-go (fgetchr fp) fp (cons c acc)))))
+
+(define (read-list fp) (read-list-go (fgetchr fp) fp '()))
+(define (read-list-go c fp acc)
+  (cond
+    ((= c -1) (rev acc))
+    ((= c 41) (rev acc))
+    ((= c 39)
+     (read-list-go (fgetchr fp) fp
+                   (cons (cons 'quote (cons (read-expr fp) '())) acc)))
+    (else (read-list-go (fgetchr fp) fp (cons (read-atom fp c) acc)))))
+
+;; ------------------------------------------[?2004h> ;; eval.scm -- a metacircular evaluator for the Scheme-like language
+[?2004l[?2004h> ;; implemented by interp.py.
+[?2004lst[?2004h> ;;
+[?2004l of[?2004h> ;; Usage:
+[?2004l[?2004h> ;;   echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004l[?2004h> ;; Reads exactly one line from STDIN: the path of a file to interpret.
+[?2004l[?2004h> ;; All remaining STDIN is fed to the program being interpreted, and any
+[?2004l[?2004h> ;; output the program produces is sent to STDOUT.
+[?2004l[?2004h> 
+[?2004ln[?2004h> ;; ------------------------------------------------------------------
+[?2004lse[?2004h> ;; Small helpers.
+[?2004l[?2004h> (define (rev l) (rev-go l '()))
+[?2004l[?2004h> (define (rev-go l acc)
+[?2004l[?2004h>   (if (null? l) acc (rev-go (cdr l) (cons (car l) acc))))
+[?2004l[?2004h> 
+[?2004ld[?2004h> (define (my-assoc k l)
+[?2004l n[?2004h>   (cond ((null? l) #f)
+[?2004lpa[?2004h>         ((eq? k (car (car l))) (car l))
+[?2004le[?2004h>         (else (my-assoc k (cdr l)))))
+[?2004l[?2004h> 
+[?2004la[?2004h> ;; Python-style truthiness: only #f, 0 and the empty list are false.
+[?2004l[?2004h> (define (py-false? x) (or (null? x) (= x 0) (eq? x #f)))
+[?2004l[?2004h> 
+[?2004l[?2004h> ;; ------------------------------------------------------------------
+[?2004l[?2004h> ;; Reader: S-expressions from a file descriptor (fgetchr based),
+[?2004l[?2004h> ;; producing data built from the real cons / numbers / symbols / strings.
+[?2004l[?2004h> (define (sp? c) (or (= c 32) (= c 9) (= c 10) (= c 13)))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (skip-line fp)
+[?2004l-[?2004h>   (let ((c (fgetchr fp)))
+[?2004l([?2004h>     (if (or (= c -1) (= c 10) (= c 13)) #f (skip-line fp))))
+[?2004l[?2004h> 
+[?2004la[?2004h> (define *tmpfile* "__str_tmp_eval.scm")
+[?2004lc[?2004h> 
+[?2004ld[?2004h> ;; Rebuild a genuine string value (as interp.py's tokenizer would make
+[?2004l[?2004h> ;; one for a "..." literal) from raw character codes, by writing the
+[?2004l[?2004h> ;; quoted text to a temp file and letting the real reader (fread)
+[?2004l[?2004h> ;; tokenize it.
+[?2004l[?2004h> (define (write-codes w l)
+[?2004l [?2004h>   (if (null? l) #f (begin (fputchr w (car l)) (write-codes w (cdr l)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (codes->string l)
+[?2004l[?2004h>   (let ((w (fopen *tmpfile* "w")))
+[?2004ll[?2004h>     (fputchr w 34)
+[?2004l[?2004h>     (write-codes w l)
+[?2004l[?2004h>     (fputchr w 34)
+[?2004l[?2004h>     (fclose w)
+[?2004l[?2004h>     (let ((rf (fopen *tmpfile* "r")))
+[?2004l[?2004h>       (let ((v (fread rf)))
+[?2004l[?2004h>         (fclose rf)
+[?2004l  (i[?2004h>         (let ((c (fopen *tmpfile* "w")))
+[?2004l[?2004h>           (fclose c))
+[?2004l[?2004h>         v))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (chars->symbol l) (symbol l))
+[?2004l[?2004h> 
+[?2004ls[?2004h> (define (digit? c) (and (>= c 48) (<= c 57)))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (all-digits? l)
+[?2004l[?2004h>   (cond ((null? l) #f)
+[?2004la[?2004h>         ((not (digit? (car l))) #f)
+[?2004l[?2004h>         ((null? (cdr l)) #t)
+[?2004l[?2004h>         (else (all-digits? (cdr l)))))
+[?2004ls[?2004h> 
+[?2004l [?2004h> (define (chars->int l) (chars->int-go l 0))
+[?2004lb[?2004h> (define (chars->int-go l acc)
+[?2004l[?2004h>   (if (null? l) acc (chars->int-go (cdr l) (+ (* 10 acc) (- (car l) 48)))))
+[?2004l[?2004h> 
+[?2004l([?2004h> ;; Interpret character codes as an atomic token: #t, #f, an integer,
+[?2004l[?2004h> ;; or a symbol (as interp.py's parse_expr does).
+[?2004l[?2004h> (define (atom-value l)
+[?2004l[?2004h>   (cond
+[?2004ld[?2004h>     ((and (pair? l) (null? (cdr (cdr l))) (= (car l) 35))
+[?2004ll[?2004h>       (eq? (cadr l) 116))
+[?2004l[?2004h>     (else
+[?2004l[?2004h>      (let ((neg #f) (x l))
+[?2004l[?2004h>        (if (and (not (null? x)) (or (= (car x) 43) (= (car x) 45)))
+[?2004l[?2004h>            (set! neg (= (car x) 45))
+[?2004la[?2004h>            (set! x (cdr x)))
+[?2004ln[?2004h>        (if (all-digits? x)
+[?2004l[?2004h>            (if neg (- (chars->int x)) (chars->int x))
+[?2004l[?2004h>            (chars->symbol l))))))
+[?2004l[?2004h> 
+[?2004ll[?2004h> (define (read-atom fp c0) (read-atom-go fp (cons c0 '())))
+[?2004l[?2004h> (define (read-atom-go fp acc)
+[?2004la[?2004h>   (let ((c (fgetchr fp)))
+[?2004l[?2004h>     (if (or (= c -1) (= c 40) (= c 41) (= c 39) (= c 59) (sp? c))
+[?2004l[?2004h>         (atom-value (rev acc))
+[?2004l[?2004h>         (read-atom-go fp (cons c acc)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (read-expr fp)
+[?2004l[?2004h>   (read-expr-go (fgetchr fp) fp))
+[?2004lc[?2004h> 
+[?2004l[?2004h> (define (read-expr-go c fp)
+[?2004l<[?2004h>   (cond
+[?2004lar[?2004h>     ((= c -1) 'eof)
+[?2004l[?2004h>     ((sp? c) (read-expr-go (fgetchr fp) fp))
+[?2004l[?2004h>     ((= c 59) (skip-line fp) (read-expr-go (fgetchr fp) fp))
+[?2004l [?2004h>     ((= c 40) (read-list fp))
+[?2004l([?2004h>     ((= c 39) (cons 'quote (cons (read-expr fp) '())))
+[?2004l[?2004h>     ((= c 34) (read-str-go (fgetchr fp) fp '()))
+[?2004l[?2004h>     (else (read-atom fp c))))
+[?2004l [?2004h> 
+[?2004l([?2004h> (define (read-str-go c fp acc)
+[?2004l[?2004h>   (cond
+[?2004l ([?2004h>     ((= c -1) (codes->string (rev acc)))
+[?2004le[?2004h>     ((= c 34) (codes->string (rev acc)))
+[?2004l[?2004h>     ((= c 92)
+[?2004l[?2004h>      (let ((c2 (fgetchr fp)))
+[?2004l[?2004h>        (read-str-go (fgetchr fp) fp (cons c2 (cons 92 acc)))))
+[?2004l[?2004h>     (else (read-str-go (fgetchr fp) fp (cons c acc)))))
+[?2004l
+[?2004h> 
+[?2004l [?2004h> (define (read-list fp) (read-list-go (fgetchr fp) fp '()))
+[?2004l[?2004h> (define (read-list-go c fp acc)
+[?2004l[?2004h>   (cond
+[?2004largs)[?2004h>     ((= c -1) (rev acc))
+[?2004l[?2004h>     ((= c 41) (rev acc))
+[?2004l [?2004h>     ((= c 39)
+[?2004l[?2004h>      (read-list-go (fgetchr fp) fp
+[?2004lr[?2004h>                    (cons (cons 'quote (cons (read-expr fp) '())) acc)))
+[?2004l[?2004h>     (else (read-list-go (fgetchr fp) fp (cons (read-atom fp c) acc)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> ;; ------------------------------------------------------------------
+[?2004l[?2004h> ;; The interpreter.
+[?2004l[?2004h> ;;
+[?2004la[?2004h> ;; Environments: a "program environment" is a list of frames (innermost
+[?2004l[?2004h> ;; first); each frame is a list of (name . value) pairs.  The program's
+[?2004l[?2004h> ;; global environment is *glob*, pre-seeded with all base primitives
+[?2004l[?2004h> ;; (as the same objects interp.py provides).
+[?2004l[?2004h> (define *glob* '())
+[?2004l[?2004h> 
+[?2004l [?2004h> (define (g-seed name val)
+[?2004l[?2004h>   (set! *glob* (cons (cons name val) *glob*)))
+[?2004l[?2004h> 
+[?2004l([?2004h> (g-seed '+ +)
+[?2004lg[?2004h> (g-seed '- -)
+[?2004l[?2004h> (g-seed '* *)
+[?2004l[?2004h> (g-seed '/ /)
+[?2004l[?2004h> (g-seed '= =)
+[?2004l")[?2004h> (g-seed '< <)
+[?2004l[?2004h> (g-seed '> >)
+[?2004ll[?2004h> (g-seed '<= <=)
+[?2004l[?2004h> (g-seed '>= >=)
+[?2004l[?2004h> (g-seed 'cons cons)
+[?2004l[?2004h> (g-seed 'car car)
+[?2004l[?2004h> (g-seed 'cdr cdr)
+[?2004l p[?2004h> (g-seed 'null? null?)
+[?2004l-[?2004h> (g-seed 'pair? pair?)
+[?2004l[?2004h> (g-seed 'eq? eq?)
+[?2004l[?2004h> (g-seed 'equal? equal?)
+[?2004l[?2004h> (g-seed 'not not)
+[?2004l[?2004h> (g-seed 'and and)
+[?2004l[?2004h> (g-seed 'or or)
+[?2004l[?2004h> (g-seed 'getchr getchr)
+[?2004le[?2004h> (g-seed 'putchr putchr)
+[?2004l[?2004h> (g-seed 'chr chr)
+[?2004l[?2004h> (g-seed 'read read)
+[?2004l[?2004h> (g-seed 'symbol symbol)
+[?2004l[?2004h> (g-seed 'symbol? symbol?)
+[?2004l[?2004h> (g-seed 'string? string?)
+[?2004l [?2004h> (g-seed 'number? number?)
+[?2004l[?2004h> (g-seed 'set-car! set-car!)
+[?2004l[?2004h> (g-seed 'set-cdr! set-cdr!)
+[?2004l[?2004h> (g-seed 'display display)
+[?2004le[?2004h> (g-seed 'newline newline)
+[?2004l e[?2004h> (g-seed 'fopen fopen)
+[?2004l?[?2004h> (g-seed 'fclose fclose)
+[?2004l[?2004h> (g-seed 'fgetchr fgetchr)
+[?2004l[?2004h> (g-seed 'fputchr fputchr)
+[?2004l[?2004h> (g-seed 'fdisplay fdisplay)
+[?2004l[?2004h> (g-seed 'fread fread)
+[?2004le[?2004h> 
+[?2004lv[?2004h> (define (g-lookup name)
+[?2004l[?2004h>   (let ((b (my-assoc name *glob*)))
+[?2004l[?2004h>     (if b
+[?2004l[?2004h>         (cdr b)
+[?2004l[?2004h>         (begin
+[?2004l[?2004h>           (display "Error: Undefined variable: ")
+[?2004l[?2004h>           (display name)
+[?2004l[?2004h>           (newline)
+[?2004ll[?2004h>           #f))))
+[?2004l[?2004h> 
+[?2004l [?2004h> (define (my-lookup name env)
+[?2004l[?2004h>   (if (null? env)
+[?2004l[?2004h>       (g-lookup name)
+[?2004l[?2004h>       (let ((b (my-assoc name (car env))))
+[?2004l[?2004h>         (if b (cdr b) (my-lookup name (cdr env))))))
+[?2004l[?2004h> 
+[?2004l [?2004h> (define (my-define name val env)
+[?2004l[?2004h>   (if (null? env)
+[?2004l[?2004h>       (let ((b (my-assoc name *glob*)))
+[?2004lf[?2004h>         (if b
+[?2004l[?2004h>             (set-car! b val)
+[?2004l[?2004h>             (set! *glob* (cons (cons name val) *glob*))))
+[?2004l[?2004h>       (let ((b (my-assoc name (car env))))
+[?2004l[?2004h>         (if b
+[?2004l))[?2004h>             (set-car! b val)
+[?2004l[?2004h>             (set-car! (car env) (cons (cons name val) (car env)))))))
+[?2004l[?2004h> 
+[?2004le[?2004h> (define (my-set! name val env)
+[?2004lr[?2004h>   (if (null? env)
+[?2004l[?2004h>       (my-define name val '())
+[?2004l[?2004h>       (let ((b (my-assoc name (car env))))
+[?2004l[?2004h>         (if b (set-car! b val) (my-set! name val (cdr env))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-proc params body env)
+[?2004l[?2004h>   (cons 'proc (cons params (cons body (cons env '())))))
+[?2004l[?2004h> 
+[?2004l-[?2004h> (define (make-frame params args)
+[?2004l[?2004h>   (if (null? params)
+[?2004lef[?2004h>       '()
+[?2004l[?2004h>       (cons (cons (car params) (car args))
+[?2004l[?2004h>             (make-frame (cdr params) (cdr args)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> ;; Apply a primitive (one of the base objects seeded above) to evaluated
+[?2004l[?2004h> ;; arguments, mirroring the behaviour of interp.py's builtins.
+[?2004l[?2004h> (define (sum-args l)
+[?2004l[?2004h>   (if (null? l) 0 (+ (car l) (sum-args (cdr l)))))
+[?2004l[?2004h> 
+[?2004l-[?2004h> (define (prod-args l)
+[?2004l[?2004h>   (if (null? l) 1 (* (car l) (prod-args (cdr l)))))
+[?2004l[?2004h> 
+[?2004ll[?2004h> (define (and-args l)
+[?2004l[?2004h>   (if (null? l) #t (and (not (py-false? (car l))) (and-args (cdr l)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (or-args l)
+[?2004l[?2004h>   (if (null? l) #f (if (not (py-false? (car l))) #t (or-args (cdr l)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (builtin-apply f args)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((eq? f +) (sum-args args))
+[?2004l[?2004h>     ((eq? f -)
+[?2004l[?2004h>      (if (null? (cdr args))
+[?2004l[?2004h>          (- (car args))
+[?2004l(f[?2004h>          (- (car args) (cadr args))))
+[?2004l)[?2004h>     ((eq? f *) (prod-args args))
+[?2004l[?2004h>     ((eq? f /) (/ (car args) (cadr args)))
+[?2004ld[?2004h>     ((eq? f =) (= (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f <) (< (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f >) (> (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f <=) (<= (car args) (cadr args)))
+[?2004l [?2004h>     ((eq? f >=) (>= (car args) (cadr args)))
+[?2004l [?2004h>     ((eq? f cons) (cons (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f car) (if (pair? (car args)) (car (car args)) #f))
+[?2004l[?2004h>     ((eq? f cdr) (if (pair? (car args)) (cdr (car args)) '()))
+[?2004l[?2004h>     ((eq? f null?) (null? (car args)))
+[?2004l[?2004h>     ((eq? f pair?) (pair? (car args)))
+[?2004l[?2004h>     ((eq? f eq?) (eq? (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f equal?) (equal? (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f not) (eq? (car args) #f))
+[?2004l[?2004h>     ((eq? f and) (and-args args))
+[?2004l[?2004h>     ((eq? f or) (or-args args))
+[?2004l[?2004h>     ((eq? f getchr) (getchr))
+[?2004l[?2004h>     ((eq? f putchr) (putchr (car args)))
+[?2004l[?2004h>     ((eq? f chr) (chr (car args)))
+[?2004l[?2004h>     ((eq? f read) (read))
+[?2004l[?2004h>     ((eq? f symbol) (symbol (car args)))
+[?2004l[?2004h>     ((eq? f symbol?) (symbol? (car args)))
+[?2004l[?2004h>     ((eq? f string?) (string? (car args)))
+[?2004l[?2004h>     ((eq? f number?) (number? (car args)))
+[?2004l[?2004h>     ((eq? f set-car!) (set-car! (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f set-cdr!) (set-cdr! (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f display) (display (car args)))
+[?2004l[?2004h>     ((eq? f newline) (newline))
+[?2004l[?2004h>     ((eq? f fopen) (fopen (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f fclose) (fclose (car args)))
+[?2004l[?2004h>     ((eq? f fgetchr) (fgetchr (car args)))
+[?2004l[?2004h>     ((eq? f fputchr) (fputchr (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f fdisplay) (fdisplay (car args) (cadr args)))
+[?2004l[?2004h>     ((eq? f fread) (fread (car args)))
+[?2004l[?2004h>     (else
+[?2004l[?2004h>      (display "Error: Not a procedure: ")
+[?2004l[?2004h>      (display f)
+[?2004l[?2004h>      (newline)
+[?2004l[?2004h>      #f)))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-apply proc args)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((and (pair? proc) (eq? (car proc) 'proc))
+[?2004l[?2004h>      (my-eval-seq (caddr proc)
+[?2004l[?2004h>                   (cons (make-frame (cadr proc) args) (cadddr proc))))
+[?2004l[?2004h>     (else (builtin-apply proc args))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-seq l env)
+[?2004l[?2004h>   (if (null? l)
+[?2004l[?2004h>       #f
+[?2004l[?2004h>       (if (null? (cdr l))
+[?2004l[?2004h>           (my-eval (car l) env)
+[?2004l[?2004h>           (begin (my-eval (car l) env) (my-eval-seq (cdr l) env)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-let e env) (my-let-vals (cadr e) (cddr e) env '()))
+[?2004l[?2004h> (define (my-let-vals b body env frame)
+[?2004l[?2004h>   (if (null? b)
+[?2004l[?2004h>       (my-eval-seq body (cons frame env))
+[?2004l[?2004h>       (my-let-vals (cdr b) body env
+[?2004l[?2004h>                    (cons (cons (car b) (my-eval (cadr b) env)) frame))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-cond clauses env)
+[?2004l[?2004h>   (if (null? clauses)
+[?2004l[?2004h>       #f
+[?2004l[?2004h>       (let ((t (car (car clauses))))
+[?2004l[?2004h>         (cond
+[?2004l[?2004h>           ((eq? t 'else) (my-eval-seq (cdr (car clauses)) env))
+[?2004l[?2004h>           ((my-eval t env) (my-eval-seq (cdr (car clauses)) env))
+[?2004l[?2004h>           (else (my-eval-cond (cdr clauses) env))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-list l env)
+[?2004l[?2004h>   (if (null? l)
+[?2004l[?2004h>       '()
+[?2004l[?2004h>       (cons (my-eval (car l) env) (my-eval-list (cdr l) env))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-define e env)
+[?2004l[?2004h>   (let ((h (cadr e)))
+[?2004l[?2004h>     (if (pair? h)
+[?2004l[?2004h>         (my-define (car h) (my-proc (cdr h) (cddr e) env) env)
+[?2004l[?2004h>         (my-define h (my-eval (cadr (cdr e)) env) env))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval-if e env)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((my-eval (cadr e) env)
+[?2004l[?2004h>      (my-eval (caddr e) env))
+[?2004l[?2004h>     (else
+[?2004l[?2004h>      (let ((rest (cadr (cdr (cdr e)))))
+[?2004l[?2004h>        (if (null? rest) #f (my-eval (car rest) env))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (my-eval e env)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((null? e) #f)
+[?2004l[?2004h>     ((pair? e)
+[?2004l[?2004h>      (let ((t (car e)))
+[?2004l[?2004h>        (cond
+[?2004l[?2004h>          ((eq? t 'quote) (cadr e))
+[?2004l[?2004h>          ((eq? t 'if) (my-eval-if e env))
+[?2004l[?2004h>          ((eq? t 'define) (my-eval-define e env))
+[?2004l[?2004h>          ((eq? t 'set!)
+[?2004l[?2004h>           (my-set! (cadr e) (my-eval (cadr (cdr e)) env) env)
+[?2004l[?2004h>           #f)
+[?2004l[?2004h>          ((eq? t 'lambda) (my-proc (cadr e) (cddr e) env))
+[?2004l[?2004h>          ((eq? t 'let) (my-eval-let e env))
+[?2004l[?2004h>          ((or (eq? t 'begin) (eq? t 'progn)) (my-eval-seq (cdr e) env))
+[?2004l[?2004h>          ((eq? t 'cond) (my-eval-cond (cdr e) env))
+[?2004l[?2004h>          (else (my-apply (my-eval t env) (my-eval-list (cdr e) env))))))
+[?2004l[?2004h>     ((symbol? e) (my-lookup e env))
+[?2004l[?2004h>     (else e)))
+[?2004l[?2004h> 
+[?2004l[?2004h> ;; ------------------------------------------------------------------
+[?2004l[?2004h> ;; Top level: read the file name, open it, evaluate every expression.
+[?2004l[?2004h> (define (run-program fp) (run-prog-go (read-expr fp) fp))
+[?2004l[?2004h> (define (run-prog-go e fp)
+[?2004l[?2004h>   (if (eq? e 'eof)
+[?2004l[?2004h>       (fclose fp)
+[?2004l[?2004h>       (begin (my-eval e '()) (run-prog-go (read-expr fp) fp))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (eval-main)
+[?2004l[?2004h>   (let ((path (read)))
+[?2004l[?2004h>     (if (symbol? path)
+[?2004l[?2004h>         (let ((fp (fopen path "r")))
+[?2004l[?2004h>           (if (eq? fp #f)
+[?2004l[?2004h>               (begin
+[?2004l[?2004h>                 (display "Error: cannot open ")
+[?2004l[?2004h>                 (display path)
+[?2004l[?2004h>                 (newline))
+[?2004l[?2004h>               (run-program fp)))
+[?2004l[?2004h>         (begin (display "Error: bad path") (newline)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (eval-main)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# echo REWROTE; grep -c "let [a-z]* (" /app/eval.scm
+[?2004lREWROTE
+0
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: dsplay
+Error: Undefined variable: iReading"
+Error: Undefined variable: "
+Error: Undefined variable: 
+ewline
+Error: Undefined variable: n
+Error: Undefined variable: 
+et
+Error: Undefined variable: l
+Error: Undefined variable: (ine
+Error: Undefined variable: lread
+Error: Undefined variable: (
+Error: Not a procedure: False
+Error: Undefined variable: cnd
+Error: Undefined variable: o
+Error: Undefined variable:  
+Error: Undefined variable:  =
+Error: Undefined variable: (car
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  isplay
+Error: Undefined variable: d+
+Error: Undefined variable: (car
+Error: Undefined variable: (cdr
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Not a procedure: False
+Error: Undefined variable: cr
+Error: Undefined variable: acdr
+Error: Undefined variable: (cdr
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Not a procedure: False
+Error: Undefined variable: )
+Error: Undefined variable: )
+Error: Undefined variable: (
+Error: Undefined variable: =car
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  isplay
+Error: Undefined variable: d-
+Error: Undefined variable: (car
+Error: Undefined variable: (cdr
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Not a procedure: False
+Error: Undefined variable: cr
+Error: Undefined variable: acdr
+Error: Undefined variable: (cdr
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Not a procedure: False
+Error: Undefined variable: )
+Error: Undefined variable: )
+Error: Undefined variable: (
+Error: Undefined variable: =car
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  isplay
+Error: Undefined variable: d*
+Error: Undefined variable: (car
+Error: Undefined variable: (cdr
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Not a procedure: False
+Error: Undefined variable: cr
+Error: Undefined variable: acdr
+Error: Undefined variable: (cdr
+Error: Undefined variable: (ine
+Error: Undefined variable: l
+Error: Not a procedure: False
+Error: Undefined variable: )
+Error: Undefined variable: )
+Error: Undefined variable: )
+Error: Undefined variable: nwline
+Error: Undefined variable: e
+Error: Undefined variable: 
+isplay
+Error: Undefined variable: dDone"
+Error: Undefined variable: "
+Error: Undefined variable: 
+ewline
+Error: Undefined variable: n
+Error: Undefined variable: 
+
+Error: Not a procedure: False
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = """    ((= c 39)
+[?2004l[?2004h>      (read-list-go (fgetchr fp) fp
+[?2004l[?2004h>                    (cons (cons 'quote (cons (read-expr fp) '())) acc)))
+[?2004l[?2004h>     (else (read-list-go (fgetchr fp) fp (cons (read-atom fp c) acc))))"""
+[?2004l[?2004h> new = """    ((= c 39)
+[?2004l[?2004h>      (read-list-go (fgetchr fp) fp
+[?2004l[?2004h>                    (cons (cons 'quote (cons (read-expr fp) '())) acc)))
+[?2004l[?2004h>     ((= c 34)
+[?2004l[?2004h>      (read-list-go (fgetchr fp) fp
+[?2004l[?2004h>                    (cons (read-str-go (fgetchr fp) fp '()) acc)))
+[?2004l[?2004h>     (else (read-list-go (fgetchr fp) fp (cons (read-atom fp c) acc))))"""
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print("patched")
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: dsplay
+Error: Undefined variable: iReading"
+Error: Undefined variable: 
+one"
+Error: Undefined variable: D
+Error: Undefined variable: 
+ewline
+Error: Undefined variable: n
+Error: Undefined variable: 
+
+Error: Not a procedure: False
+[?2004hroot@69944c7bc9a2:/app# cat > /tmp/dbg.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "test/calculator.scm" "r"))
+[?2004l[?2004h> (let loop-i ((i 0))
+[?2004l[?2004h>   (if (< i 25)
+[?2004l[?2004h>       (progn (display (fgetchr fp)) (display " ") (loop-i (+ i 1)))))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/tmp/dbg.scm').read().replace("(let loop-i ((i 0))\n  (if (< i 25)\n      (progn (display (fgetchr fp)) (display \" \") (loop-i (+ i 1)))))", "")
+[?2004l[?2004h> open('/tmp/dbg.scm','w').write(src)
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# cat > /tmp/dbg.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "test/calculator.scm" "r"))
+[?2004l[?2004h> (define (show i)
+[?2004l[?2004h>   (if (< i 25)
+[?2004l[?2004h>       (progn (display (fgetchr fp)) (display " ") (show (+ i 1)))))
+[?2004l[?2004h> (show 0)
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/dbg.scm
+[?2004l40 100 105 115 112 108 97 121 32 34 82 101 97 100 105 110 103 34 41 10 40 110 101 119 108 
+[?2004hroot@69944c7bc9a2:/app# sed -n '/^(define (read-atom/,/^;; ---/p' /app/eval.scm
+[?2004l(define (read-atom fp c0) (read-atom-go fp (cons c0 '())))
+(define (read-atom-go fp acc)
+  (let ((c (fgetchr fp)))
+    (if (or (= c -1) (= c 40) (= c 41) (= c 39) (= c 59) (sp? c))
+        (atom-value (rev acc))
+        (read-atom-go fp (cons c acc)))))
+
+(define (read-expr fp)
+  (read-expr-go (fgetchr fp) fp))
+
+(define (read-expr-go c fp)
+  (cond
+    ((= c -1) 'eof)
+    ((sp? c) (read-expr-go (fgetchr fp) fp))
+    ((= c 59) (skip-line fp) (read-expr-go (fgetchr fp) fp))
+    ((= c 40) (read-list fp))
+    ((= c 39) (cons 'quote (cons (read-expr fp) '())))
+    ((= c 34) (read-str-go (fgetchr fp) fp '()))
+    (else (read-atom fp c))))
+
+(define (read-str-go c fp acc)
+  (cond
+    ((= c -1) (codes->string (rev acc)))
+    ((= c 34) (codes->string (rev acc)))
+    ((= c 92)
+     (let ((c2 (fgetchr fp)))
+       (read-str-go (fgetchr fp) fp (cons c2 (cons 92 acc)))))
+    (else (read-str-go (fgetchr fp) fp (cons c acc)))))
+
+(define (read-list fp) (read-list-go (fgetchr fp) fp '()))
+(define (read-list-go c fp acc)
+  (cond
+    ((= c -1) (rev acc))
+    ((= c 41) (rev acc))
+    ((= c 39)
+     (read-list-go (fgetchr fp) fp
+                   (cons (cons 'quote (cons (read-expr fp) '())) acc)))
+    ((= c 34)
+     (read-list-go (fgetchr fp) fp
+                   (cons (read-str-go (fgetchr fp) fp '()) acc)))
+    (else (read-list-go (fgetchr fp) fp (cons (read-atom fp c) acc)))))
+
+;; ------------------------------------------------------------------
+[?2004hroot@69944c7bc9a2:/app# cd /app && awk '/^\(define \(rev l\)/,/^\(define \(read-list-go/' eval.scm > /tmp/probe.scm && cat >> /tmp/probe.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "test/calculator.scm" "r"))
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe.scm
+[?2004lError: Missing closing parenthesis
+[?2004hroot@69944c7bc9a2:/app# grep -n "define (read-list-go\|define (my-apply proc args)\|The interpreter" eval.scm | head
+[?2004l114:(define (read-list-go c fp acc)
+127:;; The interpreter.
+280:(define (my-apply proc args)
+[?2004hroot@69944c7bc9a2:/app# awk 'NR>=1 && NR<=115' eval.scm > /tmp/probe.scm; tail -5 /tmp/probe.scm
+[?2004l    (else (read-str-go (fgetchr fp) fp (cons c acc)))))
+
+(define (read-list fp) (read-list-go (fgetchr fp) fp '()))
+(define (read-list-go c fp acc)
+  (cond
+[?2004hroot@69944c7bc9a2:/app# awk 'NR>=1 && NR<=124' eval.scm > /tmp/probe.scm && cat >> /tmp/probe.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "test/calculator.scm" "r"))
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# sed -n '120,124p' eval.scm
+[?2004l                   (cons (cons 'quote (cons (read-expr fp) '())) acc)))
+    ((= c 34)
+     (read-list-go (fgetchr fp) fp
+                   (cons (read-str-go (fgetchr fp) fp '()) acc)))
+    (else (read-list-go (fgetchr fp) fp (cons (read-atom fp c) acc)))))
+[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe.scm
+[?2004l('dsplay' 'iReading"' "(newline)" '\none"' 'D' '\newline' 'n' '\n')
+eof
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = """(define (read-list-go c fp acc)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((= c -1) (rev acc))
+[?2004l[?2004h>     ((= c 41) (rev acc))
+[?2004l[?2004h>     ((= c 39)
+[?2004l[?2004h>      (read-list-go (fgetchr fp) fp
+[?2004l[?2004h>                    (cons (cons 'quote (cons (read-expr fp) '())) acc)))
+[?2004l[?2004h>     ((= c 34)
+[?2004l[?2004h>      (read-list-go (fgetchr fp) fp
+[?2004l[?2004h>                    (cons (read-str-go (fgetchr fp) fp '()) acc)))
+[?2004l[?2004h>     (else (read-list-go (fgetchr fp) fp (cons (read-atom fp c) acc))))"""
+[?2004l[?2004h> new = """(define (read-list-go c fp acc)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((= c -1) (rev acc))
+[?2004l[?2004h>     ((= c 41) (rev acc))
+[?2004l[?2004h>     ((= c 39)
+[?2004l[?2004h>      (let ((qitem (cons 'quote (cons (read-expr fp) '()))))
+[?2004l[?2004h>        (read-list-go (fgetchr fp) fp (cons qitem acc))))
+[?2004l[?2004h>     ((= c 34)
+[?2004l[?2004h>      (let ((sval (read-str-go (fgetchr fp) fp '())))
+[?2004l[?2004h>        (read-list-go (fgetchr fp) fp (cons sval acc))))
+[?2004l[?2004h>     (else
+[?2004l[?2004h>      (let ((aval (read-atom fp c)))
+[?2004l[?2004h>        (read-list-go (fgetchr fp) fp (cons aval acc))))))"""
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print("patched")
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lError: Unexpected closing parenthesis
+[?2004hroot@69944c7bc9a2:/app# grep -n "define (read-list-go" eval.scm
+[?2004l114:(define (read-list-go c fp acc)
+[?2004hroot@69944c7bc9a2:/app# awk 'NR<=128' eval.scm > /tmp/probe.scm && cat >> /tmp/probe.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "test/calculator.scm" "r"))
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# tail -8 /tmp/probe.scm; python3 interp.py /tmp/probe.scm
+[?2004l       (read-list-go (fgetchr fp) fp (cons aval acc)))))))
+
+;; ------------------------------------------------------------------
+(define fp (fopen "test/calculator.scm" "r"))
+(display (read-expr fp))
+(newline)
+(display (read-expr fp))
+(newline)
+Error: Unexpected closing parenthesis
+[?2004hroot@69944c7bc9a2:/app# sed -n '114,130p' eval.scm
+[?2004l(define (read-list-go c fp acc)
+  (cond
+    ((= c -1) (rev acc))
+    ((= c 41) (rev acc))
+    ((= c 39)
+     (let ((qitem (cons 'quote (cons (read-expr fp) '()))))
+       (read-list-go (fgetchr fp) fp (cons qitem acc))))
+    ((= c 34)
+     (let ((sval (read-str-go (fgetchr fp) fp '())))
+       (read-list-go (fgetchr fp) fp (cons sval acc))))
+    (else
+     (let ((aval (read-atom fp c)))
+       (read-list-go (fgetchr fp) fp (cons aval acc)))))))
+
+;; ------------------------------------------------------------------
+;; The interpreter.
+;;
+[?2004hroot@69944c7bc9a2:/app# awk 'NR<=126' eval.scm > /tmp/probe.scm && cat >> /tmp/probe.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "test/calculator.scm" "r"))
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe.scm
+[?2004lError: Unexpected closing parenthesis
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> lines = open('/app/eval.scm').read().split('\n')
+[?2004l[?2004h> bal = 0
+[?2004l[?2004h> for i, ln in enumerate(lines[:126], 1):
+[?2004l[?2004h>     bal += ln.count('(') - ln.count(')')
+[?2004l[?2004h>     if i >= 113 and i <= 126:
+[?2004l[?2004h>         print(i, bal, ln)
+[?2004l[?2004h> print('total bal:', bal)
+[?2004l[?2004h> PYEOF
+[?2004l113 0 (define (read-list fp) (read-list-go (fgetchr fp) fp '()))
+114 1 (define (read-list-go c fp acc)
+115 2   (cond
+116 2     ((= c -1) (rev acc))
+117 2     ((= c 41) (rev acc))
+118 3     ((= c 39)
+119 4      (let ((qitem (cons 'quote (cons (read-expr fp) '()))))
+120 2        (read-list-go (fgetchr fp) fp (cons qitem acc))))
+121 3     ((= c 34)
+122 4      (let ((sval (read-str-go (fgetchr fp) fp '())))
+123 2        (read-list-go (fgetchr fp) fp (cons sval acc))))
+124 3     (else
+125 4      (let ((aval (read-atom fp c)))
+126 -1        (read-list-go (fgetchr fp) fp (cons aval acc)))))))
+total bal: -1
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> ln = open('/app/eval.scm').read().split('\n')[125]
+[?2004l[?2004h> print(repr(ln))
+[?2004l[?2004h> print('opens', ln.count('('), 'closes', ln.count(')'))
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = '       (read-list-go (fgetchr fp) fp (cons aval acc)))))))'
+[?2004l[?2004h> if old in src:
+[?2004l[?2004h>     src = src.replace(old, '       (read-list-go (fgetchr fp) fp (cons aval acc))))))')
+[?2004l[?2004h>     open('/app/eval.scm','w').write(src)
+[?2004l[?2004h>     print('fixed')
+[?2004l[?2004h> else:
+[?2004l[?2004h>     print('pattern not found')
+[?2004l[?2004h> PYEOF
+[?2004l'       (read-list-go (fgetchr fp) fp (cons aval acc)))))))'
+opens 3 closes 8
+fixed
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> bal = 0
+[?2004l[?2004h> for i, ln in enumerate(src.split('\n'), 1):
+[?2004l[?2004h>     bal += ln.count('(') - ln.count(')')
+[?2004l[?2004h> print('final balance:', bal)
+[?2004l[?2004h> PYEOF
+[?2004lfinal balance: 0
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lReadingError: Undefined variable: 
+
+Error: Undefined variable: let
+Error: Undefined variable: (
+Error: Undefined variable: line
+Error: Undefined variable: (read
+
+Error: Undefined variable: )
+Error: Undefined variable: (cdr
+Error: Undefined variable: (cdr
+Error: Undefined variable: line
+Error: Undefined variable: )
+Error: Undefined variable: )
+Error: Undefined variable: (=
+Error: Undefined variable: (car
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: (-
+Error: Undefined variable: (car
+Error: Undefined variable: (cdr
+Error: Undefined variable: line
+Error: Not a procedure: False
+Error: Undefined variable: (cdr
+Error: Undefined variable: (cdr
+Error: Undefined variable: line
+Error: Undefined variable: )
+Error: Undefined variable: )
+Error: Undefined variable: (=
+Error: Undefined variable: (car
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: (*
+Error: Undefined variable: (car
+Error: Undefined variable: (cdr
+Error: Undefined variable: line
+Error: Not a procedure: False
+Error: Undefined variable: (cdr
+Error: Undefined variable: (cdr
+Error: Undefined variable: line
+Error: Undefined variable: )
+Error: Undefined variable: )
+Error: Undefined variable: )
+Error: Undefined variable: 
+
+
+Error: Undefined variable: 
+
+
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = """    ((= c 34)
+[?2004l[?2004h>      (let ((sval (read-str-go (fgetchr fp) fp '())))
+[?2004l[?2004h>        (read-list-go (fgetchr fp) fp (cons sval acc))))
+[?2004l[?2004h>     (else"""
+[?2004l[?2004h> new = """    ((= c 34)
+[?2004l[?2004h>      (let ((sval (read-str-go (fgetchr fp) fp '())))
+[?2004l[?2004h>        (read-list-go (fgetchr fp) fp (cons sval acc))))
+[?2004l[?2004h>     ((= c 40)
+[?2004l[?2004h>      (let ((sub (read-list fp)))
+[?2004l[?2004h>        (read-list-go (fgetchr fp) fp (cons sub acc))))
+[?2004l[?2004h>     (else"""
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lReadingError: Undefined variable: 
+
+Error: Undefined variable: let
+Error: Undefined variable: line
+Error: Not a procedure: False
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable: cond
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable: cadr
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = """(define (rev l) (rev-go l '()))"""
+[?2004l[?2004h> new = """(define (caar x) (car (car x)))
+[?2004l[?2004h> (define (cadar x) (car (cdr x)))
+[?2004l[?2004h> (define (cadr x) (car (cdr x)))
+[?2004l[?2004h> (define (cddr x) (cdr (cdr x)))
+[?2004l[?2004h> (define (caddr x) (car (cdr (cdr x))))
+[?2004l[?2004h> (define (cadddr x) (car (cdr (cdr (cdr x)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (rev l) (rev-go l '()))"""
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new, 1)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lReadingError: Undefined variable: 
+
+Error: Undefined variable: let
+Error: Undefined variable: line
+Error: Not a procedure: False
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable: cond
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: 
+
+Error: Undefined variable:  
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Undefined variable:  
+Error: Undefined variable: line
+Error: Not a procedure: False
+Error: Undefined variable: 
+
+Error: Undefined variable: 
+
+Error: Undefined variable: 
+
+Error: Undefined variable: 
+
+Error: Not a procedure: True
+Error: Not a procedure: False
+
+[?2004hroot@69944c7bc9a2:/app# grep -n "The interpreter.\|^(define (run-prog-go" eval.scm | head -3
+[?2004l139:;; The interpreter.
+364:(define (run-prog-go e fp)
+[?2004hroot@69944c7bc9a2:/app# start=$(grep -n ';; The interpreter.' eval.scm | cut -d: -f1); end=$((start - 2)); echo using $end; awk -v e=$end 'NR<=e' eval.scm > /tmp/probe.scm; cat >> /tmp/probe.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "test/calculator.scm" "r"))
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> (display (read-expr fp))
+[?2004l[?2004h> (newline)
+[?2004l[?2004h> EOF
+[?2004lusing 137
+[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe.scm
+[?2004l('display' "Reading")
+('newline' '\n' 'let' (('line' ('read')) '\n' ' ' 'cond' ' ' ' ' ('=' ('car' 'line' ' ' '+' '\n' ' ' ' ' 'display' ('+' ('car' ('cdr' 'line') ' ' 'car' ('cdr' ('cdr' 'line'))))) '\n' ' ' (('=' ('car' 'line' ' ' '-' '\n' ' ' ' ' 'display' ('-' ('car' ('cdr' 'line') ' ' 'car' ('cdr' ('cdr' 'line'))))) '\n' ' ' (('=' ('car' 'line' ' ' '*' '\n' ' ' ' ' 'display' ('*' ('car' ('cdr' 'line') ' ' 'car' ('cdr' ('cdr' 'line'))))))) '\n' 'newline' '\n' 'display' "Done") '\n' 'newline' '\n'))))
+eof
+eof
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> import re
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> 
+[?2004l[?2004h> start = src.index("(define (sp? c)")
+[?2004l[?2004h> end = src.index("(define (digit? c)")
+[?2004l[?2004h> new_reader = '''(define (sp? c) (or (= c 32) (= c 9) (= c 10) (= c 13)))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (skip-line fp)
+[?2004l[?2004h>   (let ((c (fgetchr fp)))
+[?2004l[?2004h>     (if (or (= c -1) (= c 10) (= c 13)) #f (skip-line fp))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define *tmpfile* "__str_tmp_eval.scm")
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (write-codes w l)
+[?2004l[?2004h>   (if (null? l) #f (begin (fputchr w (car l)) (write-codes w (cdr l)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> ;; Rebuild a genuine string value (as interp.py's tokenizer would make
+[?2004l[?2004h> ;; one for a "..." literal) from raw character codes, by writing the
+[?2004l[?2004h> ;; quoted text to a temp file and letting the real reader (fread)
+[?2004l[?2004h> ;; tokenize it.
+[?2004l[?2004h> (define (codes->string l)
+[?2004l[?2004h>   (let ((w (fopen *tmpfile* "w")))
+[?2004l[?2004h>     (fputchr w 34)
+[?2004l[?2004h>     (write-codes w l)
+[?2004l[?2004h>     (fputchr w 34)
+[?2004l[?2004h>     (fclose w)
+[?2004l[?2004h>     (let ((rf (fopen *tmpfile* "r")))
+[?2004l[?2004h>       (let ((v (fread rf)))
+[?2004l[?2004h>         (fclose rf)
+[?2004l[?2004h>         (let ((c (fopen *tmpfile* "w")))
+[?2004l[?2004h>           (fclose c))
+[?2004l[?2004h>         v))))
+[?2004l[?2004h> 
+[?2004l[?2004h> '''
+[?2004l[?2004h> src = src[:start] + new_reader + src[end:]
+[?2004l[?2004h> 
+[?2004l[?2004h> # Now replace the read-expr ... read-list-go block (after digit/all-digits/chars->int/atom-value)
+[?2004l[?2004h> start = src.index("(define (read-atom fp c0)")
+[?2004l[?2004h> end = src.index(";; ------------------------------------------------------------------\n;; The interpreter.")
+[?2004l[?2004h> new_reader2 = '''(define (read-atom fp c) (read-atom-go fp c (cons c '())))
+[?2004l[?2004h> (define (read-atom-go fp c acc)
+[?2004l[?2004h>   (if (or (= c -1) (= c 40) (= c 41) (= c 39) (= c 59) (sp? c))
+[?2004l[?2004h>       (cons (atom-value (rev acc)) c)
+[?2004l[?2004h>       (read-atom-go fp (fgetchr fp) (cons c acc))))
+[?2004l[?2004h> 
+[?2004l[?2004h> ;; The reader returns (value . next-char) pairs; next-char is the first
+[?2004l[?2004h> ;; character just past the value being returned.
+[?2004l[?2004h> (define (read-expr fp c)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((= c -1) (cons 'eof -1))
+[?2004l[?2004h>     ((sp? c) (read-expr fp (fgetchr fp)))
+[?2004l[?2004h>     ((= c 59) (skip-line fp) (read-expr fp (fgetchr fp)))
+[?2004l[?2004h>     ((= c 40) (read-list fp c))
+[?2004l[?2004h>     ((= c 39)
+[?2004l[?2004h>      (let ((r (read-expr fp (fgetchr fp))))
+[?2004l[?2004h>        (cons (cons 'quote (cons (car r) '())) (cdr r))))
+[?2004l[?2004h>     ((= c 34) (read-str fp c))
+[?2004l[?2004h>     (else (read-atom fp c))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (read-str fp c) (read-str-go (fgetchr fp) fp '()))
+[?2004l[?2004h> (define (read-str-go c fp acc)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((= c -1) (cons (codes->string (rev acc)) -1))
+[?2004l[?2004h>     ((= c 34) (cons (codes->string (rev acc)) (fgetchr fp)))
+[?2004l[?2004h>     ((= c 92)
+[?2004l[?2004h>      (let ((c2 (fgetchr fp)))
+[?2004l[?2004h>        (read-str-go (fgetchr fp) fp (cons c2 (cons 92 acc)))))
+[?2004l[?2004h>     (else (read-str-go (fgetchr fp) fp (cons c acc)))))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (read-list fp c) (read-list-go (fgetchr fp) fp '()))
+[?2004l[?2004h> (define (read-list-go c fp acc)
+[?2004l[?2004h>   (cond
+[?2004l[?2004h>     ((= c -1) (cons (rev acc) -1))
+[?2004l[?2004h>     ((= c 41) (cons (rev acc) (fgetchr fp)))
+[?2004l[?2004h>     ((sp? c) (read-list-go (fgetchr fp) fp acc))
+[?2004l[?2004h>     ((= c 59) (skip-line fp) (read-list-go (fgetchr fp) fp acc))
+[?2004l[?2004h>     ((= c 39)
+[?2004l[?2004h>      (let ((r (read-expr fp (fgetchr fp))))
+[?2004l[?2004h>        (read-list-go (cdr r) fp
+[?2004l[?2004h>                      (cons (cons 'quote (cons (car r) '())) acc))))
+[?2004l[?2004h>     ((= c 34)
+[?2004l[?2004h>      (let ((r (read-str fp c)))
+[?2004l[?2004h>        (read-list-go (cdr r) fp (cons (car r) acc))))
+[?2004l[?2004h>     ((= c 40)
+[?2004l[?2004h>      (let ((r (read-list fp c)))
+[?2004l[?2004h>        (read-list-go (cdr r) fp (cons (car r) acc))))
+[?2004l[?2004h>     (else
+[?2004l[?2004h>      (let ((r (read-atom fp c)))
+[?2004l[?2004h>        (read-list-go (cdr r) fp (cons (car r) acc))))))
+[?2004l[?2004h> 
+[?2004l[?2004h> '''
+[?2004l[?2004h> src = src[:start] + new_reader2 + src[end:]
+[?2004l[?2004h> 
+[?2004l[?2004h> # Update run-program loop
+[?2004l[?2004h> old = """(define (run-program fp) (run-prog-go (read-expr fp) fp))
+[?2004l[?2004h> (define (run-prog-go e fp)
+[?2004l[?2004h>   (if (eq? e 'eof)
+[?2004l[?2004h>       (fclose fp)
+[?2004l[?2004h>       (begin (my-eval e '()) (run-prog-go (read-expr fp) fp))))"""
+[?2004l[?2004h> new = """(define (run-program fp) (run-prog-go (fgetchr fp) fp))
+[?2004l[?2004h> (define (run-prog-go c fp)
+[?2004l[?2004h>   (let ((r (read-expr fp c)))
+[?2004l[?2004h>     (if (eq? (car r) 'eof)
+[?2004l[?2004h>         (fclose fp)
+[?2004l[?2004h>         (begin
+[?2004l[?2004h>           (my-eval (car r) '())
+[?2004l[?2004h>           (run-prog-go (cdr r) fp)))))"""
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('rewrite done')
+[?2004l[?2004h> PYEOF
+[?2004lrewrite done
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: chars->symbol
+[?2004hroot@69944c7bc9a2:/app# grep -n "chars->symbol\|codes->string\|digit?" eval.scm | head
+[?2004l49:(define (codes->string l)
+62:(define (digit? c) (and (>= c 48) (<= c 57)))
+66:        ((not (digit? (car l))) #f)
+87:           (chars->symbol l))))))
+112:    ((= c -1) (cons (codes->string (rev acc)) -1))
+113:    ((= c 34) (cons (codes->string (rev acc)) (fgetchr fp)))
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = """(define (digit? c) (and (>= c 48) (<= c 57)))"""
+[?2004l[?2004h> new = """(define (chars->symbol l) (symbol l))
+[?2004l[?2004h> 
+[?2004l[?2004h> (define (digit? c) (and (>= c 48) (<= c 57)))"""
+[?2004l[?2004h> assert old in src and "(define (chars->symbol" not in src
+[?2004l[?2004h> src = src.replace(old, new, 1)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('re-added')
+[?2004l[?2004h> PYEOF
+[?2004lre-added
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: ddisplay
+Error: Not a procedure: False
+Error: Undefined variable: nnewline
+Error: Not a procedure: False
+Error: Undefined variable: llet
+Error: Undefined variable: lline
+Error: Undefined variable: rread
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ccond
+Error: Undefined variable: ==
+Error: Undefined variable: ccar
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ddisplay
+Error: Undefined variable: ++
+Error: Undefined variable: ccar
+Error: Undefined variable: ccdr
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ccar
+Error: Undefined variable: ccdr
+Error: Undefined variable: ccdr
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ==
+Error: Undefined variable: ccar
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ddisplay
+Error: Undefined variable: --
+Error: Undefined variable: ccar
+Error: Undefined variable: ccdr
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ccar
+Error: Undefined variable: ccdr
+Error: Undefined variable: ccdr
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ==
+Error: Undefined variable: ccar
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ddisplay
+Error: Undefined variable: **
+Error: Undefined variable: ccar
+Error: Undefined variable: ccdr
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: ccar
+Error: Undefined variable: ccdr
+Error: Undefined variable: ccdr
+Error: Undefined variable: lline
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Not a procedure: False
+Error: Undefined variable: nnewline
+Error: Not a procedure: False
+Error: Undefined variable: ddisplay
+Error: Not a procedure: False
+Error: Undefined variable: nnewline
+Error: Not a procedure: False
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = "(define (read-atom fp c) (read-atom-go fp c (cons c '())))"
+[?2004l[?2004h> new = "(define (read-atom fp c) (read-atom-go fp c '()))"
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lReading
+Error: Undefined variable: line
+Error: Undefined variable: line
+Error: Undefined variable: line
+
+Done
+[?2004hroot@69944c7bc9a2:/app# printf '(let ((x 5))\n  (display x)\n  (newline))\n' > /tmp/tlet.scm; echo -e '/tmp/tlet.scm' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: x
+False
+[?2004hroot@69944c7bc9a2:/app# start=$(grep -n ';; The interpreter.' eval.scm | cut -d: -f1); end=$((start - 2)); awk -v e=$end 'NR<=e' eval.scm > /tmp/probe.scm; cat >> /tmp/probe.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "test/calculator.scm" "r"))
+[?2004l[?2004h> (let ((r (read-expr fp (fgetchr fp)))) (display (car r)) (newline))
+[?2004l[?2004h> (let ((r (read-expr fp (fgetchr fp)))) (display (car r)) (newline))
+[?2004l[?2004h> (let ((r (read-expr fp (fgetchr fp)))) (display (car r)) (newline))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe.scm
+[?2004l('display' "Reading")
+('newline')
+('let' (('line' ('read'))) ('cond' (('=' ('car' 'line') ('quote' '+')) ('display' ('+' ('car' ('cdr' 'line')) ('car' ('cdr' ('cdr' 'line')))))) (('=' ('car' 'line') ('quote' '-')) ('display' ('-' ('car' ('cdr' 'line')) ('car' ('cdr' ('cdr' 'line')))))) (('=' ('car' 'line') ('quote' '*')) ('display' ('*' ('car' ('cdr' 'line')) ('car' ('cdr' ('cdr' 'line'))))))))
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = """      (my-let-vals (cdr b) body env
+[?2004l[?2004h>                    (cons (cons (car b) (my-eval (cadr b) env)) frame))))"""
+[?2004l[?2004h> new = """      (my-let-vals (cdr b) body env
+[?2004l[?2004h>                    (cons (cons (caar b) (my-eval (cadr b) env)) frame))))"""
+[?2004l[?2004h> if old in src:
+[?2004l[?2004h>     src = src.replace(old, new)
+[?2004l[?2004h> else:
+[?2004l[?2004h>     old2 = "(cons (cons (car b) (my-eval (cadr b) env)) frame))"
+[?2004l[?2004h>     assert old2 in src
+[?2004l[?2004h>     src = src.replace(old2, "(cons (cons (caar b) (my-eval (cadr b) env)) frame))")
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lReading
+
+Done
+[?2004hroot@69944c7bc9a2:/app# printf '(display (read))\n(newline)\n(display (car (read)))\n(newline)\n' > /tmp/tread.scm; echo -e '/tmp/tread.scm\n(+ 7 8)\n(- 4 1)' | python3 interp.py eval.scm
+[?2004l('+' 7 8)
+-
+[?2004hroot@69944c7bc9a2:/app# printf "(let ((line '(+ 7 8)))\n  (display (if (= (car line) '+) \"yes\" \"no\"))\n  (newline))\n" > /tmp/tcond.scm; cat /tmp/tcond.scm; echo -e '/tmp/tcond.scm' | python3 interp.py eval.scm
+[?2004l(let ((line '(+ 7 8)))
+  (display (if (= (car line) '+) "yes" "no"))
+  (newline))
+False
+[?2004hroot@69944c7bc9a2:/app# printf "(let ((line '(+ 7 8)))\n  (display (= 3 3)) (newline)\n  (display (= (car line) '+) ) (newline)\n  (display (car line)) (newline))\n" > /tmp/tc2.scm; echo -e '/tmp/tc2.scm' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: 3
+Error: Undefined variable: 3
+True
+False
+False
+[?2004hroot@69944c7bc9a2:/app# sed -n '/^(define (my-eval e env)/,/^;; ---/p' eval.scm | head -30
+[?2004l(define (my-eval e env)
+  (cond
+    ((null? e) #f)
+    ((pair? e)
+     (let ((t (car e)))
+       (cond
+         ((eq? t 'quote) (cadr e))
+         ((eq? t 'if) (my-eval-if e env))
+         ((eq? t 'define) (my-eval-define e env))
+         ((eq? t 'set!)
+          (my-set! (cadr e) (my-eval (cadr (cdr e)) env) env)
+          #f)
+         ((eq? t 'lambda) (my-proc (cadr e) (cddr e) env))
+         ((eq? t 'let) (my-eval-let e env))
+         ((or (eq? t 'begin) (eq? t 'progn)) (my-eval-seq (cdr e) env))
+         ((eq? t 'cond) (my-eval-cond (cdr e) env))
+         (else (my-apply (my-eval t env) (my-eval-list (cdr e) env))))))
+    ((symbol? e) (my-lookup e env))
+    (else e)))
+
+;; ------------------------------------------------------------------
+[?2004hroot@69944c7bc9a2:/app# printf "(display 3)\n(newline)\n(display (car '(+ 7 8)))\n(newline)\n(display (quote 9))\n(newline)\n" > /tmp/t3.scm; echo -e '/tmp/t3.scm' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: 3
+False
++
+9
+[?2004hroot@69944c7bc9a2:/app# printf "(define n 3)\n(display (number? n)) (newline)\n(display (pair? n)) (newline)\n(display (null? n)) (newline)\n(display (symbol? n)) (newline)\n" > /tmp/t4.scm; echo -e '/tmp/t4.scm' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: 3
+True
+False
+False
+False
+[?2004hroot@69944c7bc9a2:/app# printf "(define n 3)\n(display (symbol? n)) (newline)\n(display (number? n)) (newline)\n(display n) (newline)\n" > /tmp/t5.scm; python3 interp.py /tmp/t5.scm
+[?2004lFalse
+True
+3
+[?2004hroot@69944c7bc9a2:/app# printf "(display 3)\n(newline)\n" > /tmp/t6.scm; echo -e '/tmp/t6.scm' | python3 interp.py eval.scm
+[?2004lError: Undefined variable: 3
+False
+[?2004hroot@69944c7bc9a2:/app# printf '3\n' > /tmp/t7.scm; start=$(grep -n ';; The interpreter.' eval.scm | cut -d: -f1); end=$((start - 2)); awk -v e=$end 'NR<=e' eval.scm > /tmp/probe.scm; cat >> /tmp/probe.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "/tmp/t7.scm" "r"))
+[?2004l[?2004h> (let ((r (read-expr fp (fgetchr fp))))
+[?2004l[?2004h>   (display (car r))
+[?2004l[?2004h>   (display " num=")
+[?2004l[?2004h>   (display (number? (car r)))
+[?2004l[?2004h>   (display " sym=")
+[?2004l[?2004h>   (display (symbol? (car r)))
+[?2004l[?2004h>   (display " pair=")
+[?2004l[?2004h>   (display (pair? (car r)))
+[?2004l[?2004h>   (newline))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe.scm
+[?2004l3 num=False sym=True pair=False
+[?2004hroot@69944c7bc9a2:/app# cat > /tmp/probe2.scm <<'EOF'
+[?2004l[?2004h> (define (digit? c) (and (>= c 48) (<= c 57)))
+[?2004l[?2004h> (define (all-digits? l)
+[?2004l[?2004h>   (cond ((null? l) #f)
+[?2004l[?2004h>         ((not (digit? (car l))) #f)
+[?2004l[?2004h>         ((null? (cdr l)) #t)
+[?2004l[?2004h>         (else (all-digits? (cdr l)))))
+[?2004l[?2004h> (define l (cons 51 '()))
+[?2004l[?2004h> (display (digit? 51)) (newline)
+[?2004l[?2004h> (display (all-digits? l)) (newline)
+[?2004l[?2004h> (display (eq? (car l) 51)) (newline)
+[?2004l[?2004h> (display (= (car l) 51)) (newline)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe2.scm
+[?2004lTrue
+True
+True
+True
+[?2004hroot@69944c7bc9a2:/app# sed -n '/^(define (atom-value/,/^(define (read-atom fp c)/p' eval.scm
+[?2004l(define (atom-value l)
+  (cond
+    ((and (pair? l) (null? (cdr (cdr l))) (= (car l) 35))
+      (eq? (cadr l) 116))
+    (else
+     (let ((neg #f) (x l))
+       (if (and (not (null? x)) (or (= (car x) 43) (= (car x) 45)))
+           (set! neg (= (car x) 45))
+           (set! x (cdr x)))
+       (if (all-digits? x)
+           (if neg (- (chars->int x)) (chars->int x))
+           (chars->symbol l))))))
+
+(define (read-atom fp c) (read-atom-go fp c '()))
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = """     (let ((neg #f) (x l))
+[?2004l[?2004h>        (if (and (not (null? x)) (or (= (car x) 43) (= (car x) 45)))
+[?2004l[?2004h>            (set! neg (= (car x) 45))
+[?2004l[?2004h>            (set! x (cdr x)))
+[?2004l[?2004h>        (if (all-digits? x)"""
+[?2004l[?2004h> new = """     (let ((neg #f) (x l))
+[?2004l[?2004h>        (if (and (not (null? x)) (or (= (car x) 43) (= (car x) 45)))
+[?2004l[?2004h>            (begin
+[?2004l[?2004h>              (set! neg (= (car x) 45))
+[?2004l[?2004h>              (set! x (cdr x))))
+[?2004l[?2004h>        (if (all-digits? x)"""
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# grep -n "set!" eval.scm | grep -v g-seed | head -20
+[?2004l86:             (set! neg (= (car x) 45))
+87:             (set! x (cdr x))))
+153:  (set! *glob* (cons (cons name val) *glob*)))
+214:            (set! *glob* (cons (cons name val) *glob*))))
+220:(define (my-set! name val env)
+224:        (if b (set-car! b val) (my-set! name val (cdr env))))))
+355:         ((eq? t 'set!)
+356:          (my-set! (cadr e) (my-eval (cadr (cdr e)) env) env)
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lReading
+
+Done
+[?2004hroot@69944c7bc9a2:/app# echo -e '/tmp/t4.scm' | python3 interp.py eval.scm; echo ---; echo -e '/tmp/tcond.scm' | python3 interp.py eval.scm
+[?2004lTrue
+False
+False
+False
+---
+False
+[?2004hroot@69944c7bc9a2:/app# printf "(display (= '+ '+)) (newline)\n(let ((line '(+ 7 8)))\n  (display (car line)) (newline)\n  (display (= (car line) '+)) (newline)\n  (display (eq? (car line) '+)) (newline))\n" > /tmp/tc3.scm; echo -e '/tmp/tc3.scm' | python3 interp.py eval.scm
+[?2004lTrue
+False
+False
+False
+[?2004hroot@69944c7bc9a2:/app# printf "(let ((line '(+ 7 8)))\n  (display line) (newline)\n  (display (pair? line)) (newline)\n  (display (car line)) (newline))\n" > /tmp/tc4.scm; echo -e '/tmp/tc4.scm' | python3 interp.py eval.scm
+[?2004lFalse
+False
+False
+[?2004hroot@69944c7bc9a2:/app# start=$(grep -n ';; The interpreter.' eval.scm | cut -d: -f1); end=$((start - 2)); awk -v e=$end 'NR<=e' eval.scm > /tmp/probe3.scm; cat >> /tmp/probe3.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "/tmp/tc4.scm" "r"))
+[?2004l[?2004h> (let ((r (read-expr fp (fgetchr fp))))
+[?2004l[?2004h>   (display (car r)) (newline)
+[?2004l[?2004h>   (display (caddr (car (cadr (car r))))) (newline)
+[?2004l[?2004h>   (display (cadr (car r))) (newline)
+[?2004l[?2004h>   (display (cadr (cadr (car (cadr (car r)))))) (newline)
+[?2004l[?2004h>   (display (pair? (cadr (cadr (car (cadr (car r))))))) (newline)))
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe3.scm
+[?2004l('let' (('line' ('quote' ('+' 7 8)))) ('display' 'line') ('newline') ('display' ('pair?' 'line')) ('newline') ('display' ('car' 'line')) ('newline'))
+None
+(('line' ('quote' ('+' 7 8))))
+('+' 7 8)
+True
+Error: Unexpected closing parenthesis
+[?2004hroot@69944c7bc9a2:/app# grep -n "my-eval-let\|my-let-vals" eval.scm
+[?2004l311:(define (my-eval-let e env) (my-let-vals (cadr e) (cddr e) env '()))
+312:(define (my-let-vals b body env frame)
+315:      (my-let-vals (cdr b) body env
+359:         ((eq? t 'let) (my-eval-let e env))
+[?2004hroot@69944c7bc9a2:/app# sed -n '/^(define (my-eval-let/,/^$/p' eval.scm
+[?2004l(define (my-eval-let e env) (my-let-vals (cadr e) (cddr e) env '()))
+(define (my-let-vals b body env frame)
+  (if (null? b)
+      (my-eval-seq body (cons frame env))
+      (my-let-vals (cdr b) body env
+                   (cons (cons (caar b) (my-eval (cadr b) env)) frame))))
+
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> i = src.rindex("(eval-main)")
+[?2004l[?2004h> src = src[:i]
+[?2004l[?2004h> probe = src + '''
+[?2004l[?2004h> (define fp (fopen "/tmp/tc4.scm" "r"))
+[?2004l[?2004h> (let ((r (read-expr fp (fgetchr fp))))
+[?2004l[?2004h>   (let ((e (car r)))
+[?2004l[?2004h>     (display "bindings: ") (display (cadr e)) (newline)
+[?2004l[?2004h>     (let ((b (cadr e)))
+[?2004l[?2004h>       (display "caar: ") (display (caar b)) (newline)
+[?2004l[?2004h>       (let ((v (my-eval (cadr b) '())))
+[?2004l[?2004h>         (display "value: ") (display v) (display " pair=") (display (pair? v)) (newline)
+[?2004l[?2004h>         (my-eval e '()))))))
+[?2004l[?2004h> '''
+[?2004l[?2004h> open('/tmp/probe4.scm','w').write(probe)
+[?2004l[?2004h> print('ok')
+[?2004l[?2004h> PYEOF
+[?2004lok
+[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe4.scm
+[?2004lbindings: (('line' ('quote' ('+' 7 8))))
+caar: line
+value: False pair=False
+False
+False
+False
+Error: Unexpected closing parenthesis
+[?2004hroot@69944c7bc9a2:/app# cat > /tmp/probe5.scm <<'EOF'
+[?2004l[?2004h> (define fp (fopen "/tmp/tc4.scm" "r"))
+[?2004l[?2004h> (define r (read-expr fp (fgetchr fp)))
+[?2004l[?2004h> (define e (car r))
+[?2004l[?2004h> (define q (cadr (car (cadr e))))
+[?2004l[?2004h> (display "q= ") (display q) (newline)
+[?2004l[?2004h> (display "car q= ") (display (car q)) (newline)
+[?2004l[?2004h> (display "eq? quote: ") (display (eq? (car q) 'quote)) (newline)
+[?2004l[?2004h> (display "pair q: ") (display (pair? q)) (newline)
+[?2004l[?2004h> (display "cadr q: ") (display (cadr q)) (newline)
+[?2004l[?2004h> (display "my-eval q: ") (display (my-eval q '())) (newline)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@69944c7bc9a2:/app# tail -0 eval.scm > /dev/null; python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> i = src.rindex("(eval-main)")
+[?2004l[?2004h> probe = src[:i] + open('/tmp/probe5.scm').read()
+[?2004l[?2004h> open('/tmp/probe5b.scm','w').write(probe)
+[?2004l[?2004h> print('ok')
+[?2004l[?2004h> PYEOF
+[?2004lok
+[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe5b.scm
+[?2004lq= ('quote' ('+' 7 8))
+car q= quote
+eq? quote: True
+pair q: True
+cadr q: ('+' 7 8)
+my-eval q: ('+' 7 8)
+[?2004hroot@69944c7bc9a2:/app# echo -e '/tmp/tc4.scm' | python3 interp.py eval.scm; echo ---; echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lFalse
+False
+False
+---
+Reading
+
+Done
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = "(cons (cons (caar b) (my-eval (cadr b) env)) frame))"
+[?2004l[?2004h> new = "(cons (cons (caar b) (my-eval (cadar b) env)) frame))"
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm; echo ---; echo -e '/tmp/tc4.scm' | python3 interp.py eval.scm
+[?2004lReading
+
+Done
+---
+False
+False
+False
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> i = src.rindex("(eval-main)")
+[?2004l[?2004h> probe = src[:i] + '''
+[?2004l[?2004h> (define fp (fopen "/tmp/tc4.scm" "r"))
+[?2004l[?2004h> (define r (read-expr fp (fgetchr fp)))
+[?2004l[?2004h> (define e (car r))
+[?2004l[?2004h> (define b (cadr e))
+[?2004l[?2004h> (display "b: ") (display b) (newline)
+[?2004l[?2004h> (display "caar b: ") (display (caar b)) (newline)
+[?2004l[?2004h> (display "cadar b: ") (display (cadar b)) (newline)
+[?2004l[?2004h> (define v (my-eval (cadar b) '()))
+[?2004l[?2004h> (display "v: ") (display v) (newline)
+[?2004l[?2004h> (define fr (cons (cons (caar b) v) '()))
+[?2004l[?2004h> (display "fr: ") (display fr) (newline)
+[?2004l[?2004h> (display "lookup: ") (display (my-lookup (caar b) (cons fr '()))) (newline)
+[?2004l[?2004h> (display "seq: ") (display (my-eval (car (cddr e)) (cons fr '()))) (newline)
+[?2004l[?2004h> '''
+[?2004l[?2004h> open('/tmp/probe6.scm','w').write(probe)
+[?2004l[?2004h> print('ok')
+[?2004l[?2004h> PYEOF
+[?2004lok
+[?2004hroot@69944c7bc9a2:/app# python3 interp.py /tmp/probe6.scm
+[?2004lb: (('line' ('quote' ('+' 7 8))))
+caar b: line
+cadar b: None
+v: False
+fr: (('line' . False))
+lookup: False
+seq: FalseNone
+[?2004hroot@69944c7bc9a2:/app# python3 - <<'PYEOF'
+[?2004l[?2004h> src = open('/app/eval.scm').read()
+[?2004l[?2004h> old = "(cons (cons (caar b) (my-eval (cadar b) env)) frame))"
+[?2004l[?2004h> new = "(cons (cons (caar b) (my-eval (cadr (car b)) env)) frame))"
+[?2004l[?2004h> assert old in src
+[?2004l[?2004h> src = src.replace(old, new)
+[?2004l[?2004h> open('/app/eval.scm','w').write(src)
+[?2004l[?2004h> print('patched')
+[?2004l[?2004h> PYEOF
+[?2004lpatched
+[?2004hroot@69944c7bc9a2:/app# echo -e 'test/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm; echo ---; echo -e '/tmp/tc4.scm' | python3 interp.py eval.scm
+[?2004lReading
+15
+Done
+---
+('+' 7 8)
+True
++
+[?2004hroot@69944c7bc9a2:/app# echo TEST3: && echo -e 'eval.scm\ntest/calculator.scm\n(+ 7 8)' | python3 interp.py eval.scm
+[?2004lTEST3:
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+Error: Undefined variable: *glob*
+[?2004hroot@69944c7bc9a2:/app# 

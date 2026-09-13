@@ -1,0 +1,882 @@
+[?2004hroot@b0ccf739858c:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@b0ccf739858c:/app# clear
+[?2004l[H[J[3J[?2004hroot@b0ccf739858c:/app# ls -la /app/
+[?2004ltotal 0
+drwxr-xr-x 2 root root  10 Sep 13  2025 .
+drwxr-xr-x 1 root root 102 Sep  6 16:11 ..
+[?2004hroot@b0ccf739858c:/app# python3 --version
+[?2004lPython 3.13.7
+[?2004hroot@b0ccf739858c:/app# pip list 2>/dev/null | grep -i -E 'beautif|lxml|html|bs4|soupsieve'
+[?2004lbeautifulsoup4    4.13.4
+soupsieve         2.8
+[?2004hroot@b0ccf739858c:/app# cat > /app/filter.py << 'PYEOF'
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> """filter.py - Remove JavaScript from HTML files to prevent XSS attacks.
+[?2004l[?2004h> 
+[?2004l[?2004h> Usage: python3 filter.py <html_file>
+[?2004l[?2004h> Reads the HTML file given as argv[1], removes all JavaScript,
+[?2004l[?2004h> and writes the sanitised result back to the same file (in-place).
+[?2004l[?2004h> """
+[?2004l    [?2004h> 
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import re
+[?2004l[?2004h> from urllib.parse import unquote
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> 
+[?2004l[?2004h> # URI schemes that can execute code
+[?2004l[?2004h> JS_SCHEMES = frozenset([
+[?2004l[?2004h>     'javascript', 'vbscript', 'livescript', 'mocha'
+[?2004l[?2004h> ])
+[?2004l[?2004h> 
+[?2004l [?2004h> # Attributes that carry URLs
+[?2004l[?2004h> URL_ATTRS = frozenset([
+[?2004l[?2004h>     'href', 'src', 'action', 'formaction', 'data', 'codebase',
+[?2004l[?2004h>     'cite', 'background', 'poster', 'usemap', 'xlink:href'
+[?2004l[?2004h> ])
+[?2004l   [?2004h> 
+[?2004l[?2004h> # Inline event-handler attributes (onclick, onload, onerror, …)
+[?2004l[?2004h> EVENT_ATTR_RE = re.compile(r'^on', re.IGNORECASE)
+[?2004l[?2004h> 
+[?2004lu[?2004h> # CSS constructs that can run script (legacy IE)
+[?2004l[?2004h> DANGEROUS_CSS_RE = re.compile(
+[?2004l[?2004h>     r'(\bexpression\s*\(|\bbehavior\s*:|\bbinding\s*:)',
+[?2004l[?2004h>     re.IGNORECASE,
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> # Tags where a data:text/html URI creates an inline execution context
+[?2004l[?2004h> DANGEROUS_DATA_URL_TAGS = frozenset(['iframe', 'frame', 'object', 'embed'])
+[?2004l[?2004h> 
+[?2004ln[?2004h> 
+[?2004l[?2004h> # ── URI helpers ────────────────────────────────────────────────
+[?2004l[?2004h> 
+[?2004l�[?2004h> def _normalise(raw):
+[?2004l[?2004h>     """Strip nulls, URL-decode (up to 3×), trim whitespace."""
+[?2004l[?2004h>     if raw is None:
+[?2004l[?2004h>         return ''
+[?2004l[?2004h>     v = str(raw).replace('\x00', '')
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             new_v = unquote(v)
+[?2004l[?2004h>         except Exception:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         if new_v == v:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         v = new_v
+[?2004l[?2004h>     return v.replace('\x00', '').strip()
+[?2004l[?2004h> 
+[?2004l([?2004h> 
+[?2004lc[?2004h> def _scheme(uri):
+[?2004l[?2004h>     """Return the lowercased scheme of *uri*, or None."""
+[?2004l[?2004h>     m = re.match(r'^([a-zA-Z][a-zA-Z0-9+.\-]*)\s*:', uri)
+[?2004l[?2004h>     return m.group(1).lower() if m else None
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _is_js_uri(value):
+[?2004l[?2004h>     """True if *value* uses a dangerous script scheme."""
+[?2004l[?2004h>     v = _normalise(value)
+[?2004l[?2004h>     if not v:
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     for candidate in (v, re.sub(r'[\x00-\x20]+', '', v)):
+[?2004l[?2004h>         s = _scheme(candidate)
+[?2004l[?2004h>         if s in JS_SCHEMES:
+[?2004l[?2004h>             return True
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _is_html_data_uri(value):
+[?2004l[?2004h>     """True if *value* is a data: URI with an HTML media-type."""
+[?2004l[?2004h>     v = _normalise(value)
+[?2004l[?2004h>     if not v:
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     if _scheme(v) != 'data':
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     mediatype = v[5:].split(';', 1)[0].split(',', 1)[0].strip().lower()
+[?2004l[?2004h>     return mediatype in ('text/html', 'application/xhtml+xml')
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> # ── Core filter ────────────────────────────────────────────────
+[?2004l[?2004h> 
+[?2004l[?2004h> def filter_soup(soup):
+[?2004l[?2004h>     """Remove JavaScript from a BeautifulSoup tree (in-place)."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 1 ▸ <script> elements – remove entirely
+[?2004l[?2004h>     for tag in soup.find_all('script'):
+[?2004l[?2004h>         tag.decompose()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 2 ▸ <meta http-equiv="refresh"> pointing at a script
+[?2004l[?2004h>     for meta in soup.find_all('meta'):
+[?2004l[?2004h>         if not meta.parent:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if (meta.get('http-equiv') or '').strip().lower() != 'refresh':
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         content = meta.get('content') or ''
+[?2004l[?2004h>         m = re.search(r'url\s*=\s*(.+)', content, re.IGNORECASE)
+[?2004l[?2004h>         target = m.group(1).strip() if m else content
+[?2004l[?2004h>         if _is_js_uri(target) or _is_html_data_uri(target):
+[?2004l[?2004h>             meta.decompose()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 3 ▸ <style> blocks containing CSS expressions / behaviours
+[?2004l[?2004h>     for tag in soup.find_all('style'):
+[?2004l[?2004h>         if not tag.parent:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if DANGEROUS_CSS_RE.search(tag.get_text()):
+[?2004l[?2004h>             tag.decompose()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 4 ▸ Walk every remaining element and clean its attributes
+[?2004l[?2004h>     for tag in soup.find_all(True):
+[?2004l[?2004h>         if not tag.parent or not tag.attrs:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         tag_name = tag.name.lower()
+[?2004l[?2004h>         to_del = []
+[?2004l[?2004h>         to_set = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>         for name, value in list(tag.attrs.items()):
+[?2004l[?2004h>             key = name.lower()
+[?2004l[?2004h> 
+[?2004l[?2004h>             # normalise multi-valued attributes (e.g. class)
+[?2004l[?2004h>             if isinstance(value, (list, tuple)):
+[?2004l[?2004h>                 value = ' '.join(str(x) for x in value)
+[?2004l[?2004h>             v = str(value) if value is not None else ''
+[?2004l[?2004h> 
+[?2004l[?2004h>             # 4a ▸ inline event handlers  (onclick, onload, …)
+[?2004l[?2004h>             if EVENT_ATTR_RE.match(key):
+[?2004l[?2004h>                 to_del.append(name)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             # 4b ▸ style attribute containing CSS expressions
+[?2004l[?2004h>             if key == 'style':
+[?2004l[?2004h>                 if v and DANGEROUS_CSS_RE.search(v):
+[?2004l[?2004h>                     to_del.append(name)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             # 4c ▸ URL-bearing attributes
+[?2004l[?2004h>             if key in URL_ATTRS:
+[?2004l[?2004h>                 if _is_js_uri(v):
+[?2004l[?2004h>                     to_del.append(name)
+[?2004l[?2004h>                 elif key in ('src', 'data', 'href') and \
+[?2004l[?2004h>                         _is_html_data_uri(v) and \
+[?2004l[?2004h>                         tag_name in DANGEROUS_DATA_URL_TAGS:
+[?2004l[?2004h>                     to_del.append(name)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             # 4d ▸ <iframe srcdoc="…"> – recursively sanitise
+[?2004l[?2004h>             if key == 'srcdoc':
+[?2004l[?2004h>                 if v:
+[?2004l[?2004h>                     sub = BeautifulSoup(v, 'html.parser')
+[?2004l[?2004h>                     filter_soup(sub)
+[?2004l[?2004h>                     to_set[name] = str(sub)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         for n in to_del:
+[?2004l[?2004h>             del tag[n]
+[?2004l[?2004h>         for n, val in to_set.items():
+[?2004l[?2004h>             tag[n] = val
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> # ── Entry point ────────────────────────────────────────────────
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     if len(sys.argv) < 2:
+[?2004l[?2004h>         print('Usage: python3 filter.py <html_file>', file=sys.stderr)
+[?2004l[?2004h>         sys.exit(1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     path = sys.argv[1]
+[?2004l[?2004h> 
+[?2004l[?2004h>     with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+[?2004l[?2004h>         content = fh.read()
+[?2004l[?2004h> 
+[?2004l[?2004h>     soup = BeautifulSoup(content, 'html.parser')
+[?2004l[?2004h>     filter_soup(soup)
+[?2004l[?2004h> 
+[?2004l[?2004h>     with open(path, 'w', encoding='utf-8') as fh:
+[?2004l[?2004h>         fh.write(str(soup))
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@b0ccf739858c:/app# cat /app/filter.py | head -20
+[?2004l#!/usr/bin/env python3
+"""filter.py - Remove JavaScript from HTML files to prevent XSS attacks.
+
+Usage: python3 filter.py <html_file>
+Reads the HTML file given as argv[1], removes all JavaScript,
+and writes the sanitised result back to the same file (in-place).
+"""
+
+import sys
+import re
+from urllib.parse import unquote
+from bs4 import BeautifulSoup
+
+# URI schemes that can execute code
+JS_SCHEMES = frozenset([
+    'javascript', 'vbscript', 'livescript', 'mocha'
+])
+
+# Attributes that carry URLs
+URL_ATTRS = frozenset([
+[?2004hroot@b0ccf739858c:/app# cat > /tmp/test1.html << 'EOF'
+[?2004l[?2004h> <!DOCTYPE html>
+[?2004l[?2004h> <html>
+[?2004l[?2004h> <head>
+[?2004l[?2004h>     <title>Test Page</title>
+[?2004l[?2004h>     <script>alert('xss1');</script>
+[?2004l[?2004h>     <meta charset="utf-8">
+[?2004l[?2004h>     <meta http-equiv="refresh" content="0;url=javascript:alert('xss2')">
+[?2004l[?2004h>     <style>
+[?2004l[?2004h>         body { margin: 0; padding: 0; }
+[?2004l[?2004h>         .header { color: blue; font-size: 18px; }
+[?2004l[?2004h>         .widthy { width: expression(alert('xss3')); }
+[?2004l[?2004h>     </style>
+[?2004l[?2004h> </head>
+[?2004l[?2004h> <body>
+[?2004l[?2004h>     <h1>Welcome</h1>
+[?2004l[?2004h>     <p class="header">This is a paragraph.</p>
+[?2004l[?2004h>     <table>
+[?2004l[?2004h>         <tr><th>Name</th><th>Age</th></tr>
+[?2004l[?2004h>         <tr><td>Alice</td><td>30</td></tr>
+[?2004l[?2004h>     </table>
+[?2004l[?2004h>     <div onclick="alert('xss4')" id="main">Click safe content</div>
+[?2004l[?2004h>     <a href="javascript:alert('xss5')">Bad link</a>
+[?2004l[?2004h>     <a href="https://example.com">Good link</a>
+[?2004l[?2004h>     <img src="image.png" onerror="alert('xss6')" alt="Photo">
+[?2004l[?2004h>     <form action="javascript:alert('xss7')"><input type="text"></form>
+[?2004l[?2004h>     <input type="button" value="Click" onclick="alert('xss8')">
+[?2004l[?2004h>     <iframe src="javascript:alert('xss9')"></iframe>
+[?2004l[?2004h>     <iframe srcdoc="<script>alert('xss10')</script><p>safe</p>"></iframe>
+[?2004l[?2004h>     <div style="color: red; width: expression(alert('xss11'))">Styled</div>
+[?2004l[?2004h>     <p>Final paragraph</p>
+[?2004l[?2004h> </body>
+[?2004l[?2004h> </html>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test1.html
+[?2004l[?2004hroot@b0ccf739858c:/app# cat /tmp/test1.html
+[?2004l<!DOCTYPE html>
+
+<html>
+<head>
+<title>Test Page</title>
+
+<meta charset="utf-8"/>
+
+
+</head>
+<body>
+<h1>Welcome</h1>
+<p class="header">This is a paragraph.</p>
+<table>
+<tr><th>Name</th><th>Age</th></tr>
+<tr><td>Alice</td><td>30</td></tr>
+</table>
+<div id="main">Click safe content</div>
+<a>Bad link</a>
+<a href="https://example.com">Good link</a>
+<img alt="Photo" src="image.png"/>
+<form><input type="text"/></form>
+<input type="button" value="Click"/>
+<iframe></iframe>
+<iframe srcdoc="&lt;p&gt;safe&lt;/p&gt;"></iframe>
+<div>Styled</div>
+<p>Final paragraph</p>
+</body>
+</html>
+[?2004hroot@b0ccf739858c:/app# cat > /tmp/test2.html << 'EOF'
+[?2004l[?2004h> <html><body>
+[?2004l[?2004h> <a href="JaVaScRiPt:alert(1)">mixed case</a>
+[?2004l[?2004h> <a href="  javascript:alert(2)  ">leading space</a>
+[?2004l[?2004h> <a href="&#106;avascript:alert(3)">entity encoded</a>
+[?2004l[?2004h> <svg width="100"><a xlink:href="javascript:alert(4)"><text>svg link</text></a></svg>
+[?2004l[?2004h> <input type="hidden" name="x" onfocus="alert(5)" autofocus>
+[?2004l[?2004h> <iframe src="data:text/html,<script>alert(6)</script>"></iframe>
+[?2004l[?2004h> <a href="data:text/html,<script>alert(7)</script>">data link</a>
+[?2004l[?2004h> <object data="data:text/html,<script>alert(8)</script>"></object>
+[?2004l[?2004h> <img src="data:image/png;base64,iVBORw0KGgo=" alt="safe image">
+[?2004l[?2004h> <base href="javascript:alert(9)">
+[?2004l[?2004h> </body></html>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test2.html && cat /tmp/test2.html
+[?2004l<html><body>
+<a>mixed case</a>
+<a>leading space</a>
+<a>entity encoded</a>
+<svg width="100"><a><text>svg link</text></a></svg>
+<input autofocus="" name="x" type="hidden"/>
+<iframe></iframe>
+<a href="data:text/html,&lt;script&gt;alert(7)&lt;/script&gt;">data link</a>
+<object></object>
+<img alt="safe image" src="data:image/png;base64,iVBORw0KGgo="/>
+<base/>
+</body></html>
+[?2004hroot@b0ccf739858c:/app# cat > /tmp/test3.html << 'EOF'
+[?2004l[?2004h> <div style="color: red; width: expression(alert('xss')); background: blue;">test</div>
+[?2004l[?2004h> <p style="font-size: 14px; color: green;">clean style</p>
+[?2004l[?2004h> <style>
+[?2004l[?2004h> body { margin: 0; padding: 0; }
+[?2004l[?2004h> .header { color: blue; font-size: 18px; }
+[?2004l[?2004h> .dangerous { width: expression(alert(1)); }
+[?2004l[?2004h> </style>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test3.html && cat /tmp/test3.html
+[?2004l<div>test</div>
+<p style="font-size: 14px; color: green;">clean style</p>
+
+[?2004hroot@b0ccf739858c:/app# cat > /app/filter.py << 'PYEOF'
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> """filter.py - Remove JavaScript from HTML files to prevent XSS attacks.
+[?2004lECASE)
+
+    # Drop rules whose body is now empty:  sel { }
+    text = re.sub(r'\s*[^{}]+{\s*}', '', text)
+
+    return text.stri[?2004h> 
+[?2004l[?2004h> Usage: python3 filter.py <html_file>
+[?2004l[?2004h> Reads the HTML file given as argv[1], removes all JavaScript,
+[?2004l[?2004h> and writes the sanitised result back to the same file (in-place).
+[?2004l[?2004h> """
+[?2004l[?2004h> 
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import re
+[?2004l[?2004h> from urllib.parse import unquote
+[?2004l[?2004h> from bs4 import BeautifulSoup
+[?2004l[?2004h> 
+[?2004l[?2004h> # URI schemes that can execute code
+[?2004l[?2004h> JS_SCHEMES = frozenset([
+[?2004l[?2004h>     'javascript', 'vbscript', 'livescript', 'mocha'
+[?2004l[?2004h> ])
+[?2004l[?2004h> 
+[?2004l[?2004h> # Attributes that carry URLs
+[?2004l[?2004h> URL_ATTRS = frozenset([
+[?2004l[?2004h>     'href', 'src', 'action', 'formaction', 'data', 'codebase',
+[?2004l[?2004h>     'cite', 'background', 'poster', 'usemap', 'xlink:href'
+[?2004l[?2004h> ])
+[?2004l[?2004h> 
+[?2004lt[?2004h> # Inline event-handler attributes (onclick, onload, onerror, ...)
+[?2004l[?2004h> EVENT_ATTR_RE = re.compile(r'^on', re.IGNORECASE)
+[?2004l[?2004h> 
+[?2004l([?2004h> # CSS constructs that can run script (legacy IE)
+[?2004l[?2004h> DANGEROUS_CSS_RE = re.compile(
+[?2004l[?2004h>     r'(\bexpression\s*\(|\bbehavior\s*:|\bbinding\s*:)',
+[?2004l[?2004h>     re.IGNORECASE,
+[?2004l[?2004h> )
+[?2004lontaining CSS express[?2004h> 
+[?2004l[?2004h> 
+[?2004lo[?2004h> # -- URI helpers -----------------------------------------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> def _normalise(raw):
+[?2004l[?2004h>     """Strip nulls, URL-decode (up to 3 times), trim whitespace."""
+[?2004l[?2004h>     if raw is None:
+[?2004l[?2004h>         return ''
+[?2004l[?2004h>     v = str(raw).replace('\x00', '')
+[?2004l[?2004h>     for _ in range(3):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             new_v = unquote(v)
+[?2004l[?2004h>         except Exception:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         if new_v == v:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         v = new_v
+[?2004l[?2004h>     return v.replace('\x00', '').strip()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l)[?2004h> def _scheme(uri):
+[?2004l[?2004h>     """Return the lower-cased URI scheme, or None."""
+[?2004l[?2004h>     m = re.match(r'^([a-zA-Z][a-zA-Z0-9+.\-]*)\s*:', uri)
+[?2004l[?2004h>     return m.group(1).lower() if m else None
+[?2004l[?2004h> 
+[?2004lo[?2004h> 
+[?2004l_[?2004h> def _is_js_uri(value):
+[?2004l[?2004h>     """True if *value* uses a dangerous script scheme."""
+[?2004l[?2004h>     v = _normalise(value)
+[?2004l[?2004h>     if not v:
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     for candidate in (v, re.sub(r'[\x00-\x20]+', '', v)):
+[?2004l[?2004h>         s = _scheme(candidate)
+[?2004l[?2004h>         if s in JS_SCHEMES:
+[?2004l[?2004h>             return True
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _is_html_data_uri(value):
+[?2004l[?2004h>     """True if *value* is a data: URI with an HTML media-type."""
+[?2004l[?2004h>     v = _normalise(value)
+[?2004l[?2004h>     if not v:
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     if _scheme(v) != 'data':
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     mediatype = v[5:].split(';', 1)[0].split(',', 1)[0].strip().lower()
+[?2004l[?2004h>     return mediatype in ('text/html', 'application/xhtml+xml')
+[?2004l[?2004h> 
+[?2004la[?2004h> 
+[?2004lr[?2004h> # -- CSS cleaning helpers --------------------------------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> def _clean_style_attr(value):
+[?2004l[?2004h>     """Remove dangerous declarations from a *style* attribute value.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Returns the cleaned string, or None if nothing useful remains.
+[?2004l[?2004h>     """
+[?2004l-- [?2004h>     if not value:
+[?2004l[?2004h>         return None
+[?2004l[?2004h>     decls = value.split(';')
+[?2004l[?2004h>     clean = [d for d in decls if not DANGEROUS_CSS_RE.search(d)]
+[?2004l[?2004h>     result = ';'.join(clean).strip()
+[?2004l[?2004h>     # tidy up doubled spaces left behind
+[?2004l[?2004h>     result = re.sub(r'\s{2,}', ' ', result)
+[?2004l[?2004h>     if not result:
+[?2004l[?2004h>         return None
+[?2004l[?2004h>     return result
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l [?2004h> def _clean_style_block(css_text):
+[?2004l[?2004h>     """Surgically remove dangerous declarations from a CSS block.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Returns the cleaned CSS, or an empty string if only danger remained.
+[?2004l[?2004h>     """
+[?2004l [?2004h>     text = css_text
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Iteratively remove  prop: expression(...);  declarations
+[?2004l[?2004h>     guard = 0
+[?2004l[?2004h>     while guard < 100:
+[?2004l[?2004h>         guard += 1
+[?2004l[?2004h>         m = re.search(r'\bexpression\s*\(', text, re.IGNORECASE)
+[?2004l[?2004h>         if not m:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         # walk back to the start of the declaration (after ; or {)
+[?2004l[?2004h>         start = m.start()
+[?2004l[?2004h>         while start > 0 and text[start - 1] not in ';{':
+[?2004l[?2004h>             start -= 1
+[?2004l[?2004h>         # find matching close-paren (handles nested parens)
+[?2004l[?2004h>         # position of the open paren is at the end of the match – 1
+[?2004l[?2004h>         p = m.end() - 1
+[?2004l[?2004h>         depth = 0
+[?2004l[?2004h>         i = p
+[?2004l[?2004h>         while i < len(text):
+[?2004l[?2004h>             if text[i] == '(':
+[?2004l[?2004h>                 depth += 1
+[?2004l[?2004h>             elif text[i] == ')':
+[?2004l[?2004h>                 depth -= 1
+[?2004l[?2004h>                 if depth == 0:
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>         end = i + 1
+[?2004l[?2004h>         if end < len(text) and text[end] == ';':
+[?2004l[?2004h>             end += 1
+[?2004l[?2004h>         text = text[:start] + text[end:]
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Remove *behavior:* and *binding:* declarations
+[?2004l[?2004h>     text = re.sub(r'[^;{}]*\b(behavior|binding)\s*:[^;{}]*;?', '',
+[?2004l[?2004h>                   text, flags=re.IGNORECASE)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Drop rules whose body is now empty:  sel { }
+[?2004l[?2004h>     text = re.sub(r'\s*[^{}]+{\s*}', '', text)
+[?2004l[?2004h> 
+[?2004l[?2004h>     return text.strip()
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> # -- Core filter -----------------------------------------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> def filter_soup(soup):
+[?2004l[?2004h>     """Remove JavaScript from a BeautifulSoup tree (in-place)."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 1 -- <script> elements: remove entirely
+[?2004l[?2004h>     for tag in soup.find_all('script'):
+[?2004l[?2004h>         tag.decompose()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 2 -- <meta http-equiv="refresh"> pointing at a script
+[?2004l[?2004h>     for meta in soup.find_all('meta'):
+[?2004l[?2004h>         if not meta.parent:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if (meta.get('http-equiv') or '').strip().lower() != 'refresh':
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         content = meta.get('content') or ''
+[?2004l[?2004h>         m = re.search(r'url\s*=\s*(.+)', content, re.IGNORECASE)
+[?2004l[?2004h>         target = m.group(1).strip() if m else content
+[?2004l[?2004h>         if _is_js_uri(target) or _is_html_data_uri(target):
+[?2004l[?2004h>             meta.decompose()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 3 -- <style> blocks containing CSS expressions / behaviours
+[?2004l[?2004h>     for tag in soup.find_all('style'):
+[?2004l[?2004h>         if not tag.parent:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         text = tag.get_text()
+[?2004l[?2004h>         if DANGEROUS_CSS_RE.search(text):
+[?2004l[?2004h>             cleaned = _clean_style_block(text)
+[?2004l[?2004h>             if cleaned:
+[?2004l[?2004h>                 # replace the style content
+[?2004l[?2004h>                 tag.clear()
+[?2004l[?2004h>                 tag.append(type(tag.contents[0])(cleaned) if tag.contents else cleaned)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 tag.decompose()
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 4 -- Walking every remaining element to clean attributes
+[?2004l[?2004h>     for tag in soup.find_all(True):
+[?2004l[?2004h>         if not tag.parent or not tag.attrs:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         to_del = []
+[?2004l[?2004h>         to_set = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>         for name, value in list(tag.attrs.items()):
+[?2004l[?2004h>             key = name.lower()
+[?2004l[?2004h> 
+[?2004l[?2004h>             # normalise multi-valued attributes (e.g. class)
+[?2004l[?2004h>             if isinstance(value, (list, tuple)):
+[?2004l[?2004h>                 value = ' '.join(str(x) for x in value)
+[?2004l[?2004h>             v = str(value) if value is not None else ''
+[?2004l[?2004h> 
+[?2004l[?2004h>             # 4a -- inline event handlers  (onclick, onload, ...)
+[?2004l[?2004h>             if EVENT_ATTR_RE.match(key):
+[?2004l[?2004h>                 to_del.append(name)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             # 4b -- style attribute containing CSS expressions
+[?2004l[?2004h>             if key == 'style':
+[?2004l[?2004h>                 if v and DANGEROUS_CSS_RE.search(v):
+[?2004l[?2004h>                     cleaned = _clean_style_attr(v)
+[?2004l[?2004h>                     if cleaned:
+[?2004l[?2004h>                         to_set[name] = cleaned
+[?2004l[?2004h>                     else:
+[?2004l[?2004h>                         to_del.append(name)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             # 4c -- URL-bearing attributes
+[?2004l[?2004h>             if key in URL_ATTRS:
+[?2004l[?2004h>                 if _is_js_uri(v) or _is_html_data_uri(v):
+[?2004l[?2004h>                     to_del.append(name)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             # 4d -- <iframe srcdoc="...">  – recursively sanitise
+[?2004l[?2004h>             if key == 'srcdoc':
+[?2004l[?2004h>                 if v:
+[?2004l[?2004h>                     sub = BeautifulSoup(v, 'html.parser')
+[?2004l[?2004h>                     filter_soup(sub)
+[?2004l[?2004h>                     to_set[name] = str(sub)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         for n in to_del:
+[?2004l[?2004h>             del tag[n]
+[?2004l[?2004h>         for n, val in to_set.items():
+[?2004l[?2004h>             tag[n] = val
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> # -- Entry point -----------------------------------------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     if len(sys.argv) < 2:
+[?2004l[?2004h>         print('Usage: python3 filter.py <html_file>', file=sys.stderr)
+[?2004l[?2004h>         sys.exit(1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     path = sys.argv[1]
+[?2004l[?2004h> 
+[?2004l[?2004h>     with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+[?2004l[?2004h>         content = fh.read()
+[?2004l[?2004h> 
+[?2004l[?2004h>     soup = BeautifulSoup(content, 'html.parser')
+[?2004l[?2004h>     filter_soup(soup)
+[?2004l[?2004h> 
+[?2004l[?2004h>     with open(path, 'w', encoding='utf-8') as fh:
+[?2004l[?2004h>         fh.write(str(soup))
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> PYEOF
+[?2004l[?2004hroot@b0ccf739858c:/app# echo '--- Test: CSS preservation ---'
+[?2004l--- Test: CSS preservation ---
+[?2004hroot@b0ccf739858c:/app# cat > /tmp/test3.html << 'EOF'
+[?2004l[?2004h> <div style="color: red; width: expression(alert('xss')); background: blue;">test</div>
+[?2004l[?2004h> <p style="font-size: 14px; color: green;">clean style</p>
+[?2004l[?2004h> <p style="width: expression(alert(1))">only danger</p>
+[?2004l[?2004h> <style>
+[?2004l[?2004h> body { margin: 0; padding: 0; }
+[?2004l[?2004h> .header { color: blue; font-size: 18px; }
+[?2004l[?2004h> .dangerous { width: expression(alert(1)); }
+[?2004l[?2004h> </style>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test3.html && cat /tmp/test3.html
+[?2004l<div style="color: red; background: blue;">test</div>
+<p style="font-size: 14px; color: green;">clean style</p>
+<p>only danger</p>
+<style>body { margin: 0; padding: 0; }
+.header { color: blue; font-size: 18px; }</style>
+[?2004hroot@b0ccf739858c:/app# cat > /tmp/test_full.html << 'EOF'
+[?2004l[?2004h> <!DOCTYPE html>
+[?2004l[?2004h> <html>
+[?2004l[?2004h> <head>
+[?2004l[?2004h>     <title>Full Test</title>
+[?2004l[?2004h>     <meta charset="utf-8">
+[?2004l[?2004h>     <meta http-equiv="refresh" content="0;url=javascript:alert('xss')">
+[?2004l[?2004h>     <script>document.write('<p>evil</p>');</script>
+[?2004l[?2004h>     <script type="text/javascript">alert('evil2');</script>
+[?2004l[?2004h>     <script type="module">import x from 'evil';</script>
+[?2004l[?2004h>     <style>
+[?2004l[?2004h>         body { font-family: sans-serif; }
+[?2004l[?2004h>         #x { color: expression(alert(1)); }
+[?2004l[?2004h>     </style>
+[?2004l[?2004h> </head>
+[?2004l[?2004h> <body>
+[?2004l[?2004h>     <header>
+[?2004l[?2004h>         <h1>Main Header</h1>
+[?2004l[?2004h>         <h2>Sub Header</h2>
+[?2004l[?2004h>         <nav><a href="/home">Home</a> | <a href="/about">About</a></nav>
+[?2004l[?2004h>     </header>
+[?2004l[?2004h>     <main>
+[?2004l[?2004h>         <table border="1">
+[?2004l[?2004h>             <thead><tr><th>Col1</th><th>Col2</th></tr></thead>
+[?2004l[?2004h>             <tbody>
+[?2004l[?2004h>                 <tr><td>A</td><td>B</td></tr>
+[?2004l[?2004h>                 <tr><td onclick="alert('table')">C</td><td>D</td></tr>
+[?2004l[?2004h>             </tbody>
+[?2004l[?2004h>         </table>
+[?2004l[?2004h>         <form action="submit.php" method="post">
+[?2004l[?2004h>             <label>Name: <input type="text" name="name"></label>
+[?2004l[?2004h>             <label>Email: <input type="email" name="email"></label>
+[?2004l[?2004h>             <button type="submit" onclick="alert('form')">Submit</button>
+[?2004l[?2004h>         </form>
+[?2004l[?2004h>         <form action="javascript:void(0)">
+[?2004l[?2004h>             <input type="submit" value="Bad Form">
+[?2004l[?2004h>             <button formaction="javascript:alert(1)">Bad Button</button>
+[?2004l[?2004h>         </form>
+[?2004l[?2004h>         <ul>
+[?2004l[?2004h>             <li>Item 1</li>
+[?2004l[?2004h>             <li>Item 2 onmouseover="alert(1)"</li>
+[?2004l[?2004h>             <li><a href="javascript:alert(2)">js link</a></li>
+[?2004l[?2004h>             <li><a href="mailto:test@example.com">Email</a></li>
+[?2004l[?2004h>             <li><a href="tel:+1234567890">Phone</a></li>
+[?2004l[?2004h>         </ul>
+[?2004l[?2004h>         <div id="container" class="wrapper box" data-value="safe">
+[?2004l[?2004h>             <img src="photo.jpg" alt="A photo" width="200">
+[?2004l[?2004h>             <img src=x onerror="alert('img')">
+[?2004l[?2004h>         </div>
+[?2004l[?2004h>         <iframe src="page.html" width="400" height="300"></iframe>
+[?2004l[?2004h>         <iframe srcdoc="<h1>Inner</h1><script>alert(1)</script><p>Text</p>"></iframe>
+[?2004l[?2004h>         <object data="movie.swf" type="application/x-shockwave-flash"></object>
+[?2004l[?2004h>         <embed src="media.mp3">
+[?2004l[?2004h>         <video src="video.mp4" poster="poster.jpg" controls></video>
+[?2004l[?2004h>         <audio src="audio.mp3" controls></audio>
+[?2004l[?2004h>         <p onload="window.location='evil'" onunload="alert('bye')">Final</p>
+[?2004l[?2004h>     </main>
+[?2004l[?2004h>     <footer>
+[?2004l[?2004h>         <p>&copy; 2025 Test</p>
+[?2004l[?2004h>     </footer>
+[?2004l[?2004h> </body>
+[?2004l[?2004h> </html>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_full.html && cat /tmp/test_full.html
+[?2004l<!DOCTYPE html>
+
+<html>
+<head>
+<title>Full Test</title>
+<meta charset="utf-8"/>
+
+
+
+
+<style>body { font-family: sans-serif; }</style>
+</head>
+<body>
+<header>
+<h1>Main Header</h1>
+<h2>Sub Header</h2>
+<nav><a href="/home">Home</a> | <a href="/about">About</a></nav>
+</header>
+<main>
+<table border="1">
+<thead><tr><th>Col1</th><th>Col2</th></tr></thead>
+<tbody>
+<tr><td>A</td><td>B</td></tr>
+<tr><td>C</td><td>D</td></tr>
+</tbody>
+</table>
+<form action="submit.php" method="post">
+<label>Name: <input name="name" type="text"/></label>
+<label>Email: <input name="email" type="email"/></label>
+<button type="submit">Submit</button>
+</form>
+<form>
+<input type="submit" value="Bad Form"/>
+<button>Bad Button</button>
+</form>
+<ul>
+<li>Item 1</li>
+<li>Item 2 onmouseover="alert(1)"</li>
+<li><a>js link</a></li>
+<li><a href="mailto:test@example.com">Email</a></li>
+<li><a href="tel:+1234567890">Phone</a></li>
+</ul>
+<div class="wrapper box" data-value="safe" id="container">
+<img alt="A photo" src="photo.jpg" width="200"/>
+<img src="x"/>
+</div>
+<iframe height="300" src="page.html" width="400"></iframe>
+<iframe srcdoc="&lt;h1&gt;Inner&lt;/h1&gt;&lt;p&gt;Text&lt;/p&gt;"></iframe>
+<object data="movie.swf" type="application/x-shockwave-flash"></object>
+<embed src="media.mp3"/>
+<video controls="" poster="poster.jpg" src="video.mp4"></video>
+<audio controls="" src="audio.mp3"></audio>
+<p>Final</p>
+</main>
+<footer>
+<p>© 2025 Test</p>
+</footer>
+</body>
+</html>
+[?2004hroot@b0ccf739858c:/app# # Test: empty file
+[?2004l[?2004hroot@b0ccf739858c:/app# echo -n '' > /tmp/test_empty.html
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_empty.html && echo "OK: $(cat /tmp/test_empty.html)"
+[?2004lOK: 
+[?2004hroot@b0ccf739858c:/app# # Test: plain text (no HTML)
+[?2004l[?2004hroot@b0ccf739858c:/app# echo 'Just some plain text' > /tmp/test_text.html
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_text.html && cat /tmp/test_text.html
+[?2004lJust some plain text
+[?2004hroot@b0ccf739858c:/app# # Test: malformed HTML
+[?2004l[?2004hroot@b0ccf739858c:/app# echo '<div><p>Unclosed <b>bold <script>alert(1)</script>end</div>' > /tmp/test_malformed.html
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_malformed.html && cat /tmp/test_malformed.html
+[?2004l<div><p>Unclosed <b>bold end</b></p></div>
+[?2004hroot@b0ccf739858c:/app# # Test: no argument
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py 2>&1; echo "Exit: $?"
+[?2004lUsage: python3 filter.py <html_file>
+Exit: 1
+[?2004hroot@b0ccf739858c:/app# # Test: non-existent file
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/nonexistent.html 2>&1; echo "Exit: $?"
+[?2004lTraceback (most recent call last):
+  File [35m"/app/filter.py"[0m, line [35m252[0m, in [35m<module>[0m
+    [31mmain[0m[1;31m()[0m
+    [31m~~~~[0m[1;31m^^[0m
+  File [35m"/app/filter.py"[0m, line [35m241[0m, in [35mmain[0m
+    with [31mopen[0m[1;31m(path, 'r', encoding='utf-8', errors='replace')[0m as fh:
+         [31m~~~~[0m[1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mFileNotFoundError[0m: [35m[Errno 2] No such file or directory: '/tmp/nonexistent.html'[0m
+Exit: 1
+[?2004hroot@b0ccf739858c:/app# # Test: complex nested HTML with multiple scripts
+[?2004l[?2004hroot@b0ccf739858c:/app# cat > /tmp/test_complex.html << 'HTMLEOF'
+[?2004l[?2004h> <div onclick="alert(1)">
+[?2004l[?2004h>   <span onmouseover="alert(2)">
+[?2004l[?2004h>     <a href="JAVASCRIPT:alert(3)">test</a>
+[?2004l[?2004h>     <a href="vbscript:msgbox(4)">vbs</a>
+[?2004l[?2004h>     <input type="image" src="ok.png" onabort="alert(5)">
+[?2004l[?2004h>     <a href="\tjavascript:alert(6)">tab obfuscated</a>
+[?2004l[?2004h>     <a href="%6Aavascript:alert(7)">url encoded</a>
+[?2004l[?2004h>     <a href="jav&#x0A;ascript:alert(8)">newline entity</a>
+[?2004l[?2004h>   </span>
+[?2004l[?2004h> </div>
+[?2004l[?2004h> HTMLEOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_complex.html && cat /tmp/test_complex.html
+[?2004l<div>
+<span>
+<a>test</a>
+<a>vbs</a>
+<input src="ok.png" type="image"/>
+<a href="\tjavascript:alert(6)">tab obfuscated</a>
+<a>url encoded</a>
+<a>newline entity</a>
+</span>
+</div>
+[?2004hroot@b0ccf739858c:/app# # Test: actual tab and newline chars in href
+[?2004l[?2004hroot@b0ccf739858c:/app# printf '<a href="\tjavascript:alert(1)">tab</a>\n<a href="\n javascript:alert(2)">newline</a>\n<a href="java\x00script:alert(3)">null</a>\n' > /tmp/test_ctrl.html
+[?2004l[?2004hroot@b0ccf739858c:/app# cat -A /tmp/test_ctrl.html
+[?2004l<a href="^Ijavascript:alert(1)">tab</a>$
+<a href="$
+ javascript:alert(2)">newline</a>$
+<a href="java^@script:alert(3)">null</a>$
+[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_ctrl.html && cat /tmp/test_ctrl.html
+[?2004l<a>tab</a>
+<a>newline</a>
+<a>null</a>
+[?2004hroot@b0ccf739858c:/app# # Test: idempotency - run filter twice
+[?2004l[?2004hroot@b0ccf739858c:/app# cat > /tmp/test_idem.html << 'EOF'
+[?2004l[?2004h> <div onclick="alert(1)"><a href="javascript:alert(2)">link</a><p>text</p></div>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# cp /tmp/test_idem.html /tmp/test_idem_orig.html
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_idem.html
+[?2004l[?2004hroot@b0ccf739858c:/app# cp /tmp/test_idem.html /tmp/test_idem_first.html
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_idem.html
+[?2004l[?2004hroot@b0ccf739858c:/app# diff /tmp/test_idem_first.html /tmp/test_idem.html && echo "IDEMPOTENT: PASS" || echo "IDEMPOTENT: FAIL"
+[?2004lIDEMPOTENT: PASS
+[?2004hroot@b0ccf739858c:/app# # Test: HTML with special characters & unicode
+[?2004l[?2004hroot@b0ccf739858c:/app# cat > /tmp/test_unicode.html << 'EOF'
+[?2004l[?2004h> <p>Price: &euro;100 &amp; <script>alert(1)</script>discount</p>
+[?2004l[?2004h> <p>&#65;&#66;&#67; = ABC</p>
+[?2004l[?2004h> <div title="hello &amp; goodbye">test</div>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_unicode.html && cat /tmp/test_unicode.html
+[?2004l<p>Price: €100 &amp; discount</p>
+<p>ABC = ABC</p>
+<div title="hello &amp; goodbye">test</div>
+[?2004hroot@b0ccf739858c:/app# # Test: SVG with script and xlink:href
+[?2004l[?2004hroot@b0ccf739858c:/app# cat > /tmp/test_svg.html << 'EOF'
+[?2004l[?2004h> <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+[?2004l[?2004h>   <circle cx="50" cy="50" r="40" fill="blue"/>
+[?2004l[?2004h>   <script>alert('svg script');</script>
+[?2004l[?2004h>   <a xlink:href="javascript:alert(1)"><text x="10" y="80">link</text></a>
+[?2004l[?2004h>   <text x="50" y="30" fill="white">Hello</text>
+[?2004l[?2004h> </svg>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/test_svg.html && cat /tmp/test_svg.html
+[?2004l<svg height="100" width="100" xmlns="http://www.w3.org/2000/svg">
+<circle cx="50" cy="50" fill="blue" r="40"></circle>
+
+<a><text x="10" y="80">link</text></a>
+<text fill="white" x="50" y="30">Hello</text>
+</svg>
+[?2004hroot@b0ccf739858c:/app# python3 -c "import py_compile; py_compile.compile('/app/filter.py', doraise=True)" && echo "Syntax OK"
+[?2004lSyntax OK
+[?2004hroot@b0ccf739858c:/app# wc -l /app/filter.py
+[?2004l252 /app/filter.py
+[?2004hroot@b0ccf739858c:/app# # One final comprehensive test
+[?2004lon3 /app/filter.py /tmp/final_test.html && cat /tmp/final_test.html
+[?2004hroot@b0ccf739858c:/app# cat > /tmp/final_test.html << 'EOF'
+[?2004l[?2004h> <!DOCTYPE html>
+[?2004l[?2004h> <html lang="en">
+[?2004l[?2004h> <head>
+[?2004l[?2004h>     <meta charset="utf-8">
+[?2004l[?2004h>     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+[?2004l[?2004h>     <title>Final Test</title>
+[?2004l[?2004h>     <script src="https://evil.com/malware.js"></script>
+[?2004l[?2004h>     <script>var x = 1;</script>
+[?2004l[?2004h>     <style>* { margin: 0; } .btn { padding: 10px; }</style>
+[?2004l[?2004h> </head>
+[?2004l[?2004h> <body>
+[?2004l[?2004h>     <h1 class="title">Hello World</h1>
+[?2004l[?2004h>     <p onclick="steal()" data-id="42">Click safe</p>
+[?2004l[?2004h>     <a href="https://google.com" target="_blank">Search</a>
+[?2004l[?2004h>     <a href="javascript:document.cookie">Cookies</a>
+[?2004l[?2004h>     <table><tr><td>1+1=2</td></tr></table>
+[?2004l[?2004h>     <img src="pic.jpg" alt="pic" onerror="alert(1)">
+[?2004l[?2004h>     <form action="/submit"><input name="q" value="test"><button type="submit" onsubmit="hijack()">Go</button></form>
+[?2004l[?2004h>     <input type="button" onclick="hack()" value="Hacker">
+[?2004l[?2004h>     <div onmouseenter="track()" style="margin: 5px">Hover</div>
+[?2004l[?2004h>     <iframe src="about:blank" onload="inject()"></iframe>
+[?2004l[?2004h> </body>
+[?2004l[?2004h> </html>
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@b0ccf739858c:/app# python3 /app/filter.py /tmp/final_test.html && cat /tmp/final_test.html
+[?2004l<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Final Test</title>
+
+
+<style>* { margin: 0; } .btn { padding: 10px; }</style>
+</head>
+<body>
+<h1 class="title">Hello World</h1>
+<p data-id="42">Click safe</p>
+<a href="https://google.com" target="_blank">Search</a>
+<a>Cookies</a>
+<table><tr><td>1+1=2</td></tr></table>
+<img alt="pic" src="pic.jpg"/>
+<form action="/submit"><input name="q" value="test"/><button type="submit">Go</button></form>
+<input type="button" value="Hacker"/>
+<div style="margin: 5px">Hover</div>
+<iframe src="about:blank"></iframe>
+</body>
+</html>
+[?2004hroot@b0ccf739858c:/app# ls -la /app/filter.py
+[?2004l-rw-r--r-- 1 root root 7650 Sep  6 16:39 /app/filter.py
+[?2004hroot@b0ccf739858c:/app# 
